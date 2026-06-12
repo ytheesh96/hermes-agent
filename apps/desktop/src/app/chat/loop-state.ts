@@ -312,7 +312,7 @@ export function deriveLoopPanelStateFromTenantSource(source: TenantLoopSource | 
   const rootTaskId = source.tenant || source.session_id || source.lineage_session_ids?.[0] || ''
 
   return {
-    message: '',
+    message: rows.length ? '' : 'No Loop rows for this session.',
     rawJson: rawJson(source),
     revision: source.latest_event_id || 0,
     rootTaskId,
