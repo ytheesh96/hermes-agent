@@ -309,6 +309,14 @@ describe('LoopPanel', () => {
           assignee: 'reviewer-qa',
           included_child_ids: [],
           included_parent_ids: ['t_child']
+        },
+        {
+          id: 't_orphan',
+          title: 'Loose task',
+          status: 'ready',
+          assignee: 'reviewer-qa',
+          included_child_ids: [],
+          included_parent_ids: []
         }
       ]
     })
@@ -347,6 +355,18 @@ describe('LoopPanel', () => {
     fireEvent.click(screen.getByRole('button', { name: /select child task t_grandchild/i }))
     expect(screen.getByRole('heading', { name: /Review child/i })).toBeTruthy()
     expect(screen.getByText('No description provided.')).toBeTruthy()
+    expect(screen.getByText('No child tasks.')).toBeTruthy()
+
+    fireEvent.click(screen.getByRole('button', { name: /Status: ready Loose task/i }))
+    expect(screen.getByRole('heading', { name: /Loose task/i })).toBeTruthy()
+    expect(screen.getByText('No description provided.')).toBeTruthy()
+    expect(screen.getByText('No parent tasks.')).toBeTruthy()
+    expect(screen.getByText('No child tasks.')).toBeTruthy()
+    expect(screen.getByText('No run recorded yet.')).toBeTruthy()
+    expect(screen.getByText('No result recorded.')).toBeTruthy()
+    expect(screen.getByText('No summary recorded.')).toBeTruthy()
+    expect(screen.getByText('Assignee: reviewer-qa')).toBeTruthy()
+    expect(screen.getByText('Workspace: unknown')).toBeTruthy()
   })
 
   it('uses fetched task detail when selecting a dependency that is not in the flat composer rows', () => {

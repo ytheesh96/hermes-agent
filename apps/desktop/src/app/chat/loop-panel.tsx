@@ -1,4 +1,4 @@
-import { type CSSProperties, type ReactNode, useMemo, useState } from 'react'
+import { type ReactNode, useMemo, useState } from 'react'
 
 import { StatusRow } from '@/components/chat/status-row'
 import { StatusSection } from '@/components/chat/status-section'
@@ -141,10 +141,7 @@ interface LoopStackRowProps {
 
 function LoopStackRow({ onSelect, row, selected }: LoopStackRowProps) {
   return (
-    <div
-      data-testid={`loop-card-${row.taskId}`}
-      style={{ '--loop-depth': row.depth, paddingLeft: `calc(0.5rem + ${row.depth} * 1rem)` } as CSSProperties}
-    >
+    <div data-testid={`loop-card-${row.taskId}`}>
       <StatusRow
         className={cn(selected && 'bg-(--ui-row-hover-background)')}
         leading={<LoopStatusIndicator row={row} />}
