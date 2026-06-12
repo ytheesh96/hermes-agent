@@ -325,6 +325,7 @@ export interface SessionMessage {
   reasoning_content?: null | string
   reasoning_details?: unknown
   role: 'assistant' | 'system' | 'tool' | 'user'
+  hidden?: boolean
   text?: unknown
   timestamp?: number
   tool_call_id?: null | string

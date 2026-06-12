@@ -28,6 +28,43 @@ describe('toChatMessages', () => {
     expect(chatMessageText(messages[0])).toBe('Planning.Done.')
   })
 
+  it('keeps a hidden synthetic tool snapshot available without attaching it to the visible user', () => {
+    const messages = toChatMessages([
+      {
+        role: 'assistant',
+        content: '',
+        hidden: true,
+        timestamp: 1,
+        tool_calls: [
+          {
+            id: 'loop-call',
+            function: { name: 'loop_graph', arguments: '{"action":"read","root_task_id":"t_root"}' }
+          }
+        ]
+      },
+      {
+        role: 'tool',
+        hidden: true,
+        tool_call_id: 'loop-call',
+        tool_name: 'loop_graph',
+        content: '{"ok":true,"root_task_id":"t_root","nodes":[{"task_id":"t_child","title":"Visible row"}]}',
+        timestamp: 2
+      },
+      { role: 'user', content: 'where did rows go?', timestamp: 3 }
+    ])
+
+    expect(messages).toHaveLength(2)
+    expect(messages[0].hidden).toBe(true)
+    expect(messages[0].parts[0]).toMatchObject({
+      type: 'tool-call',
+      toolCallId: 'loop-call',
+      toolName: 'loop_graph',
+      result: { ok: true, root_task_id: 't_root' }
+    })
+    expect(messages[1].role).toBe('user')
+    expect(messages[1].hidden).toBeUndefined()
+  })
+
   it('keeps assistant tool-call iterations in one loaded assistant bubble', () => {
     const messages = toChatMessages([
       { role: 'user', content: 'check this repo', timestamp: 1 },

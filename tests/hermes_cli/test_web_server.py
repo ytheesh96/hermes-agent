@@ -670,6 +670,72 @@ class TestWebServerEndpoints:
         assert payload["session_id"] == "desktop-tip"
         assert [m["content"] for m in payload["messages"]] == ["after compression"]
 
+    def test_get_session_messages_inherits_loop_snapshot_from_compression_parent(self):
+        """A fresh compression child with no Loop call should still seed the Desktop Loop card stack."""
+        import time as _time
+
+        from hermes_state import SessionDB
+
+        db = SessionDB()
+        try:
+            db.create_session(session_id="loop-root", source="cli")
+            db.append_message(
+                session_id="loop-root",
+                role="assistant",
+                content="",
+                tool_calls=[
+                    {
+                        "id": "loop-call",
+                        "function": {
+                            "name": "loop_graph",
+                            "arguments": json.dumps(
+                                {"action": "read", "root_task_id": "t_root", "include_nodes": True}
+                            ),
+                        },
+                    }
+                ],
+            )
+            db.append_message(
+                session_id="loop-root",
+                role="tool",
+                tool_call_id="loop-call",
+                tool_name="loop_graph",
+                content=json.dumps(
+                    {
+                        "ok": True,
+                        "root_task_id": "t_root",
+                        "graph_revision": 9,
+                        "nodes": [{"task_id": "t_child", "title": "Visible inherited row"}],
+                    }
+                ),
+            )
+            db.end_session("loop-root", "compression")
+            now = _time.time()
+            db._conn.execute(
+                "UPDATE sessions SET started_at = ?, ended_at = ? WHERE id = ?",
+                (now - 10, now - 5, "loop-root"),
+            )
+            db.create_session(session_id="loop-tip", source="cli", parent_session_id="loop-root")
+            db._conn.execute("UPDATE sessions SET started_at = ? WHERE id = ?", (now - 4, "loop-tip"))
+            db.append_message(session_id="loop-tip", role="user", content="child turn")
+            db._conn.commit()
+        finally:
+            db.close()
+
+        resp = self.client.get("/api/sessions/loop-tip/messages")
+        assert resp.status_code == 200
+        payload = resp.json()
+
+        assert payload["session_id"] == "loop-tip"
+        assert [m["role"] for m in payload["messages"]] == ["assistant", "tool", "user"]
+        assert payload["messages"][0]["hidden"] is True
+        assert payload["messages"][0]["tool_calls"][0]["id"] == "loop-call"
+        assert payload["messages"][1]["hidden"] is True
+        assert payload["messages"][1]["tool_name"] == "loop_graph"
+        loop_payload = json.loads(payload["messages"][1]["content"])
+        assert loop_payload["nodes"][0]["title"] == "Visible inherited row"
+        assert payload["messages"][2]["content"] == "child turn"
+
     def test_get_sessions_archived_is_boolean(self):
         from hermes_state import SessionDB
 

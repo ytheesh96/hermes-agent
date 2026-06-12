@@ -668,11 +668,13 @@ function withUniqueToolCallIds(messages: ChatMessage[]): ChatMessage[] {
 export function toChatMessages(messages: SessionMessage[]): ChatMessage[] {
   const result: ChatMessage[] = []
   let pendingToolParts: ChatMessagePart[] = []
+  let pendingToolHidden = false
   let pendingToolTimestamp: number | undefined
   let activeAssistantIndex: null | number = null
 
   const clearPendingTools = () => {
     pendingToolParts = []
+    pendingToolHidden = false
     pendingToolTimestamp = undefined
   }
 
@@ -700,15 +702,19 @@ export function toChatMessages(messages: SessionMessage[]): ChatMessage[] {
       return
     }
 
-    if (!appendPartsToActiveAssistant(pendingToolParts, pendingToolTimestamp)) {
-      result.push({
-        id: `${pendingToolTimestamp || Date.now()}-${index}-tools`,
-        role: 'assistant',
-        parts: pendingToolParts,
-        timestamp: pendingToolTimestamp
-      })
-      activeAssistantIndex = result.length - 1
+    if (!pendingToolHidden && appendPartsToActiveAssistant(pendingToolParts, pendingToolTimestamp)) {
+      clearPendingTools()
+      return
     }
+
+    result.push({
+      id: `${pendingToolTimestamp || Date.now()}-${index}-tools`,
+      hidden: pendingToolHidden || undefined,
+      role: 'assistant',
+      parts: pendingToolParts,
+      timestamp: pendingToolTimestamp
+    })
+    activeAssistantIndex = result.length - 1
 
     clearPendingTools()
   }
@@ -719,6 +725,7 @@ export function toChatMessages(messages: SessionMessage[]): ChatMessage[] {
 
       if (updatedPendingToolParts) {
         pendingToolParts = updatedPendingToolParts
+        pendingToolHidden = pendingToolHidden || Boolean(message.hidden)
 
         return
       }
@@ -728,6 +735,7 @@ export function toChatMessages(messages: SessionMessage[]): ChatMessage[] {
       }
 
       pendingToolParts = [...pendingToolParts, storedToolMessagePart(message, index)]
+      pendingToolHidden = pendingToolHidden || Boolean(message.hidden)
       pendingToolTimestamp ??= message.timestamp
 
       return
@@ -768,6 +776,7 @@ export function toChatMessages(messages: SessionMessage[]): ChatMessage[] {
 
     if (isToolOnlyAssistant) {
       pendingToolParts = [...pendingToolParts, ...parts]
+      pendingToolHidden = pendingToolHidden || Boolean(message.hidden)
       pendingToolTimestamp ??= message.timestamp
 
       return
@@ -802,6 +811,7 @@ export function toChatMessages(messages: SessionMessage[]): ChatMessage[] {
 
     result.push({
       id: `${message.timestamp || Date.now()}-${index}-${message.role}`,
+      hidden: message.hidden || undefined,
       role: message.role,
       parts,
       timestamp: message.timestamp

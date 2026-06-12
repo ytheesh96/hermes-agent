@@ -6474,6 +6474,15 @@ def _content_is_structured_loop_graph_result(content: Any) -> bool:
     return bool(record.get("root_task_id") and ("nodes" in record or "graph_revision" in record or record.get("ok") is False))
 
 
+def _messages_have_structured_loop_graph_result(messages: List[Dict[str, Any]]) -> bool:
+    return any(
+        msg.get("role") == "tool"
+        and msg.get("tool_name") == "loop_graph"
+        and _content_is_structured_loop_graph_result(msg.get("content"))
+        for msg in messages
+    )
+
+
 def _read_loop_graph_for_dashboard(args: Dict[str, Any]) -> Optional[str]:
     action = str(args.get("action") or "read").strip().lower()
     root_task_id = str(args.get("root_task_id") or "").strip()
@@ -6535,6 +6544,119 @@ def _hydrate_compacted_loop_graph_messages(messages: List[Dict[str, Any]]) -> Li
     return hydrated if changed else messages
 
 
+def _latest_loop_graph_snapshot_for_dashboard(messages: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    """Return the latest read-only loop_graph pair in ``messages``.
+
+    Desktop derives the Loop card stack from stored assistant tool-call parts,
+    so a lone tool row is not enough: return a synthetic assistant tool-call row
+    followed by its tool result. Callers inject this pair as hidden UI-only
+    context when a compression continuation has no Loop read of its own.
+    """
+    loop_calls_by_id: Dict[str, Tuple[Dict[str, Any], Dict[str, Any]]] = {}
+    latest: Optional[Tuple[Dict[str, Any], Dict[str, Any], Optional[Dict[str, Any]]]] = None
+
+    for msg in messages:
+        if msg.get("role") == "assistant" and isinstance(msg.get("tool_calls"), list):
+            for call in msg.get("tool_calls") or []:
+                call_id = _loop_graph_call_id(call)
+                args = _loop_graph_call_args(call)
+                if call_id and args:
+                    loop_calls_by_id[call_id] = (call, args)
+
+        if msg.get("role") != "tool" or msg.get("tool_name") != "loop_graph":
+            continue
+
+        call_id = str(msg.get("tool_call_id") or "")
+        call_and_args = loop_calls_by_id.get(call_id)
+        if not call_and_args and not _content_is_structured_loop_graph_result(msg.get("content")):
+            continue
+
+        call: Dict[str, Any]
+        args: Optional[Dict[str, Any]]
+        if call_and_args:
+            call, args = call_and_args
+        else:
+            result = _parse_json_record(msg.get("content"))
+            call_id = call_id or f"synthetic-loop-graph-{msg.get('id') or 'snapshot'}"
+            args = {
+                "action": "read",
+                "root_task_id": result.get("root_task_id"),
+                "include_nodes": True,
+            }
+            call = {
+                "id": call_id,
+                "function": {"name": "loop_graph", "arguments": json.dumps(args)},
+            }
+
+        latest = (call, msg, args)
+
+    if latest is None:
+        return []
+
+    call, tool_msg, args = latest
+    content = tool_msg.get("content")
+    if args:
+        try:
+            refreshed = _read_loop_graph_for_dashboard(args)
+        except Exception as exc:
+            _log.debug("Failed to refresh inherited loop_graph snapshot: %s", exc)
+            refreshed = None
+        if refreshed:
+            content = refreshed
+
+    if not _content_is_structured_loop_graph_result(content):
+        return []
+
+    call_id = _loop_graph_call_id(call) or str(tool_msg.get("tool_call_id") or "synthetic-loop-graph-snapshot")
+    assistant_msg = {
+        "role": "assistant",
+        "content": "",
+        "tool_calls": [{**call, "id": call_id}],
+        "timestamp": tool_msg.get("timestamp"),
+        "hidden": True,
+    }
+    hydrated_tool_msg = {
+        **tool_msg,
+        "tool_call_id": call_id,
+        "content": content,
+        "hidden": True,
+    }
+    return [assistant_msg, hydrated_tool_msg]
+
+
+def _compression_parent_id(db: Any, session: Dict[str, Any]) -> Optional[str]:
+    parent_id = session.get("parent_session_id") if isinstance(session, dict) else None
+    if not parent_id:
+        return None
+    parent = db.get_session(parent_id)
+    if not parent or parent.get("end_reason") != "compression":
+        return None
+    parent_ended_at = parent.get("ended_at")
+    started_at = session.get("started_at")
+    if parent_ended_at is None or started_at is None or started_at < parent_ended_at:
+        return None
+    return str(parent_id)
+
+
+def _inherited_loop_graph_snapshot_for_dashboard(db: Any, session_id: str) -> List[Dict[str, Any]]:
+    """Find the nearest Loop snapshot in compression ancestors, if any."""
+    current = db.get_session(session_id)
+    seen = {session_id}
+    for _ in range(100):
+        if not current:
+            return []
+        parent_id = _compression_parent_id(db, current)
+        if not parent_id or parent_id in seen:
+            return []
+        seen.add(parent_id)
+        parent_messages = _hydrate_compacted_loop_graph_messages(db.get_messages(parent_id))
+        snapshot = _latest_loop_graph_snapshot_for_dashboard(parent_messages)
+        if snapshot:
+            return snapshot
+        current = db.get_session(parent_id)
+    return []
+
+
 @app.get("/api/sessions/{session_id}")
 async def get_session_detail(session_id: str, profile: Optional[str] = None):
     db = _open_session_db_for_profile(profile)
@@ -6573,6 +6695,10 @@ async def get_session_messages(session_id: str, profile: Optional[str] = None):
         sid = db.resolve_resume_session_id(sid)
         messages = db.get_messages(sid)
         messages = _hydrate_compacted_loop_graph_messages(messages)
+        if not _messages_have_structured_loop_graph_result(messages):
+            inherited_loop_snapshot = _inherited_loop_graph_snapshot_for_dashboard(db, sid)
+            if inherited_loop_snapshot:
+                messages = inherited_loop_snapshot + messages
         return {"session_id": sid, "messages": messages}
     finally:
         db.close()
