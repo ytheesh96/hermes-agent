@@ -37,6 +37,8 @@ const groupLabel = (group: StatusGroup, s: Translations['statusStack']) => {
 }
 
 interface ComposerStatusStackProps {
+  /** Session-scoped sections supplied by the chat shell (e.g. Loop rows). */
+  lead?: ReactNode
   /** The queue, built by the composer (it owns the queue's callbacks). Rendered
    *  as the last group so it stays fused to the composer like before. */
   queue: ReactNode
@@ -48,7 +50,7 @@ interface ComposerStatusStackProps {
  * every session-scoped status — subagents, background tasks, queue — grouped by
  * type and separated by light dividers. Collapses to nothing when empty.
  */
-export function ComposerStatusStack({ queue, sessionId }: ComposerStatusStackProps) {
+export function ComposerStatusStack({ lead, queue, sessionId }: ComposerStatusStackProps) {
   const { t } = useI18n()
   const navigate = useNavigate()
   const itemsBySession = useStore($statusItemsBySession)
@@ -84,7 +86,9 @@ export function ComposerStatusStack({ queue, sessionId }: ComposerStatusStackPro
   const openSubagent = (item: ComposerStatusItem) =>
     item.sessionId ? void openSessionInNewWindow(item.sessionId, { watch: true }) : openAgents()
 
-  const sections: { key: string; node: ReactNode }[] = groups.map(group => ({
+  const sections: { key: string; node: ReactNode }[] = lead ? [{ key: 'lead', node: lead }] : []
+
+  sections.push(...groups.map(group => ({
     key: group.type,
     node: (
       <StatusSection
@@ -120,7 +124,7 @@ export function ComposerStatusStack({ queue, sessionId }: ComposerStatusStackPro
         ))}
       </StatusSection>
     )
-  }))
+  })))
 
   if (queue) {
     sections.push({ key: 'queue', node: queue })

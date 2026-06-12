@@ -7,7 +7,7 @@ import {
 import { useStore } from '@nanostores/react'
 import { useQuery } from '@tanstack/react-query'
 import type * as React from 'react'
-import { Suspense, useCallback, useMemo, useRef } from 'react'
+import { Suspense, useCallback, useMemo, useRef, useState } from 'react'
 import { useLocation } from 'react-router-dom'
 
 import { Thread } from '@/components/assistant-ui/thread'
@@ -38,6 +38,7 @@ import {
   $messages,
   $selectedStoredSessionId,
   $sessions,
+  sessionMatchesAnyId,
   sessionPinId
 } from '@/store/session'
 import type { ModelOptionsResponse } from '@/types/hermes'
@@ -53,10 +54,10 @@ import { droppedFileInlineRefs, type SessionDragPayload, sessionInlineRef } from
 import type { ChatBarState } from './composer/types'
 import { type DroppedFile, partitionDroppedFiles } from './hooks/use-composer-actions'
 import { useFileDropZone } from './hooks/use-file-drop-zone'
+import { LoopPanel, LoopTaskStack } from './loop-panel'
+import { deriveLoopPanelState } from './loop-state'
 import { SessionActionsMenu } from './sidebar/session-actions-menu'
 import { lastVisibleMessageIsUser, threadLoadingState } from './thread-loading'
-import { LoopPanel } from './loop-panel'
-import { deriveLoopPanelState } from './loop-state'
 
 interface ChatViewProps extends Omit<React.ComponentProps<'div'>, 'onSubmit'> {
   gateway: HermesGateway | null
@@ -91,6 +92,7 @@ interface ChatHeaderProps {
   isRoutedSessionView: boolean
   onDeleteSelectedSession: () => void
   onToggleSelectedPin: () => void
+  routedSessionId: null | string
   selectedSessionId: null | string
 }
 
@@ -99,13 +101,14 @@ function ChatHeader({
   isRoutedSessionView,
   onDeleteSelectedSession,
   onToggleSelectedPin,
+  routedSessionId,
   selectedSessionId
 }: ChatHeaderProps) {
   const sessions = useStore($sessions)
   const pinnedSessionIds = useStore($pinnedSessionIds)
 
   const activeStoredSession =
-    sessions.find(session => session.id === selectedSessionId || session._lineage_root_id === selectedSessionId) || null
+    sessions.find(session => sessionMatchesAnyId(session, [selectedSessionId, routedSessionId, activeSessionId])) || null
 
   const title = activeStoredSession ? sessionTitle(activeStoredSession) : 'New session'
 
@@ -125,6 +128,8 @@ function ChatHeader({
     return null
   }
 
+  const actionSessionId = selectedSessionId || activeStoredSession?.id || routedSessionId || activeSessionId || ''
+
   return (
     <header className={cn(titlebarHeaderBaseClass, isRoutedSessionView && titlebarHeaderShadowClass)}>
       <div className={titlebarHeaderTitleClass}>
@@ -133,7 +138,7 @@ function ChatHeader({
           onDelete={selectedSessionId ? onDeleteSelectedSession : undefined}
           onPin={selectedSessionId ? onToggleSelectedPin : undefined}
           pinned={selectedIsPinned}
-          sessionId={selectedSessionId || activeSessionId || ''}
+          sessionId={actionSessionId}
           sideOffset={8}
           title={title}
         >
@@ -193,7 +198,8 @@ export function ChatView({
   const messages = useStore($messages)
   const selectedSessionId = useStore($selectedStoredSessionId)
   const runtimeMessageCacheRef = useRef(new WeakMap<ChatMessage, ThreadMessage>())
-  const isRoutedSessionView = Boolean(routeSessionId(location.pathname))
+  const routedSessionId = routeSessionId(location.pathname)
+  const isRoutedSessionView = Boolean(routedSessionId)
 
   const showIntro =
     freshDraftReady && !isRoutedSessionView && !selectedSessionId && !activeSessionId && messages.length === 0
@@ -252,6 +258,7 @@ export function ChatView({
   )
 
   const loopPanelState = useMemo(() => deriveLoopPanelState(messages), [messages])
+  const [selectedLoopTaskId, setSelectedLoopTaskId] = useState<string | null>(null)
 
   const runtimeMessageRepository = useMemo(() => {
     const items: { message: ThreadMessage; parentId: string | null }[] = []
@@ -344,6 +351,7 @@ export function ChatView({
         isRoutedSessionView={isRoutedSessionView}
         onDeleteSelectedSession={onDeleteSelectedSession}
         onToggleSelectedPin={onToggleSelectedPin}
+        routedSessionId={routedSessionId}
         selectedSessionId={selectedSessionId}
       />
 
@@ -392,6 +400,15 @@ export function ChatView({
                   queueSessionKey={selectedSessionId || activeSessionId}
                   sessionId={activeSessionId}
                   state={chatBarState}
+                  statusStackLead={
+                    loopPanelState?.rows.length ? (
+                      <LoopTaskStack
+                        onSelectTaskId={setSelectedLoopTaskId}
+                        selectedTaskId={selectedLoopTaskId}
+                        state={loopPanelState}
+                      />
+                    ) : null
+                  }
                 />
               </Suspense>
             )}
@@ -399,7 +416,7 @@ export function ChatView({
           <ChatDropOverlay kind={dragKind} />
           <ChatSwapOverlay profile={gatewaySwapTarget} />
         </div>
-        <LoopPanel state={loopPanelState} />
+        <LoopPanel selectedTaskId={selectedLoopTaskId} state={loopPanelState} />
       </div>
     </div>
   )

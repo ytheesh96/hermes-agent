@@ -18,6 +18,7 @@ import {
   $messages,
   $sessions,
   $yoloActive,
+  sessionMatchesId,
   sessionPinId,
   setActiveSessionId,
   setAwaitingResponse,
@@ -211,7 +212,7 @@ function patchSessionWorkspace(sessionId: string, cwd: string | undefined) {
 }
 
 function sessionMatchesStoredId(session: SessionInfo, storedSessionId: string): boolean {
-  return session.id === storedSessionId || session._lineage_root_id === storedSessionId
+  return sessionMatchesId(session, storedSessionId)
 }
 
 function upsertResolvedSession(session: SessionInfo, storedSessionId: string) {
@@ -534,7 +535,7 @@ export function useSessionActions({
       const cachedState = cachedRuntimeId && sessionStateByRuntimeIdRef.current.get(cachedRuntimeId)
 
       if (cachedRuntimeId && cachedState) {
-        const stored = $sessions.get().find(session => session.id === storedSessionId)
+        const stored = $sessions.get().find(session => sessionMatchesId(session, storedSessionId))
 
         const cachedViewState =
           !cachedState.model && stored?.model != null
@@ -648,6 +649,7 @@ export function useSessionActions({
           reconcileResumeMessages(toChatMessages(resumed.messages), currentMessages),
           currentMessages
         )
+
         // Keep the local snapshot when resume would only reshuffle runtime projection.
         const preferredMessages =
           localSnapshot.length > 0

@@ -1,10 +1,11 @@
 import { cleanup, fireEvent, render, screen } from '@testing-library/react'
+import { useState } from 'react'
 import { afterEach, describe, expect, it } from 'vitest'
 
 import type { ChatMessage } from '@/lib/chat-messages'
 
-import { LoopPanel } from './loop-panel'
-import { deriveLoopPanelState } from './loop-state'
+import { LoopPanel, LoopTaskStack } from './loop-panel'
+import { deriveLoopPanelState, type LoopPanelState } from './loop-state'
 
 const toolMessage = (result: unknown, args: Record<string, unknown> = { action: 'read', root_task_id: 't_root' }): ChatMessage => ({
   id: `msg-${Math.random()}`,
@@ -22,6 +23,17 @@ const toolMessage = (result: unknown, args: Record<string, unknown> = { action: 
 })
 
 afterEach(() => cleanup())
+
+function LoopHarness({ state }: { state: LoopPanelState }) {
+  const [selectedTaskId, setSelectedTaskId] = useState<string | null>(null)
+
+  return (
+    <>
+      <LoopTaskStack onSelectTaskId={setSelectedTaskId} selectedTaskId={selectedTaskId} state={state} />
+      <LoopPanel selectedTaskId={selectedTaskId} state={state} />
+    </>
+  )
+}
 
 describe('deriveLoopPanelState', () => {
   it('renders the latest triage-backed graph rows in dependency-derived order', () => {
@@ -70,18 +82,24 @@ describe('LoopPanel', () => {
       })
     ])
 
-    render(<LoopPanel state={state} />)
+    render(<LoopHarness state={state!} />)
 
     expect(screen.getByText('Loop')).toBeTruthy()
+    expect(screen.getByText('Loop 0/2')).toBeTruthy()
     expect(screen.getAllByText('Design parent').length).toBeGreaterThan(0)
     expect(screen.getByText('Build child')).toBeTruthy()
-    expect(screen.getByTestId('loop-row-t_child').getAttribute('style')).toContain('--loop-depth: 1')
+    expect(screen.getAllByLabelText('Status: triage').length).toBeGreaterThanOrEqual(2)
+    expect(screen.queryByText(/triage/i)).toBeNull()
+    expect(screen.queryByText('active')).toBeNull()
+    expect(screen.queryByText('frontier')).toBeNull()
+    expect(screen.getByTestId('loop-card-t_child').getAttribute('style')).toContain('--loop-depth: 1')
     expect(screen.queryByText(/"nodes"/)).toBeNull()
 
-    fireEvent.click(screen.getByTestId('loop-row-t_child'))
-    expect(screen.getByText('Draft task details')).toBeTruthy()
+    fireEvent.click(screen.getByText('Build child'))
+    expect(screen.getByText('Loop details')).toBeTruthy()
     expect(screen.getByText('t_child')).toBeTruthy()
     expect(screen.getByText('Parents: t_parent')).toBeTruthy()
+    expect(screen.queryByText(/triage/i)).toBeNull()
 
     fireEvent.click(screen.getByRole('button', { name: /show debug json/i }))
     expect(screen.getByText(/"nodes"/)).toBeTruthy()

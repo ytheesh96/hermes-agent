@@ -154,6 +154,7 @@ export function ChatBar({
   maxRecordingSeconds = 120,
   queueSessionKey,
   sessionId,
+  statusStackLead,
   state,
   onCancel,
   onAddUrl,
@@ -189,8 +190,10 @@ export function ChatBar({
 
   const statusStackVisible = useMemo(
     () =>
-      queuedPrompts.length > 0 || (statusSessionId ? (statusItemsBySession[statusSessionId]?.length ?? 0) > 0 : false),
-    [queuedPrompts.length, statusItemsBySession, statusSessionId]
+      Boolean(statusStackLead) ||
+      queuedPrompts.length > 0 ||
+      (statusSessionId ? (statusItemsBySession[statusSessionId]?.length ?? 0) > 0 : false),
+    [queuedPrompts.length, statusItemsBySession, statusSessionId, statusStackLead]
   )
 
   const composerRef = useRef<HTMLFormElement | null>(null)
@@ -1713,6 +1716,7 @@ export function ChatBar({
               its own --status-stack-measured-height so the thread's clearance
               accounts for it. Collapses to nothing when every status is empty. */}
           <ComposerStatusStack
+            lead={statusStackLead}
             queue={
               activeQueueSessionKey && queuedPrompts.length > 0 ? (
                 <QueuePanel

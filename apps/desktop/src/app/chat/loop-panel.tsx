@@ -1,6 +1,9 @@
 import { type CSSProperties, useMemo, useState } from 'react'
 
+import { StatusRow } from '@/components/chat/status-row'
+import { StatusSection } from '@/components/chat/status-section'
 import { Button } from '@/components/ui/button'
+import { Codicon } from '@/components/ui/codicon'
 import { cn } from '@/lib/utils'
 
 import type { LoopPanelState, LoopPanelStatus, LoopRow } from './loop-state'
@@ -17,55 +20,126 @@ function statusCopy(status: LoopPanelStatus): string {
   return 'Live draft'
 }
 
-function rowBadge(row: LoopRow): string {
-  if (row.active) {
-    return 'active'
+function statusIndicatorClass(status: string): string {
+  const value = status.toLowerCase()
+
+  if (value === 'running' || value === 'in_progress' || value === 'claimed') {
+    return 'size-1.5 bg-(--ui-accent) shadow-[0_0_0.625rem_color-mix(in_srgb,var(--ui-accent)_45%,transparent)]'
   }
 
-  if (row.frontier) {
-    return 'frontier'
+  if (value === 'blocked' || value === 'stale') {
+    return 'size-1.5 bg-amber-500'
   }
 
-  return row.status
+  if (value === 'error' || value === 'failed') {
+    return 'size-1.5 bg-destructive'
+  }
+
+  if (value === 'done') {
+    return 'size-1.5 bg-emerald-500/80'
+  }
+
+  return 'size-1 bg-(--ui-text-quaternary) opacity-80'
 }
 
-interface LoopRowButtonProps {
-  onSelect: (row: LoopRow) => void
+function LoopStatusIndicator({ row }: { row: LoopRow }) {
+  return (
+    <span
+      aria-label={`Status: ${row.status}`}
+      className="grid w-3.5 shrink-0 place-items-center overflow-hidden"
+      role="img"
+    >
+      <span aria-hidden="true" className={cn('rounded-full', statusIndicatorClass(row.status))} />
+    </span>
+  )
+}
+
+function completedLoopRows(rows: LoopRow[]): number {
+  return rows.filter(row => {
+    const status = row.status.toLowerCase()
+
+    return status === 'done' || status === 'complete' || status === 'completed'
+  }).length
+}
+
+function selectedRowFrom(state: LoopPanelState | null, selectedTaskId?: null | string): LoopRow | null {
+  if (!state) {
+    return null
+  }
+
+  return state.rows.find(row => row.taskId === selectedTaskId) || state.rows[0] || null
+}
+
+interface LoopStackRowProps {
+  onSelect: (taskId: string) => void
   row: LoopRow
   selected: boolean
 }
 
-function LoopRowButton({ onSelect, row, selected }: LoopRowButtonProps) {
+function LoopStackRow({ onSelect, row, selected }: LoopStackRowProps) {
   return (
-    <button
-      className={cn(
-        'group grid w-full grid-cols-[1fr_auto] items-center gap-2 rounded-lg border border-transparent px-2 py-1.5 text-left text-sm transition-colors hover:border-(--ui-stroke-tertiary) hover:bg-(--ui-control-hover-background)',
-        selected && 'border-(--ui-stroke-secondary) bg-(--ui-control-active-background)'
-      )}
-      data-testid={`loop-row-${row.taskId}`}
-      onClick={() => onSelect(row)}
+    <div
+      data-testid={`loop-card-${row.taskId}`}
       style={{ '--loop-depth': row.depth, paddingLeft: `calc(0.5rem + ${row.depth} * 1rem)` } as CSSProperties}
-      type="button"
     >
-      <span className="min-w-0 truncate text-(--ui-text-primary)">{row.title}</span>
-      <span className="rounded-full bg-(--ui-fill-quaternary) px-1.5 py-0.5 text-[0.625rem] uppercase tracking-wide text-(--ui-text-tertiary)">
-        {rowBadge(row)}
-      </span>
-    </button>
+      <StatusRow
+        className={cn(selected && 'bg-(--ui-row-hover-background)')}
+        leading={<LoopStatusIndicator row={row} />}
+        onActivate={() => onSelect(row.taskId)}
+      >
+        <span
+          className={cn(
+            'min-w-0 max-w-[18rem] truncate text-[0.73rem] leading-4',
+            selected ? 'text-foreground/92' : 'text-muted-foreground/75'
+          )}
+        >
+          {row.title}
+        </span>
+      </StatusRow>
+    </div>
   )
 }
 
-export function LoopPanel({ state }: { state: LoopPanelState | null }) {
-  const [selectedTaskId, setSelectedTaskId] = useState<string | null>(null)
+interface LoopTaskStackProps {
+  onSelectTaskId: (taskId: string) => void
+  selectedTaskId?: null | string
+  state: LoopPanelState | null
+}
+
+export function LoopTaskStack({ onSelectTaskId, selectedTaskId, state }: LoopTaskStackProps) {
+  const selected = useMemo(() => selectedRowFrom(state, selectedTaskId), [selectedTaskId, state])
+
+  if (!state || state.rows.length === 0) {
+    return null
+  }
+
+  return (
+    <StatusSection
+      defaultCollapsed={false}
+      icon={<Codicon className="text-muted-foreground/70" name="checklist" size="0.8rem" />}
+      label={`Loop ${completedLoopRows(state.rows)}/${state.rows.length}`}
+    >
+      {state.rows.map(row => (
+        <LoopStackRow
+          key={row.taskId}
+          onSelect={onSelectTaskId}
+          row={row}
+          selected={selected?.taskId === row.taskId}
+        />
+      ))}
+    </StatusSection>
+  )
+}
+
+interface LoopPanelProps {
+  selectedTaskId?: null | string
+  state: LoopPanelState | null
+}
+
+export function LoopPanel({ selectedTaskId, state }: LoopPanelProps) {
   const [debugOpen, setDebugOpen] = useState(false)
 
-  const selected = useMemo(() => {
-    if (!state) {
-      return null
-    }
-
-    return state.rows.find(row => row.taskId === selectedTaskId) || state.rows[0] || null
-  }, [selectedTaskId, state])
+  const selected = useMemo(() => selectedRowFrom(state, selectedTaskId), [selectedTaskId, state])
 
   if (!state) {
     return null
@@ -101,37 +175,26 @@ export function LoopPanel({ state }: { state: LoopPanelState | null }) {
       )}
 
       <div className="min-h-0 flex-1 overflow-auto">
-        {state.rows.length ? (
-          <div className="grid gap-1">
-            {state.rows.map(row => (
-              <LoopRowButton
-                key={row.taskId}
-                onSelect={row => setSelectedTaskId(row.taskId)}
-                row={row}
-                selected={selected?.taskId === row.taskId}
-              />
-            ))}
-          </div>
+        {selected ? (
+          <section className="rounded-lg border border-(--ui-stroke-tertiary) bg-(--ui-surface-background) p-3 text-xs">
+            <h3 className="m-0 mb-2 text-xs font-semibold uppercase tracking-wide text-(--ui-text-tertiary)">
+              Loop details
+            </h3>
+            <div className="grid gap-1.5">
+              <div className="flex items-center gap-2 font-medium text-(--ui-text-primary)">
+                <LoopStatusIndicator row={selected} />
+                <span className="min-w-0 truncate">{selected.title}</span>
+              </div>
+              <div className="font-mono text-(--ui-text-tertiary)">{selected.taskId}</div>
+              <div>Parents: {selected.parents.length ? selected.parents.join(', ') : 'none'}</div>
+            </div>
+          </section>
         ) : (
           <p className="m-0 rounded-lg border border-dashed border-(--ui-stroke-tertiary) p-3 text-xs text-(--ui-text-tertiary)">
-            No triage-backed draft rows yet. Ask Hermes to read or mutate the Loop graph.
+            No Loop rows yet. Ask Hermes to read or mutate the Loop graph.
           </p>
         )}
       </div>
-
-      {selected && (
-        <section className="mt-3 rounded-lg border border-(--ui-stroke-tertiary) bg-(--ui-surface-background) p-3 text-xs">
-          <h3 className="m-0 mb-2 text-xs font-semibold uppercase tracking-wide text-(--ui-text-tertiary)">
-            Draft task details
-          </h3>
-          <div className="grid gap-1.5">
-            <div className="font-medium text-(--ui-text-primary)">{selected.title}</div>
-            <div className="font-mono text-(--ui-text-tertiary)">{selected.taskId}</div>
-            <div>Status: {selected.status}</div>
-            <div>Parents: {selected.parents.length ? selected.parents.join(', ') : 'none'}</div>
-          </div>
-        </section>
-      )}
 
       <div className="mt-3 border-t border-(--ui-stroke-tertiary) pt-3">
         <Button className="h-7 px-2 text-xs" onClick={() => setDebugOpen(open => !open)} type="button" variant="ghost">
