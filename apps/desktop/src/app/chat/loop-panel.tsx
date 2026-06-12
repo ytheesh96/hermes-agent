@@ -8,6 +8,8 @@ import { cn } from '@/lib/utils'
 
 import type { LoopPanelState, LoopPanelStatus, LoopRow, LoopTaskDetail, TenantLoopTask } from './loop-state'
 
+export type LoopTaskAction = 'block' | 'decompose' | 'details' | 'kanban' | 'logs' | 'park' | 'start' | 'unblock'
+
 function statusCopy(status: LoopPanelStatus): string {
   if (status === 'stale') {
     return 'Stale revision'
@@ -196,6 +198,7 @@ interface LoopPanelProps {
   hidden?: boolean
   onHide?: () => void
   onSelectTaskId?: (taskId: string) => void
+  onTaskAction?: (action: LoopTaskAction, row: LoopRow) => void
   open?: boolean
   selectedTaskDetail?: LoopTaskDetail | null
   selectedTaskId?: null | string
@@ -273,14 +276,98 @@ function latestRunCopy(row: LoopRow): string {
   return `Run ${id} · ${status}${profile}`
 }
 
+function normalizedRowStatus(row: LoopRow): string {
+  return row.status.toLowerCase()
+}
+
+function actionsForRow(row: LoopRow): { action: LoopTaskAction; label: string; tone?: 'primary' }[] {
+  const status = normalizedRowStatus(row)
+  const terminal = status === 'done' || status === 'complete' || status === 'completed' || status === 'cancelled'
+  const archived = status === 'archived'
+  const actions: { action: LoopTaskAction; label: string; tone?: 'primary' }[] = []
+
+  if (status === 'triage') {
+    actions.push({ action: 'decompose', label: '⚗ Decompose', tone: 'primary' })
+  } else if (status === 'blocked') {
+    actions.push({ action: 'unblock', label: 'Unblock', tone: 'primary' })
+  } else if (status === 'scheduled') {
+    actions.push({ action: 'start', label: 'Start', tone: 'primary' })
+  } else if (status === 'todo') {
+    actions.push({ action: 'start', label: 'Start', tone: 'primary' })
+  }
+
+  if (!terminal && !archived && status !== 'blocked') {
+    actions.push({ action: 'block', label: 'Block' })
+  }
+
+  if (!terminal && !archived && status !== 'scheduled') {
+    actions.push({ action: 'park', label: 'Park' })
+  }
+
+  actions.push({ action: 'details', label: 'Details' })
+
+  if (row.tenant || row.workspacePath || row.rawTask?.session_id) {
+    actions.push({ action: 'kanban', label: 'Kanban' })
+  }
+
+  if (row.latestRun?.id || row.latestRun?.task_id) {
+    actions.push({ action: 'logs', label: 'Logs' })
+  }
+
+  return actions
+}
+
+function actionAriaLabel(action: LoopTaskAction, label: string, row: LoopRow): string {
+  if (action === 'details') {
+    return `Open details for ${row.taskId}`
+  }
+
+  if (action === 'kanban') {
+    return `Open Kanban for ${row.taskId}`
+  }
+
+  if (action === 'logs') {
+    return `Open logs for ${row.taskId}`
+  }
+
+  return `${label.replace(/^⚗\s*/, '')} ${row.taskId}`
+}
+
+function LoopTaskActions({ onTaskAction, row }: { onTaskAction?: (action: LoopTaskAction, row: LoopRow) => void; row: LoopRow }) {
+  const actions = actionsForRow(row)
+
+  if (!onTaskAction) {
+    return <EmptyDetail>Task actions will appear here when enabled.</EmptyDetail>
+  }
+
+  return (
+    <div className="flex flex-wrap gap-1.5" data-testid="loop-task-actions">
+      {actions.map(({ action, label, tone }) => (
+        <Button
+          aria-label={actionAriaLabel(action, label, row)}
+          className="h-7 px-2 text-xs"
+          key={action}
+          onClick={() => onTaskAction(action, row)}
+          type="button"
+          variant={tone === 'primary' ? 'default' : 'outline'}
+        >
+          {label}
+        </Button>
+      ))}
+    </div>
+  )
+}
+
 function LoopTaskDetails({
   detail,
   onSelectTaskId,
+  onTaskAction,
   row,
   rowById
 }: {
   detail?: LoopTaskDetail | null
   onSelectTaskId?: (taskId: string) => void
+  onTaskAction?: (action: LoopTaskAction, row: LoopRow) => void
   row: LoopRow
   rowById: Map<string, LoopRow>
 }) {
@@ -352,7 +439,7 @@ function LoopTaskDetails({
       </DetailSection>
 
       <DetailSection title="Safe actions">
-        <EmptyDetail>Task actions will appear here when enabled.</EmptyDetail>
+        <LoopTaskActions onTaskAction={onTaskAction} row={row} />
       </DetailSection>
     </div>
   )
@@ -363,6 +450,7 @@ export function LoopPanel({
   hidden = false,
   onHide,
   onSelectTaskId,
+  onTaskAction,
   open = false,
   selectedTaskDetail,
   selectedTaskId,
@@ -439,12 +527,22 @@ export function LoopPanel({
         {selected ? (
           <div className="grid gap-3">
             <h3 className="m-0 text-xs font-semibold uppercase tracking-wide text-(--ui-text-tertiary)">Loop details</h3>
-            <LoopTaskDetails detail={selectedTaskDetail} onSelectTaskId={onSelectTaskId} row={selected} rowById={rowById} />
+            <LoopTaskDetails
+              detail={selectedTaskDetail}
+              onSelectTaskId={onSelectTaskId}
+              onTaskAction={onTaskAction}
+              row={selected}
+              rowById={rowById}
+            />
           </div>
         ) : selectedTaskId ? (
-          <p className="m-0 rounded-lg border border-dashed border-(--ui-stroke-tertiary) p-3 text-xs text-(--ui-text-tertiary)">
-            Task {selectedTaskId} is unavailable or still loading.
-          </p>
+          <section className="rounded-lg border border-amber-500/30 bg-amber-500/10 p-3 text-xs text-amber-700 dark:text-amber-300">
+            <h3 className="m-0 mb-2 text-xs font-semibold uppercase tracking-wide">Selected task unavailable</h3>
+            <p className="m-0">
+              Task <span className="font-mono">{selectedTaskId}</span> is missing from the latest Loop source. It may have been archived,
+              deleted, or refreshed out of this session lineage. Select another row or close the panel.
+            </p>
+          </section>
         ) : (
           <p className="m-0 rounded-lg border border-dashed border-(--ui-stroke-tertiary) p-3 text-xs text-(--ui-text-tertiary)">
             No Loop rows yet. Ask Hermes to read or mutate the Loop graph.

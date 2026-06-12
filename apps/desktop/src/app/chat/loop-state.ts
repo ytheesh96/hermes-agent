@@ -109,9 +109,9 @@ export interface LoopTaskRun extends LoopLatestRun {
 // - latest run/result/summary: row.latestRun, row.result, row.latestSummary
 //   (latest_summary || latest_run.summary). detail.runs is the full history for
 //   future expansion; absent/empty means no run history.
-// - safe task actions: no backend capability list is exposed yet. Until a
-//   dedicated safe-actions/capabilities field exists, render a disabled/empty
-//   state instead of inferring destructive action availability from raw status.
+// - safe task actions: the UI derives conservative non-destructive affordances from
+//   normalized status until a backend capability list exists. Mutating actions are
+//   emitted only through explicit user clicks via LoopPanel.onTaskAction.
 export interface LoopTaskDetail {
   comments?: LoopTaskComment[]
   links?: {
@@ -295,7 +295,9 @@ export function deriveLoopPanelStateFromTenantSource(source: TenantLoopSource | 
     return null
   }
 
-  const tasks = (source.tasks || []).filter(task => task.id && !ARCHIVED_STATUSES.has(normalizedStatus(task.status)))
+  const tasks = (source.tasks || []).filter(
+    task => task.id && (source.include_archived || !ARCHIVED_STATUSES.has(normalizedStatus(task.status)))
+  )
   const depths = depthByTaskId(tasks)
   const taskIds = new Set(tasks.map(task => task.id))
   const rows = tasks.map(task => tenantRowFromTask(task, depths, taskIds))

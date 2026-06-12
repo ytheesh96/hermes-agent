@@ -1,6 +1,6 @@
 import { cleanup, fireEvent, render, screen } from '@testing-library/react'
 import { useState } from 'react'
-import { afterEach, describe, expect, it } from 'vitest'
+import { afterEach, describe, expect, it, vi } from 'vitest'
 
 import type { ChatMessage } from '@/lib/chat-messages'
 
@@ -85,6 +85,66 @@ function DetailFetchHarness({ state }: { state: LoopPanelState }) {
       state={state}
     />
   )
+}
+
+function actionState() {
+  return deriveLoopPanelStateFromTenantSource({
+    session_id: 'sess-actions',
+    tenant: 'tenant-a',
+    include_archived: true,
+    latest_event_id: 17,
+    tasks: [
+      {
+        id: 't_triage',
+        title: 'Needs decomposition',
+        status: 'triage',
+        tenant: 'tenant-a',
+        included_child_ids: [],
+        included_parent_ids: []
+      },
+      {
+        id: 't_blocked',
+        title: 'Blocked task',
+        status: 'blocked',
+        tenant: 'tenant-a',
+        included_child_ids: [],
+        included_parent_ids: []
+      },
+      {
+        id: 't_scheduled',
+        title: 'Parked task',
+        status: 'scheduled',
+        tenant: 'tenant-a',
+        included_child_ids: [],
+        included_parent_ids: []
+      },
+      {
+        id: 't_todo',
+        title: 'Ready to start',
+        status: 'todo',
+        tenant: 'tenant-a',
+        included_child_ids: [],
+        included_parent_ids: []
+      },
+      {
+        id: 't_done',
+        title: 'Finished task',
+        status: 'done',
+        tenant: 'tenant-a',
+        included_child_ids: [],
+        included_parent_ids: [],
+        latest_run: { id: 9, profile: 'reviewer-qa', status: 'done', summary: 'accepted' }
+      },
+      {
+        id: 't_archived',
+        title: 'Archived task',
+        status: 'archived',
+        tenant: 'tenant-a',
+        included_child_ids: [],
+        included_parent_ids: []
+      }
+    ]
+  })!
 }
 
 describe('deriveLoopPanelState', () => {
@@ -406,5 +466,67 @@ describe('LoopPanel', () => {
     expect(screen.getAllByText('newest run').length).toBeGreaterThanOrEqual(1)
     expect(screen.queryByText(/Run #1 · done · old-worker/)).toBeNull()
     expect(screen.queryByText('oldest run')).toBeNull()
+  })
+
+  it('renders status-specific safe actions and dispatches only on explicit clicks', () => {
+    const state = actionState()
+    const onTaskAction = vi.fn()
+    const { rerender } = render(<LoopPanel onTaskAction={onTaskAction} open selectedTaskId="t_triage" state={state} />)
+
+    expect(onTaskAction).not.toHaveBeenCalled()
+    expect(screen.getByRole('button', { name: /decompose t_triage/i }).textContent).toBe('⚗ Decompose')
+    expect(screen.getByRole('button', { name: /block t_triage/i })).toBeTruthy()
+    expect(screen.getByRole('button', { name: /park t_triage/i })).toBeTruthy()
+    expect(screen.getByRole('button', { name: /open details for t_triage/i })).toBeTruthy()
+    expect(screen.getByRole('button', { name: /open kanban for t_triage/i })).toBeTruthy()
+    expect(screen.queryByRole('button', { name: /start t_triage/i })).toBeNull()
+
+    fireEvent.click(screen.getByRole('button', { name: /decompose t_triage/i }))
+    expect(onTaskAction).toHaveBeenCalledWith('decompose', expect.objectContaining({ taskId: 't_triage' }))
+
+    rerender(<LoopPanel onTaskAction={onTaskAction} open selectedTaskId="t_blocked" state={state} />)
+    expect(screen.getByRole('button', { name: /unblock t_blocked/i })).toBeTruthy()
+    expect(screen.getByRole('button', { name: /park t_blocked/i })).toBeTruthy()
+    expect(screen.queryByRole('button', { name: /^Block t_blocked$/i })).toBeNull()
+    expect(screen.queryByRole('button', { name: /decompose t_blocked/i })).toBeNull()
+
+    rerender(<LoopPanel onTaskAction={onTaskAction} open selectedTaskId="t_scheduled" state={state} />)
+    expect(screen.getByRole('button', { name: /start t_scheduled/i })).toBeTruthy()
+    expect(screen.getByRole('button', { name: /block t_scheduled/i })).toBeTruthy()
+    expect(screen.queryByRole('button', { name: /park t_scheduled/i })).toBeNull()
+
+    rerender(<LoopPanel onTaskAction={onTaskAction} open selectedTaskId="t_todo" state={state} />)
+    expect(screen.getByRole('button', { name: /start t_todo/i })).toBeTruthy()
+    expect(screen.getByRole('button', { name: /block t_todo/i })).toBeTruthy()
+    expect(screen.getByRole('button', { name: /park t_todo/i })).toBeTruthy()
+
+    rerender(<LoopPanel onTaskAction={onTaskAction} open selectedTaskId="t_done" state={state} />)
+    expect(screen.getByRole('button', { name: /open details for t_done/i })).toBeTruthy()
+    expect(screen.getByRole('button', { name: /open logs for t_done/i })).toBeTruthy()
+    expect(screen.queryByRole('button', { name: /block t_done/i })).toBeNull()
+    expect(screen.queryByRole('button', { name: /park t_done/i })).toBeNull()
+
+    rerender(<LoopPanel onTaskAction={onTaskAction} open selectedTaskId="t_archived" state={state} />)
+    expect(screen.getByRole('button', { name: /open details for t_archived/i })).toBeTruthy()
+    expect(screen.queryByRole('button', { name: /block t_archived/i })).toBeNull()
+    expect(screen.queryByRole('button', { name: /park t_archived/i })).toBeNull()
+  })
+
+  it('keeps missing or archived selections sticky instead of silently selecting another row', () => {
+    const state = actionState()
+    const onTaskAction = vi.fn()
+    const { rerender } = render(<LoopPanel onTaskAction={onTaskAction} open selectedTaskId="t_missing" state={state} />)
+
+    expect(screen.getByText('Selected task unavailable')).toBeTruthy()
+    expect(screen.getByText(/t_missing/)).toBeTruthy()
+    expect(screen.queryByRole('heading', { name: /Needs decomposition/i })).toBeNull()
+    expect(screen.queryByRole('button', { name: /decompose t_missing/i })).toBeNull()
+    expect(onTaskAction).not.toHaveBeenCalled()
+
+    rerender(<LoopPanel onTaskAction={onTaskAction} open selectedTaskId="t_archived" state={state} />)
+    expect(screen.getByRole('heading', { name: /Archived task/i })).toBeTruthy()
+    expect(screen.getByText('No run recorded yet.')).toBeTruthy()
+    expect(screen.queryByRole('button', { name: /block t_archived/i })).toBeNull()
+    expect(screen.queryByRole('button', { name: /park t_archived/i })).toBeNull()
   })
 })
