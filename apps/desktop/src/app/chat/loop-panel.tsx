@@ -86,6 +86,12 @@ function selectedRowFrom(state: LoopPanelState | null, selectedTaskId?: null | s
   return state.rows.find(row => row.taskId === selectedTaskId) || state.rows[0] || null
 }
 
+function canOfferLoopCreationGuidance(row: LoopRow): boolean {
+  const status = row.status.toLowerCase()
+
+  return status === 'triage' || status === 'context'
+}
+
 interface LoopStackRowProps {
   onSelect: (row: LoopRow) => void
   row: LoopRow
@@ -193,11 +199,6 @@ export function LoopPanel({ hidden = false, onHide, open = false, selectedTaskId
             </p>
           </div>
           <div className="flex shrink-0 items-center gap-1">
-            {state.rootTaskId && (
-              <span className="rounded bg-(--ui-fill-quaternary) px-1.5 py-0.5 font-mono text-[0.65rem] text-(--ui-text-tertiary)">
-                {state.rootTaskId}
-              </span>
-            )}
             {onHide && (
               <Button aria-label="Hide Loop panel" className="size-7 p-0" onClick={onHide} type="button" variant="ghost">
                 <Codicon name="close" size="0.875rem" />
@@ -206,7 +207,7 @@ export function LoopPanel({ hidden = false, onHide, open = false, selectedTaskId
           </div>
         </div>
 
-        {state.message && (
+        {state.message && state.status !== 'ready' && (
           <div
             className={cn(
               'mb-3 rounded-lg border px-2 py-1.5 text-xs',
@@ -230,14 +231,23 @@ export function LoopPanel({ hidden = false, onHide, open = false, selectedTaskId
                   <LoopStatusIndicator row={selected} />
                   <span className="min-w-0 truncate">{selected.title}</span>
                 </div>
-                <div className="font-mono text-(--ui-text-tertiary)">{selected.taskId}</div>
-                <div>Parents: {selected.parents.length ? selected.parents.join(', ') : 'none'}</div>
                 <div>Links: {selected.parentCount} parents · {selected.childCount} children</div>
+                {canOfferLoopCreationGuidance(selected) && (
+                  <p className="m-0 text-(--ui-text-tertiary)">
+                    Use this row to guide Loop creation or decomposition.
+                  </p>
+                )}
+                {debugOpen && (
+                  <>
+                    <div className="font-mono text-(--ui-text-tertiary)">{selected.taskId}</div>
+                    <div>Parents: {selected.parents.length ? selected.parents.join(', ') : 'none'}</div>
+                  </>
+                )}
               </div>
             </section>
           ) : (
             <p className="m-0 rounded-lg border border-dashed border-(--ui-stroke-tertiary) p-3 text-xs text-(--ui-text-tertiary)">
-              No Loop rows yet. Ask Hermes to read or mutate the Loop graph.
+              {state.message || 'No Loop rows for this session.'}
             </p>
           )}
         </div>

@@ -274,7 +274,7 @@ export function ChatView({
     [loopSourceQuery.data]
   )
 
-  const loopPanelState = tenantLoopPanelState?.rows.length ? tenantLoopPanelState : transcriptLoopPanelState
+  const loopPanelState = tenantLoopPanelState || transcriptLoopPanelState
   const [selectedLoopTask, setSelectedLoopTask] = useState<LoopRow | null>(null)
   const selectedLoopTaskId = selectedLoopTask?.taskId || null
   const [loopPanelOpen, setLoopPanelOpen] = useState(false)

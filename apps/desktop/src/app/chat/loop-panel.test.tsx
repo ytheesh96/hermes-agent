@@ -138,6 +138,22 @@ describe('tenant-backed loop mapping', () => {
     expect(state?.rows.find(row => row.taskId === 't_child')).toMatchObject({ childCount: 0, parentCount: 1, parents: ['t_parent'] })
   })
 
+  it('keeps empty tenant results as a quiet empty state without falling back to legacy rows', () => {
+    const state = deriveLoopPanelStateFromTenantSource({
+      latest_event_id: 9,
+      session_id: 'session-empty',
+      tasks: []
+    })
+
+    expect(state).toMatchObject({
+      message: 'No Loop rows for this session.',
+      revision: 9,
+      rootTaskId: 'session-empty',
+      rows: [],
+      status: 'ready'
+    })
+  })
+
   it('keeps dependency ordering deterministic for cycles without hanging', () => {
     const state = deriveLoopPanelStateFromTenantSource({
       tasks: [
@@ -261,8 +277,9 @@ describe('LoopPanel', () => {
     expect(screen.getByTestId('loop-panel').className).toContain('w-[min(20rem,45vw)]')
     expect(screen.queryByRole('button', { name: /dismiss loop panel overlay/i })).toBeNull()
     expect(screen.getByText('Loop details')).toBeTruthy()
-    expect(screen.getByText('t_child')).toBeTruthy()
-    expect(screen.getByText('Parents: t_parent')).toBeTruthy()
+    expect(screen.queryByText('t_child')).toBeNull()
+    expect(screen.queryByText('Parents: t_parent')).toBeNull()
+    expect(screen.getByText('Links: 1 parents · 0 children')).toBeTruthy()
     expect(screen.queryByText(/triage/i)).toBeNull()
 
     fireEvent.click(screen.getByRole('button', { name: /hide loop panel/i }))
@@ -270,9 +287,26 @@ describe('LoopPanel', () => {
 
     fireEvent.click(screen.getByText('Design parent'))
     expect(screen.getByTestId('loop-panel')).toBeTruthy()
-    expect(screen.getByText('t_parent')).toBeTruthy()
+    expect(screen.queryByText('t_parent')).toBeNull()
 
     fireEvent.click(screen.getByRole('button', { name: /show debug json/i }))
     expect(screen.getByText(/"nodes"/)).toBeTruthy()
+    expect(screen.getByText('t_parent')).toBeTruthy()
+    expect(screen.getByText('Parents: none')).toBeTruthy()
+  })
+
+  it('renders a quiet empty state for tenant sessions without creation guidance or raw ids', () => {
+    const state = deriveLoopPanelStateFromTenantSource({ session_id: 'session-empty', tasks: [] })
+
+    render(<LoopPanel open state={state} />)
+
+    expect(screen.getByText('No Loop rows for this session.')).toBeTruthy()
+    expect(screen.queryByText(/ask hermes/i)).toBeNull()
+    expect(screen.queryByText('session-empty')).toBeNull()
+    expect(screen.queryByText(/"session_id"/)).toBeNull()
+
+    fireEvent.click(screen.getByRole('button', { name: /show debug json/i }))
+    expect(screen.getByText(/"session_id"/)).toBeTruthy()
+    expect(screen.getByText(/session-empty/)).toBeTruthy()
   })
 })
