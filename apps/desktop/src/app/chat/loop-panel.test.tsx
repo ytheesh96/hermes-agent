@@ -244,6 +244,35 @@ describe('LoopPanel', () => {
     expect(selectTask).toHaveBeenNthCalledWith(3, expect.objectContaining({ taskId: 't_parent', title: 'Design parent' }))
   })
 
+  it('opens and reopens the docked shell from tenant-backed row clicks without transcript rows', () => {
+    const state = deriveLoopPanelStateFromTenantSource({
+      latest_event_id: 11,
+      session_id: 'tenant-only-session',
+      tasks: [
+        { id: 't_parent', title: 'Design parent', status: 'done', included_child_ids: ['t_child'] },
+        { id: 't_child', title: 'Build child', status: 'ready', included_parent_ids: ['t_parent'] }
+      ]
+    })
+
+    render(<LoopHarness state={state!} />)
+
+    expect(screen.getByTestId('loop-panel').className).toContain('hidden xl:flex')
+    expect(screen.queryByText('tenant-only-session')).toBeNull()
+
+    fireEvent.click(screen.getByText(/Build child/))
+    expect(screen.getByTestId('loop-panel').className).not.toContain('hidden xl:flex')
+    expect(screen.getByText('Loop details')).toBeTruthy()
+    expect(screen.getByText('Links: 1 parents · 0 children')).toBeTruthy()
+    expect(screen.queryByText('t_child')).toBeNull()
+
+    fireEvent.click(screen.getByRole('button', { name: /hide loop panel/i }))
+    expect(screen.queryByTestId('loop-panel')).toBeNull()
+
+    fireEvent.click(screen.getByText(/Design parent/))
+    expect(screen.getByTestId('loop-panel').className).not.toContain('hidden xl:flex')
+    expect(screen.getByText('Links: 0 parents · 1 children')).toBeTruthy()
+  })
+
   it('renders rows, opens useful draft details on click, and hides raw JSON behind debug', () => {
     const state = deriveLoopPanelState([
       toolMessage({
