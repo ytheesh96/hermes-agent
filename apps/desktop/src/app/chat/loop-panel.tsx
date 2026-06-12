@@ -132,80 +132,107 @@ export function LoopTaskStack({ onSelectTaskId, selectedTaskId, state }: LoopTas
 }
 
 interface LoopPanelProps {
+  hidden?: boolean
+  onHide?: () => void
+  open?: boolean
   selectedTaskId?: null | string
   state: LoopPanelState | null
 }
 
-export function LoopPanel({ selectedTaskId, state }: LoopPanelProps) {
+export function LoopPanel({ hidden = false, onHide, open = false, selectedTaskId, state }: LoopPanelProps) {
   const [debugOpen, setDebugOpen] = useState(false)
 
   const selected = useMemo(() => selectedRowFrom(state, selectedTaskId), [selectedTaskId, state])
 
-  if (!state) {
+  if (!state || hidden) {
     return null
   }
 
   return (
-    <aside className="hidden w-80 shrink-0 border-l border-(--ui-stroke-secondary) bg-(--ui-sidebar-background) p-3 text-(--ui-text-secondary) xl:flex xl:flex-col">
-      <div className="mb-3 flex items-start justify-between gap-3">
-        <div className="min-w-0">
-          <h2 className="m-0 text-sm font-semibold text-(--ui-text-primary)">Loop</h2>
-          <p className="m-0 mt-0.5 text-xs text-(--ui-text-tertiary)">
-            {statusCopy(state.status)} · rev {state.revision || '—'}
-          </p>
-        </div>
-        {state.rootTaskId && (
-          <span className="rounded bg-(--ui-fill-quaternary) px-1.5 py-0.5 font-mono text-[0.65rem] text-(--ui-text-tertiary)">
-            {state.rootTaskId}
-          </span>
-        )}
-      </div>
-
-      {state.message && (
-        <div
-          className={cn(
-            'mb-3 rounded-lg border px-2 py-1.5 text-xs',
-            state.status === 'stale'
-              ? 'border-amber-500/30 bg-amber-500/10 text-amber-700 dark:text-amber-300'
-              : 'border-destructive/30 bg-destructive/10 text-destructive'
-          )}
-        >
-          {state.message}
-        </div>
+    <>
+      {open && onHide && (
+        <button
+          aria-label="Dismiss Loop panel overlay"
+          className="fixed inset-0 z-30 bg-black/20 backdrop-blur-[1px] xl:hidden"
+          onClick={onHide}
+          type="button"
+        />
       )}
+      <aside
+        className={cn(
+          'fixed inset-y-2 right-2 z-40 flex w-80 max-w-[calc(100vw-1rem)] flex-col rounded-xl border border-(--ui-stroke-secondary) bg-(--ui-sidebar-background) p-3 text-(--ui-text-secondary) shadow-2xl',
+          'xl:static xl:inset-auto xl:max-h-none xl:max-w-none xl:shrink-0 xl:rounded-none xl:border-y-0 xl:border-r-0 xl:shadow-none',
+          !open && 'hidden xl:flex'
+        )}
+        data-testid="loop-panel"
+      >
+        <div className="mb-3 flex items-start justify-between gap-3">
+          <div className="min-w-0">
+            <h2 className="m-0 text-sm font-semibold text-(--ui-text-primary)">Loop</h2>
+            <p className="m-0 mt-0.5 text-xs text-(--ui-text-tertiary)">
+              {statusCopy(state.status)} · rev {state.revision || '—'}
+            </p>
+          </div>
+          <div className="flex shrink-0 items-center gap-1">
+            {state.rootTaskId && (
+              <span className="rounded bg-(--ui-fill-quaternary) px-1.5 py-0.5 font-mono text-[0.65rem] text-(--ui-text-tertiary)">
+                {state.rootTaskId}
+              </span>
+            )}
+            {onHide && (
+              <Button aria-label="Hide Loop panel" className="size-7 p-0" onClick={onHide} type="button" variant="ghost">
+                <Codicon name="close" size="0.875rem" />
+              </Button>
+            )}
+          </div>
+        </div>
 
-      <div className="min-h-0 flex-1 overflow-auto">
-        {selected ? (
-          <section className="rounded-lg border border-(--ui-stroke-tertiary) bg-(--ui-surface-background) p-3 text-xs">
-            <h3 className="m-0 mb-2 text-xs font-semibold uppercase tracking-wide text-(--ui-text-tertiary)">
-              Loop details
-            </h3>
-            <div className="grid gap-1.5">
-              <div className="flex items-center gap-2 font-medium text-(--ui-text-primary)">
-                <LoopStatusIndicator row={selected} />
-                <span className="min-w-0 truncate">{selected.title}</span>
+        {state.message && (
+          <div
+            className={cn(
+              'mb-3 rounded-lg border px-2 py-1.5 text-xs',
+              state.status === 'stale'
+                ? 'border-amber-500/30 bg-amber-500/10 text-amber-700 dark:text-amber-300'
+                : 'border-destructive/30 bg-destructive/10 text-destructive'
+            )}
+          >
+            {state.message}
+          </div>
+        )}
+
+        <div className="min-h-0 flex-1 overflow-auto">
+          {selected ? (
+            <section className="rounded-lg border border-(--ui-stroke-tertiary) bg-(--ui-surface-background) p-3 text-xs">
+              <h3 className="m-0 mb-2 text-xs font-semibold uppercase tracking-wide text-(--ui-text-tertiary)">
+                Loop details
+              </h3>
+              <div className="grid gap-1.5">
+                <div className="flex items-center gap-2 font-medium text-(--ui-text-primary)">
+                  <LoopStatusIndicator row={selected} />
+                  <span className="min-w-0 truncate">{selected.title}</span>
+                </div>
+                <div className="font-mono text-(--ui-text-tertiary)">{selected.taskId}</div>
+                <div>Parents: {selected.parents.length ? selected.parents.join(', ') : 'none'}</div>
               </div>
-              <div className="font-mono text-(--ui-text-tertiary)">{selected.taskId}</div>
-              <div>Parents: {selected.parents.length ? selected.parents.join(', ') : 'none'}</div>
-            </div>
-          </section>
-        ) : (
-          <p className="m-0 rounded-lg border border-dashed border-(--ui-stroke-tertiary) p-3 text-xs text-(--ui-text-tertiary)">
-            No Loop rows yet. Ask Hermes to read or mutate the Loop graph.
-          </p>
-        )}
-      </div>
+            </section>
+          ) : (
+            <p className="m-0 rounded-lg border border-dashed border-(--ui-stroke-tertiary) p-3 text-xs text-(--ui-text-tertiary)">
+              No Loop rows yet. Ask Hermes to read or mutate the Loop graph.
+            </p>
+          )}
+        </div>
 
-      <div className="mt-3 border-t border-(--ui-stroke-tertiary) pt-3">
-        <Button className="h-7 px-2 text-xs" onClick={() => setDebugOpen(open => !open)} type="button" variant="ghost">
-          {debugOpen ? 'Hide debug JSON' : 'Show debug JSON'}
-        </Button>
-        {debugOpen && (
-          <pre className="mt-2 max-h-36 overflow-auto rounded border border-(--ui-stroke-tertiary) bg-(--ui-fill-quaternary) p-2 text-[0.65rem] text-(--ui-text-secondary)">
-            {state.rawJson}
-          </pre>
-        )}
-      </div>
-    </aside>
+        <div className="mt-3 border-t border-(--ui-stroke-tertiary) pt-3">
+          <Button className="h-7 px-2 text-xs" onClick={() => setDebugOpen(value => !value)} type="button" variant="ghost">
+            {debugOpen ? 'Hide debug JSON' : 'Show debug JSON'}
+          </Button>
+          {debugOpen && (
+            <pre className="mt-2 max-h-36 overflow-auto rounded border border-(--ui-stroke-tertiary) bg-(--ui-fill-quaternary) p-2 text-[0.65rem] text-(--ui-text-secondary)">
+              {state.rawJson}
+            </pre>
+          )}
+        </div>
+      </aside>
+    </>
   )
 }

@@ -26,11 +26,24 @@ afterEach(() => cleanup())
 
 function LoopHarness({ state }: { state: LoopPanelState }) {
   const [selectedTaskId, setSelectedTaskId] = useState<string | null>(null)
+  const [panelOpen, setPanelOpen] = useState(false)
+  const [panelHidden, setPanelHidden] = useState(false)
+
+  function selectTask(taskId: string) {
+    setSelectedTaskId(taskId)
+    setPanelOpen(true)
+    setPanelHidden(false)
+  }
+
+  function hidePanel() {
+    setPanelOpen(false)
+    setPanelHidden(true)
+  }
 
   return (
     <>
-      <LoopTaskStack onSelectTaskId={setSelectedTaskId} selectedTaskId={selectedTaskId} state={state} />
-      <LoopPanel selectedTaskId={selectedTaskId} state={state} />
+      <LoopTaskStack onSelectTaskId={selectTask} selectedTaskId={selectedTaskId} state={state} />
+      <LoopPanel hidden={panelHidden} onHide={hidePanel} open={panelOpen} selectedTaskId={selectedTaskId} state={state} />
     </>
   )
 }
@@ -93,13 +106,24 @@ describe('LoopPanel', () => {
     expect(screen.queryByText('active')).toBeNull()
     expect(screen.queryByText('frontier')).toBeNull()
     expect(screen.getByTestId('loop-card-t_child').getAttribute('style')).toContain('--loop-depth: 1')
+    expect(screen.getByTestId('loop-panel').className).toContain('hidden xl:flex')
     expect(screen.queryByText(/"nodes"/)).toBeNull()
 
     fireEvent.click(screen.getByText('Build child'))
+    expect(screen.getByTestId('loop-panel').className).not.toContain('hidden xl:flex')
+    expect(screen.getByTestId('loop-panel').className).toContain('fixed')
+    expect(screen.getByRole('button', { name: /dismiss loop panel overlay/i })).toBeTruthy()
     expect(screen.getByText('Loop details')).toBeTruthy()
     expect(screen.getByText('t_child')).toBeTruthy()
     expect(screen.getByText('Parents: t_parent')).toBeTruthy()
     expect(screen.queryByText(/triage/i)).toBeNull()
+
+    fireEvent.click(screen.getByRole('button', { name: /hide loop panel/i }))
+    expect(screen.queryByTestId('loop-panel')).toBeNull()
+
+    fireEvent.click(screen.getByText('Design parent'))
+    expect(screen.getByTestId('loop-panel')).toBeTruthy()
+    expect(screen.getByText('t_parent')).toBeTruthy()
 
     fireEvent.click(screen.getByRole('button', { name: /show debug json/i }))
     expect(screen.getByText(/"nodes"/)).toBeTruthy()

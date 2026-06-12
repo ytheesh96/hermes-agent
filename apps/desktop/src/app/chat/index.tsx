@@ -7,7 +7,7 @@ import {
 import { useStore } from '@nanostores/react'
 import { useQuery } from '@tanstack/react-query'
 import type * as React from 'react'
-import { Suspense, useCallback, useMemo, useRef, useState } from 'react'
+import { Suspense, useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import { useLocation } from 'react-router-dom'
 
 import { Thread } from '@/components/assistant-ui/thread'
@@ -259,6 +259,27 @@ export function ChatView({
 
   const loopPanelState = useMemo(() => deriveLoopPanelState(messages), [messages])
   const [selectedLoopTaskId, setSelectedLoopTaskId] = useState<string | null>(null)
+  const [loopPanelOpen, setLoopPanelOpen] = useState(false)
+  const [loopPanelHidden, setLoopPanelHidden] = useState(false)
+
+  const loopPanelRootKey = loopPanelState?.rootTaskId || ''
+
+  useEffect(() => {
+    setSelectedLoopTaskId(null)
+    setLoopPanelOpen(false)
+    setLoopPanelHidden(false)
+  }, [loopPanelRootKey])
+
+  const handleSelectLoopTaskId = useCallback((taskId: string) => {
+    setSelectedLoopTaskId(taskId)
+    setLoopPanelOpen(true)
+    setLoopPanelHidden(false)
+  }, [])
+
+  const handleHideLoopPanel = useCallback(() => {
+    setLoopPanelOpen(false)
+    setLoopPanelHidden(true)
+  }, [])
 
   const runtimeMessageRepository = useMemo(() => {
     const items: { message: ThreadMessage; parentId: string | null }[] = []
@@ -403,7 +424,7 @@ export function ChatView({
                   statusStackLead={
                     loopPanelState?.rows.length ? (
                       <LoopTaskStack
-                        onSelectTaskId={setSelectedLoopTaskId}
+                        onSelectTaskId={handleSelectLoopTaskId}
                         selectedTaskId={selectedLoopTaskId}
                         state={loopPanelState}
                       />
@@ -416,7 +437,13 @@ export function ChatView({
           <ChatDropOverlay kind={dragKind} />
           <ChatSwapOverlay profile={gatewaySwapTarget} />
         </div>
-        <LoopPanel selectedTaskId={selectedLoopTaskId} state={loopPanelState} />
+        <LoopPanel
+          hidden={loopPanelHidden}
+          onHide={handleHideLoopPanel}
+          open={loopPanelOpen}
+          selectedTaskId={selectedLoopTaskId}
+          state={loopPanelState}
+        />
       </div>
     </div>
   )
