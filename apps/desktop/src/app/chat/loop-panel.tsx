@@ -87,7 +87,7 @@ function selectedRowFrom(state: LoopPanelState | null, selectedTaskId?: null | s
 }
 
 interface LoopStackRowProps {
-  onSelect: (taskId: string) => void
+  onSelect: (row: LoopRow) => void
   row: LoopRow
   selected: boolean
 }
@@ -98,7 +98,7 @@ function LoopStackRow({ onSelect, row, selected }: LoopStackRowProps) {
       <StatusRow
         className={cn(selected && 'bg-(--ui-row-hover-background)')}
         leading={<LoopStatusIndicator row={row} />}
-        onActivate={() => onSelect(row.taskId)}
+        onActivate={() => onSelect(row)}
       >
         <span className="flex min-w-0 flex-1 items-baseline gap-1.5">
           <span
@@ -130,12 +130,12 @@ function LoopStackRow({ onSelect, row, selected }: LoopStackRowProps) {
 }
 
 interface LoopTaskStackProps {
-  onSelectTaskId: (taskId: string) => void
+  onSelectTask: (row: LoopRow) => void
   selectedTaskId?: null | string
   state: LoopPanelState | null
 }
 
-export function LoopTaskStack({ onSelectTaskId, selectedTaskId, state }: LoopTaskStackProps) {
+export function LoopTaskStack({ onSelectTask, selectedTaskId, state }: LoopTaskStackProps) {
   const selected = useMemo(() => selectedRowFrom(state, selectedTaskId), [selectedTaskId, state])
 
   if (!state || state.rows.length === 0) {
@@ -151,7 +151,7 @@ export function LoopTaskStack({ onSelectTaskId, selectedTaskId, state }: LoopTas
       {state.rows.map(row => (
         <LoopStackRow
           key={row.taskId}
-          onSelect={onSelectTaskId}
+          onSelect={onSelectTask}
           row={row}
           selected={selected?.taskId === row.taskId}
         />
