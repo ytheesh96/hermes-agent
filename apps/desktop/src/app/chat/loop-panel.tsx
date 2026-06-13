@@ -3,6 +3,7 @@ import {
   type ReactNode,
   type PointerEvent as ReactPointerEvent,
   useCallback,
+  useEffect,
   useMemo,
   useState
 } from 'react'
@@ -409,6 +410,7 @@ export function LoopTaskStack({ onRefresh, onSelectTaskId, refreshing = false, s
 interface LoopPanelProps {
   enableDebugJson?: boolean
   hidden?: boolean
+  onFocusTaskId?: (taskId: string) => void
   onHide?: () => void
   onRefresh?: () => void
   onSelectTaskId?: (taskId: string) => void
@@ -695,6 +697,7 @@ function LoopTaskDetails({
 export function LoopPanel({
   enableDebugJson = false,
   hidden = false,
+  onFocusTaskId,
   onHide,
   onRefresh,
   onSelectTaskId,
@@ -706,41 +709,52 @@ export function LoopPanel({
 }: LoopPanelProps) {
   const [debugOpen, setDebugOpen] = useState(false)
   const [navigationStack, setNavigationStack] = useState<LoopRow[]>([])
+  const [focusedTaskId, setFocusedTaskId] = useState<null | string>(selectedTaskId || null)
   const [panelWidth, setPanelWidth] = useState(LOOP_PANEL_DEFAULT_WIDTH)
 
+  useEffect(() => {
+    setFocusedTaskId(selectedTaskId || null)
+    setNavigationStack([])
+  }, [selectedTaskId])
+
   const selected = useMemo(
-    () => selectedRowFrom(state, selectedTaskId, selectedTaskDetail),
-    [selectedTaskDetail, selectedTaskId, state]
+    () => selectedRowFrom(state, focusedTaskId, selectedTaskDetail),
+    [focusedTaskId, selectedTaskDetail, state]
   )
 
   const rowById = useMemo(() => {
     const rows = state?.rows || []
     const map = new Map(rows.map(row => [row.taskId, row]))
-    const detailRow = detailRowFromTaskDetail(selectedTaskDetail, selectedTaskId)
+    const detailRow = detailRowFromTaskDetail(selectedTaskDetail, focusedTaskId)
 
     if (detailRow) {
       map.set(detailRow.taskId, detailRow)
     }
 
     return map
-  }, [selectedTaskDetail, selectedTaskId, state])
+  }, [focusedTaskId, selectedTaskDetail, state])
+
+  const focusDrawerTask = useCallback((taskId: string) => {
+    setFocusedTaskId(taskId)
+    onFocusTaskId?.(taskId)
+  }, [onFocusTaskId])
 
   const selectRelatedTask = useCallback((taskId: string) => {
     if (selected && selected.taskId !== taskId) {
-      setNavigationStack(stack => [...stack, selected])
+      setNavigationStack(stack => [...stack, selected].slice(-8))
     }
 
-    onSelectTaskId?.(taskId)
-  }, [onSelectTaskId, selected])
+    focusDrawerTask(taskId)
+  }, [focusDrawerTask, selected])
 
   const goBack = useCallback(() => {
     const previous = navigationStack.at(-1)
 
     if (previous) {
-      onSelectTaskId?.(previous.taskId)
+      focusDrawerTask(previous.taskId)
       setNavigationStack(stack => stack.slice(0, -1))
     }
-  }, [navigationStack, onSelectTaskId])
+  }, [focusDrawerTask, navigationStack])
 
   const backTarget = navigationStack.at(-1)
 
@@ -860,17 +874,17 @@ export function LoopPanel({
                   detail={selectedTaskDetail}
                   onBack={backTarget ? goBack : undefined}
                   onRefresh={onRefresh}
-                  onSelectTaskId={onSelectTaskId ? selectRelatedTask : undefined}
+                  onSelectTaskId={onSelectTaskId || onFocusTaskId ? selectRelatedTask : undefined}
                   onTaskAction={onTaskAction}
                   row={selected}
                   rowById={rowById}
                 />
               </div>
-            ) : selectedTaskId ? (
+            ) : focusedTaskId ? (
               <section className="rounded-lg border border-amber-500/30 bg-amber-500/10 p-3 text-xs text-amber-700 dark:text-amber-300">
                 <h3 className="m-0 mb-2 text-xs font-semibold uppercase tracking-wide">Selected task unavailable</h3>
                 <p className="m-0">
-                  Task <span className="font-mono">{selectedTaskId}</span> is missing from the latest Loop source. It may have been archived,
+                  Task <span className="font-mono">{focusedTaskId}</span> is missing from the latest Loop source. It may have been archived,
                   deleted, or refreshed out of this session lineage. Select another row or close the panel.
                 </p>
               </section>

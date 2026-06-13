@@ -280,15 +280,16 @@ export function ChatView({
 
   const loopPanelState = tenantLoopPanelState?.rows.length ? tenantLoopPanelState : transcriptLoopPanelState
   const [selectedLoopTaskId, setSelectedLoopTaskId] = useState<string | null>(null)
+  const [focusedLoopTaskId, setFocusedLoopTaskId] = useState<string | null>(null)
   const [loopPanelOpen, setLoopPanelOpen] = useState(false)
   const [loopPanelHidden, setLoopPanelHidden] = useState(false)
 
   const loopPanelRootKey = loopPanelState?.rootTaskId || ''
 
   const selectedLoopTaskDetailQuery = useQuery({
-    queryKey: ['loop-task-detail', activeGatewayProfile, selectedLoopTaskId, loopPanelState?.revision || 0],
-    queryFn: () => getLoopTaskDetail(selectedLoopTaskId!, activeGatewayProfile),
-    enabled: gatewayOpen && loopPanelOpen && Boolean(selectedLoopTaskId) && Boolean(tenantLoopPanelState?.rows.length),
+    queryKey: ['loop-task-detail', activeGatewayProfile, focusedLoopTaskId, loopPanelState?.revision || 0],
+    queryFn: () => getLoopTaskDetail(focusedLoopTaskId!, activeGatewayProfile),
+    enabled: gatewayOpen && loopPanelOpen && Boolean(focusedLoopTaskId) && Boolean(tenantLoopPanelState?.rows.length),
     staleTime: 2_000
   })
 
@@ -305,12 +306,14 @@ export function ChatView({
 
   useEffect(() => {
     setSelectedLoopTaskId(null)
+    setFocusedLoopTaskId(null)
     setLoopPanelOpen(false)
     setLoopPanelHidden(false)
   }, [loopPanelRootKey])
 
   const handleSelectLoopTaskId = useCallback((taskId: string) => {
     setSelectedLoopTaskId(taskId)
+    setFocusedLoopTaskId(taskId)
     setLoopPanelOpen(true)
     setLoopPanelHidden(false)
   }, [])
@@ -510,6 +513,7 @@ export function ChatView({
       </div>
       <LoopPanel
         hidden={loopPanelHidden}
+        onFocusTaskId={setFocusedLoopTaskId}
         onHide={handleHideLoopPanel}
         onRefresh={() => void loopSourceQuery.refetch()}
         onSelectTaskId={handleSelectLoopTaskId}
