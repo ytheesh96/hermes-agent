@@ -470,6 +470,63 @@ def _infer_session_source_tenants(
     return session_tenants, False
 
 
+def _session_source_board_candidates(explicit_board: Optional[str]) -> list[str]:
+    if explicit_board:
+        return [explicit_board]
+
+    candidates: list[str] = []
+
+    def add(slug: str | None) -> None:
+        value = (slug or "").strip()
+        if value and value not in candidates:
+            candidates.append(value)
+
+    add(kanban_db.get_current_board())
+    for meta in kanban_db.list_boards(include_archived=False):
+        add(str(meta.get("slug") or ""))
+
+    return candidates or [kanban_db.DEFAULT_BOARD]
+
+
+def _query_session_source_rows(
+    conn: sqlite3.Connection,
+    lineage_session_ids: list[str],
+    *,
+    explicit_tenant: Optional[str],
+    include_archived: bool,
+) -> tuple[list[sqlite3.Row], list[str], list[str]]:
+    inferred_tenants: list[str] = []
+    tenant_scope_only = False
+    if explicit_tenant:
+        tenant_filters = [explicit_tenant]
+    else:
+        inferred_tenants, tenant_scope_only = _infer_session_source_tenants(conn, lineage_session_ids)
+        tenant_filters = inferred_tenants
+
+    params: list[Any] = []
+    if tenant_filters and tenant_scope_only:
+        where = [f"tenant IN ({','.join('?' for _ in tenant_filters)})"]
+        params.extend(tenant_filters)
+    else:
+        where = [f"session_id IN ({','.join('?' for _ in lineage_session_ids)})"]
+        params.extend(lineage_session_ids)
+        if tenant_filters:
+            where.append(f"tenant IN ({','.join('?' for _ in tenant_filters)})")
+            params.extend(tenant_filters)
+    if not include_archived:
+        where.append("status != 'archived'")
+
+    rows = conn.execute(
+        f"""
+        SELECT * FROM tasks
+        WHERE {' AND '.join(where)}
+        ORDER BY created_at ASC, priority DESC, id ASC
+        """,
+        tuple(params),
+    ).fetchall()
+    return rows, inferred_tenants, tenant_filters
+
+
 def _compact_task_context(task: kanban_db.Task) -> dict[str, Any]:
     return {
         "id": task.id,
@@ -570,38 +627,48 @@ def get_session_source(
     if not lineage_session_ids:
         raise HTTPException(status_code=400, detail="session_id is required")
 
-    conn = _conn(board=board)
+    explicit_tenant = (tenant or "").strip() or None
+    selected_board: Optional[str] = None
+    conn: Optional[sqlite3.Connection] = None
+    rows: list[sqlite3.Row] = []
+    inferred_tenants: list[str] = []
+    tenant_filters: list[str] = []
+
+    candidate_boards = _session_source_board_candidates(board)
+    for candidate_board in candidate_boards:
+        candidate_conn = _conn(board=candidate_board)
+        try:
+            candidate_rows, candidate_inferred, candidate_filters = _query_session_source_rows(
+                candidate_conn,
+                lineage_session_ids,
+                explicit_tenant=explicit_tenant,
+                include_archived=include_archived,
+            )
+        except Exception:
+            candidate_conn.close()
+            raise
+
+        if candidate_rows or board is not None:
+            selected_board = candidate_board
+            conn = candidate_conn
+            rows = candidate_rows
+            inferred_tenants = candidate_inferred
+            tenant_filters = candidate_filters
+            break
+
+        candidate_conn.close()
+
+    if conn is None:
+        selected_board = candidate_boards[0]
+        conn = _conn(board=selected_board)
+        rows, inferred_tenants, tenant_filters = _query_session_source_rows(
+            conn,
+            lineage_session_ids,
+            explicit_tenant=explicit_tenant,
+            include_archived=include_archived,
+        )
+
     try:
-        explicit_tenant = (tenant or "").strip() or None
-        inferred_tenants: list[str] = []
-        tenant_scope_only = False
-        if explicit_tenant:
-            tenant_filters = [explicit_tenant]
-        else:
-            inferred_tenants, tenant_scope_only = _infer_session_source_tenants(conn, lineage_session_ids)
-            tenant_filters = inferred_tenants
-
-        params: list[Any] = []
-        if tenant_filters and tenant_scope_only:
-            where = [f"tenant IN ({','.join('?' for _ in tenant_filters)})"]
-            params.extend(tenant_filters)
-        else:
-            where = [f"session_id IN ({','.join('?' for _ in lineage_session_ids)})"]
-            params.extend(lineage_session_ids)
-            if tenant_filters:
-                where.append(f"tenant IN ({','.join('?' for _ in tenant_filters)})")
-                params.extend(tenant_filters)
-        if not include_archived:
-            where.append("status != 'archived'")
-
-        rows = conn.execute(
-            f"""
-            SELECT * FROM tasks
-            WHERE {' AND '.join(where)}
-            ORDER BY created_at ASC, priority DESC, id ASC
-            """,
-            tuple(params),
-        ).fetchall()
         tasks = [kanban_db.Task.from_row(row) for row in rows]
         task_ids = [task.id for task in tasks]
         task_id_set = set(task_ids)
@@ -688,6 +755,7 @@ def get_session_source(
             payload_tasks.append(item)
 
         return {
+            "board": selected_board,
             "session_id": (session_id or os.environ.get("HERMES_SESSION_ID") or "").strip(),
             "lineage_session_ids": lineage_session_ids,
             "tenant": explicit_tenant or (inferred_tenants[0] if len(inferred_tenants) == 1 else None),
@@ -700,7 +768,8 @@ def get_session_source(
             "now": int(time.time()),
         }
     finally:
-        conn.close()
+        if conn is not None:
+            conn.close()
 
 
 # ---------------------------------------------------------------------------

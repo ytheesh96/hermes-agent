@@ -292,6 +292,46 @@ def test_session_source_recovers_tasks_when_lineage_id_is_tenant_key(client, kan
     assert data["links"] == [{"parent_id": parent, "child_id": child}]
 
 
+def test_session_source_falls_back_to_board_containing_lineage_tenant(client, kanban_home):
+    """Desktop calls omit a board, so Loop source should find tenant rows off the current board."""
+    from hermes_state import SessionDB
+
+    tenant_root = "cross-board-tenant-root"
+    tip_session = "cross-board-tip-session"
+    session_db = SessionDB()
+    try:
+        session_db.create_session(tenant_root, "cli")
+        session_db.end_session(tenant_root, "compression")
+        session_db.create_session(tip_session, "cli", parent_session_id=tenant_root)
+    finally:
+        session_db.close()
+
+    kb.create_board("developer")
+    conn = kb.connect(board="developer")
+    try:
+        task = kb.create_task(
+            conn,
+            title="developer board tenant row",
+            tenant=tenant_root,
+            session_id=None,
+        )
+    finally:
+        conn.close()
+
+    assert kb.get_current_board() == kb.DEFAULT_BOARD
+
+    r = client.get(
+        "/api/plugins/kanban/session-source",
+        params={"session_id": tip_session},
+    )
+
+    assert r.status_code == 200, r.text
+    data = r.json()
+    assert data["board"] == "developer"
+    assert data["tenant"] == tenant_root
+    assert [item["id"] for item in data["tasks"]] == [task]
+
+
 def test_session_source_defaults_to_hermes_session_id_when_query_omits_session_id(
     client,
     monkeypatch,
