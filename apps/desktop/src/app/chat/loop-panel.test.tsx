@@ -668,7 +668,7 @@ describe('LoopPanel', () => {
     expect(screen.getByText('Workspace: unknown')).toBeTruthy()
   })
 
-  it('keeps stack selection anchored when drawer relation navigation changes detail focus', () => {
+  it('keeps stack selection anchored while drawer relation navigation and back stack change detail focus', () => {
     const state = deriveLoopPanelStateFromTenantSource({
       session_id: 'sess-stable-selection',
       tenant: 'tenant-a',
@@ -685,8 +685,15 @@ describe('LoopPanel', () => {
           id: 't_child',
           title: 'Build child',
           status: 'blocked',
-          included_child_ids: [],
+          included_child_ids: ['t_grandchild'],
           included_parent_ids: ['t_parent']
+        },
+        {
+          id: 't_grandchild',
+          title: 'Review child',
+          status: 'running',
+          included_child_ids: [],
+          included_parent_ids: ['t_child']
         }
       ]
     })!
@@ -708,11 +715,27 @@ describe('LoopPanel', () => {
     expect(screen.getByTestId('loop-card-title-t_parent').className).not.toContain('line-clamp-2')
     expect(screen.getByRole('heading', { name: /Build child/i })).toBeTruthy()
 
+    fireEvent.click(screen.getByRole('button', { name: /select blocking task t_grandchild/i }))
+
+    expect(screen.getByRole('heading', { name: /Review child/i })).toBeTruthy()
+    expect(screen.getByTestId('loop-card-title-t_child').className).toContain('text-foreground/92')
+    expect(screen.getByTestId('loop-card-title-t_grandchild').className).not.toContain('text-foreground/92')
+
+    fireEvent.click(screen.getByRole('button', { name: /back to build child/i }))
+
+    expect(screen.getByRole('heading', { name: /Build child/i })).toBeTruthy()
+    expect(screen.getByTestId('loop-card-title-t_child').className).toContain('text-foreground/92')
+
     fireEvent.click(screen.getByRole('button', { name: /select blocked by task t_parent/i }))
 
     expect(screen.getByRole('heading', { name: /Design parent/i })).toBeTruthy()
     expect(screen.getByTestId('loop-card-title-t_child').className).toContain('text-foreground/92')
     expect(screen.getByTestId('loop-card-title-t_parent').className).not.toContain('line-clamp-2')
+
+    fireEvent.click(screen.getByRole('button', { name: /back to build child/i }))
+
+    expect(screen.getByRole('heading', { name: /Build child/i })).toBeTruthy()
+    expect(screen.getByTestId('loop-card-title-t_child').className).toContain('text-foreground/92')
   })
 
   it('uses fetched task detail when selecting a dependency that is not in the flat composer rows', () => {
