@@ -2806,6 +2806,7 @@ _LOOP_HANDOFF_TERMINAL_STATES = {
     "cancelled_superseded",
 }
 _LOOP_HANDOFF_REPAIR_LIMIT = 2
+LOOP_HANDOFF_ARTIFACT_DETAIL_POLICY = "metadata_only_untrusted_path"
 _LOOP_HANDOFF_SAFE_FOLLOWUP_KINDS = {"code", "test", "tests", "docs", "doc"}
 _LOOP_HANDOFF_ESCALATION_FLAGS = {
     "live_mutation",
@@ -3030,6 +3031,14 @@ def loop_handoff_status(
     pending = sum(1 for row in rows if row["state"] in {"recorded", "queued", "batched"})
     active = sum(1 for row in rows if row["state"] in _LOOP_HANDOFF_ACTIVE_STATES)
     terminal = sum(1 for row in rows if row["state"] in _LOOP_HANDOFF_TERMINAL_STATES)
+    escalated = sum(1 for row in rows if row["state"] == "escalated" or row.get("attention") == "needs-user")
+    approved = sum(
+        1
+        for row in rows
+        if row["state"] in {"closed", "approved", "released"}
+        and row.get("verification_state") == "approved"
+    )
+    needs_attention = pending + active + escalated
     return {
         "tenant": tenant,
         "root_task_id": root_task_id,
@@ -3037,6 +3046,10 @@ def loop_handoff_status(
         "active_count": active,
         "terminal_count": terminal,
         "total_count": len(rows),
+        "approved_count": approved,
+        "escalated_count": escalated,
+        "needs_attention_count": needs_attention,
+        "quiet_green": bool(rows) and needs_attention == 0 and approved == len(rows),
     }
 
 
@@ -3212,8 +3225,23 @@ def build_loop_handoff_proof_packet(conn: sqlite3.Connection, handoff_id: int | 
     return packet
 
 
+def _artifact_detail(path_value: str) -> dict[str, Any]:
+    """Return metadata-only artifact detail for an untrusted worker path.
+
+    Worker handoff metadata can contain arbitrary absolute paths. The dashboard
+    may display the reference, but must not read or stat it through this API:
+    even a bounded preview would become a local-file disclosure primitive if a
+    worker or DB row pointed at secrets outside the task workspace.
+    """
+    return {
+        "path": str(path_value or "").strip(),
+        "content_preview": None,
+        "content_policy": LOOP_HANDOFF_ARTIFACT_DETAIL_POLICY,
+    }
+
+
 def get_loop_handoff_details(conn: sqlite3.Connection, handoff_id: int) -> dict[str, Any]:
-    """Fetch full on-demand handoff details referenced by a proof packet."""
+    """Fetch safe on-demand handoff details referenced by a proof packet."""
     handoff = _handoff_row_by_id(conn, int(handoff_id))
     if not handoff:
         raise ValueError(f"loop handoff {handoff_id!r} not found")
@@ -3225,6 +3253,21 @@ def get_loop_handoff_details(conn: sqlite3.Connection, handoff_id: int) -> dict[
         "events": list_events(conn, handoff["task_id"]),
         "runs": list_runs(conn, handoff["task_id"]),
         "attachments": list_attachments(conn, handoff["task_id"]),
+        "detail_semantics": {
+            "artifact_content": LOOP_HANDOFF_ARTIFACT_DETAIL_POLICY,
+            "transcript_content": "metadata_only",
+        },
+        "transcript": {
+            "worker_session_id": handoff.get("worker_session_id"),
+            "originating_session_id": handoff.get("originating_session_id"),
+            "content_preview": None,
+            "content_policy": "metadata_only",
+        },
+        "artifact_details": [
+            _artifact_detail(path)
+            for path in handoff.get("artifacts", [])
+            if isinstance(path, str) and path.strip()
+        ],
     }
 
 
@@ -3275,7 +3318,12 @@ def _escalate_loop_handoff(
             "escalation_reason": escalation_reason,
         },
     )
-    return {"ok": False, "outcome": "escalated", "escalation_reason": escalation_reason}
+    return {
+        "ok": False,
+        "outcome": "escalated",
+        "escalation_reason": escalation_reason,
+        "notification": {"level": "escalation", "state": "needs-user"},
+    }
 
 
 def review_loop_handoff_autonomous_action(
@@ -3370,7 +3418,12 @@ def review_loop_handoff_autonomous_action(
     )
     _append_handoff_auto_action(conn, handoff, {"actor": actor, "action": action, "outcome": "approved", "reason": reason, "created_cards": created_cards})
     recompute_ready(conn)
-    return {"ok": True, "outcome": "approved", "created_cards": created_cards}
+    return {
+        "ok": True,
+        "outcome": "approved",
+        "created_cards": created_cards,
+        "notification": {"level": "quiet", "state": "approved"},
+    }
 
 def _append_loop_foreground_handoff_event(
     conn: sqlite3.Connection,

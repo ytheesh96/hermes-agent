@@ -276,7 +276,16 @@ def test_loop_handoffs_survive_reconnect_and_expose_status_api(kanban_home):
 
     assert len(pending) == 1
     assert pending[0]["task_id"] == task_id
-    assert status == {
+    assert status | {
+        "approved_count": 0,
+        "escalated_count": 0,
+        "needs_attention_count": 1,
+        "quiet_green": False,
+    } == status
+    assert {
+        key: status[key]
+        for key in ("tenant", "root_task_id", "pending_count", "active_count", "terminal_count", "total_count")
+    } == {
         "tenant": "tenant-a",
         "root_task_id": "t_looproot",
         "pending_count": 1,
@@ -325,6 +334,46 @@ def test_claimed_reviewer_batch_includes_compact_proof_packets_and_detail_ref(ka
     assert len(details["events"]) >= 1
 
 
+def test_handoff_details_expose_safe_transcript_and_artifact_metadata(kanban_home, tmp_path):
+    proof = tmp_path / "proof.log"
+    proof.write_text("A" * 5000 + "SECRET_AFTER_BOUND", encoding="utf-8")
+    outside_secret = tmp_path / "outside-secret.txt"
+    outside_secret.write_text("MUST_NOT_LEAK", encoding="utf-8")
+
+    with kb.connect() as conn:
+        task_id = _loop_node(conn, tenant="tenant-a", session_id="origin-session")
+        assert kb.claim_task(conn, task_id, claimer="worker-host:123") is not None
+        assert kb.complete_task(
+            conn,
+            task_id,
+            summary="implementation complete",
+            metadata={
+                "worker_session_id": "worker-session-1",
+                "artifacts": [str(proof), str(outside_secret)],
+                "changed_files": ["src/app.py"],
+            },
+        )
+        handoff = kb.list_loop_handoffs(conn)[0]
+        details = kb.get_loop_handoff_details(conn, handoff["id"])
+
+    assert details["detail_semantics"] == {
+        "artifact_content": kb.LOOP_HANDOFF_ARTIFACT_DETAIL_POLICY,
+        "transcript_content": "metadata_only",
+    }
+    assert details["transcript"]["worker_session_id"] == "worker-session-1"
+    assert details["transcript"]["originating_session_id"] == "origin-session"
+    assert details["transcript"]["content_preview"] is None
+
+    artifacts = {item["path"]: item for item in details["artifact_details"]}
+    assert artifacts[str(proof)] == {
+        "path": str(proof),
+        "content_preview": None,
+        "content_policy": kb.LOOP_HANDOFF_ARTIFACT_DETAIL_POLICY,
+    }
+    assert artifacts[str(outside_secret)]["content_preview"] is None
+    assert "MUST_NOT_LEAK" not in str(details)
+
+
 def test_autonomous_approve_release_is_audited_and_promotes_downstream(kanban_home):
     with kb.connect() as conn:
         parent_id = _loop_node(conn, title="loop parent", tenant="tenant-a")
@@ -345,7 +394,12 @@ def test_autonomous_approve_release_is_audited_and_promotes_downstream(kanban_ho
         child = kb.get_task(conn, child_id)
         events = [e for e in kb.list_events(conn, parent_id) if e.kind == "loop_handoff_auto_action"]
 
-    assert result == {"ok": True, "outcome": "approved", "created_cards": []}
+    assert result == {
+        "ok": True,
+        "outcome": "approved",
+        "created_cards": [],
+        "notification": {"level": "quiet", "state": "approved"},
+    }
     assert reviewed["state"] == "closed"
     assert reviewed["verification_state"] == "approved"
     assert reviewed["decision_actor"] == "reviewer-qa"
@@ -374,6 +428,7 @@ def test_autonomous_policy_escalates_prohibited_and_bounded_repair(kanban_home):
 
     assert prohibited["ok"] is False
     assert prohibited["outcome"] == "escalated"
+    assert prohibited["notification"] == {"level": "escalation", "state": "needs-user"}
     assert "push" in prohibited["escalation_reason"]
     assert reviewed["attention"] == "needs-user"
     assert reviewed["verification_state"] == "needs-user"
@@ -397,6 +452,7 @@ def test_autonomous_policy_escalates_prohibited_and_bounded_repair(kanban_home):
         "ok": False,
         "outcome": "escalated",
         "escalation_reason": "repeated_failed_auto_repair",
+        "notification": {"level": "escalation", "state": "needs-user"},
     }
 
 
