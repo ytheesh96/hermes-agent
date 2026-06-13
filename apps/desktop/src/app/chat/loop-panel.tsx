@@ -736,8 +736,12 @@ export function LoopPanel({
 
   const focusDrawerTask = useCallback((taskId: string) => {
     setFocusedTaskId(taskId)
-    onFocusTaskId?.(taskId)
-  }, [onFocusTaskId])
+    if (onFocusTaskId) {
+      onFocusTaskId(taskId)
+    } else {
+      onSelectTaskId?.(taskId)
+    }
+  }, [onFocusTaskId, onSelectTaskId])
 
   const selectRelatedTask = useCallback((taskId: string) => {
     if (selected && selected.taskId !== taskId) {
