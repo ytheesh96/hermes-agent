@@ -6662,6 +6662,38 @@ def _inherited_loop_graph_snapshot_for_dashboard(db: Any, session_id: str) -> Li
     return []
 
 
+def _messages_for_dashboard_session(db: Any, session_id: str) -> Tuple[str, List[Dict[str, Any]]]:
+    """Return display messages for a session, including empty compression tips.
+
+    ``resolve_resume_session_id`` handles the common case where an old empty
+    compression segment should read from a later child that holds messages. A
+    freshly-created continuation can be empty in the other direction: the
+    selected session is the child, but the latest visible transcript still sits
+    in its compression parent until the next turn is flushed. In that case the
+    desktop should still show the parent transcript instead of a blank chat.
+    """
+    resolved_id = db.resolve_resume_session_id(session_id)
+    messages = db.get_messages(resolved_id)
+    if messages:
+        return resolved_id, messages
+
+    current = db.get_session(resolved_id)
+    seen = {resolved_id}
+    for _ in range(100):
+        if not current:
+            return resolved_id, messages
+        parent_id = _compression_parent_id(db, current)
+        if not parent_id or parent_id in seen:
+            return resolved_id, messages
+        seen.add(parent_id)
+        parent_messages = db.get_messages(parent_id)
+        if parent_messages:
+            return parent_id, parent_messages
+        current = db.get_session(parent_id)
+
+    return resolved_id, messages
+
+
 def _session_tenant_lineage_ids(db: Any, session_id: str) -> List[str]:
     """Return the current session id plus compression ancestors for tenant lookup."""
     sid = db.resolve_session_id(session_id)
@@ -6843,8 +6875,7 @@ async def get_session_messages(session_id: str, profile: Optional[str] = None):
         sid = db.resolve_session_id(session_id)
         if not sid:
             raise HTTPException(status_code=404, detail="Session not found")
-        sid = db.resolve_resume_session_id(sid)
-        messages = db.get_messages(sid)
+        sid, messages = _messages_for_dashboard_session(db, sid)
         messages = _hydrate_compacted_loop_graph_messages(messages)
         if not _messages_have_structured_loop_graph_result(messages):
             inherited_loop_snapshot = _inherited_loop_graph_snapshot_for_dashboard(db, sid)

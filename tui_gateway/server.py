@@ -3909,6 +3909,16 @@ def _(rid, params: dict) -> dict:
             target = found["id"]
         else:
             return _err(rid, 4007, "session not found")
+    try:
+        resolved_target = db.resolve_resume_session_id(target)
+    except Exception:
+        resolved_target = target
+    if resolved_target and resolved_target != target:
+        resolved = db.get_session(resolved_target)
+        if resolved:
+            target = resolved_target
+            found = resolved
+
     def _reuse_live_payload(sid: str, session: dict) -> dict:
         payload = _live_session_payload(
             sid,

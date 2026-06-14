@@ -736,6 +736,36 @@ class TestWebServerEndpoints:
         assert loop_payload["nodes"][0]["title"] == "Visible inherited row"
         assert payload["messages"][2]["content"] == "child turn"
 
+    def test_get_session_messages_uses_compression_parent_for_empty_child(self):
+        """An empty compression continuation should still display its parent transcript."""
+        import time as _time
+
+        from hermes_state import SessionDB
+
+        db = SessionDB()
+        try:
+            db.create_session(session_id="visible-parent", source="cli")
+            db.append_message(session_id="visible-parent", role="user", content="previous turn")
+            db.append_message(session_id="visible-parent", role="assistant", content="previous reply")
+            db.end_session("visible-parent", "compression")
+            now = _time.time()
+            db._conn.execute(
+                "UPDATE sessions SET started_at = ?, ended_at = ? WHERE id = ?",
+                (now - 10, now - 5, "visible-parent"),
+            )
+            db.create_session(session_id="empty-child", source="cli", parent_session_id="visible-parent")
+            db._conn.execute("UPDATE sessions SET started_at = ? WHERE id = ?", (now - 4, "empty-child"))
+            db._conn.commit()
+        finally:
+            db.close()
+
+        resp = self.client.get("/api/sessions/empty-child/messages")
+        assert resp.status_code == 200
+        payload = resp.json()
+
+        assert payload["session_id"] == "visible-parent"
+        assert [m["content"] for m in payload["messages"]] == ["previous turn", "previous reply"]
+
     def test_get_session_loop_tasks_reads_kanban_by_session_tenant_lineage(self):
         """Desktop can list current-session Loop rows directly from Kanban tenant data."""
         import time as _time

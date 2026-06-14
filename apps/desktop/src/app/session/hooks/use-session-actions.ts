@@ -120,6 +120,10 @@ function chatMessageArraysEquivalent(a: ChatMessage[], b: ChatMessage[]): boolea
   return a.length === b.length && a.every((message, index) => chatMessagesEquivalent(message, b[index]))
 }
 
+function hasVisibleTranscriptMessage(messages: ChatMessage[]): boolean {
+  return messages.some(message => !message.hidden && (message.role === 'assistant' || message.role === 'user'))
+}
+
 function reconcileResumeMessages(nextMessages: ChatMessage[], previousMessages: ChatMessage[]): ChatMessage[] {
   if (!previousMessages.length) {
     return nextMessages
@@ -537,7 +541,7 @@ export function useSessionActions({
       if (cachedRuntimeId && cachedState) {
         const stored = $sessions.get().find(session => sessionMatchesId(session, storedSessionId))
 
-        const cachedViewState =
+        let cachedViewState =
           !cachedState.model && stored?.model != null
             ? {
                 ...cachedState,
@@ -545,20 +549,44 @@ export function useSessionActions({
               }
             : cachedState
 
-        if (cachedViewState !== cachedState) {
-          sessionStateByRuntimeIdRef.current.set(cachedRuntimeId, cachedViewState)
-        }
-
         setFreshDraftReady(false)
         clearNotifications()
         setSelectedStoredSessionId(storedSessionId)
         selectedStoredSessionIdRef.current = storedSessionId
         setActiveSessionId(cachedRuntimeId)
         activeSessionIdRef.current = cachedRuntimeId
-        syncSessionStateToView(cachedRuntimeId, cachedViewState)
         setCurrentCwd(cachedViewState.cwd)
         setCurrentBranch(cachedViewState.branch)
         setSessionStartedAt(Date.now())
+
+        if (!isWatchWindow() && !hasVisibleTranscriptMessage(cachedViewState.messages)) {
+          try {
+            const storedMessages = await getSessionMessages(storedSessionId, sessionProfile)
+
+            if (!isCurrentResume()) {
+              return
+            }
+
+            const refreshedMessages = toChatMessages(storedMessages.messages)
+
+            if (hasVisibleTranscriptMessage(refreshedMessages)) {
+              cachedViewState = {
+                ...cachedViewState,
+                messages: preserveLocalAssistantErrors(refreshedMessages, cachedViewState.messages)
+              }
+            }
+          } catch {
+            // Best effort: the full resume below can still recover if the
+            // cached runtime id is stale, and genuinely empty sessions remain
+            // cheap to reopen from cache.
+          }
+        }
+
+        if (cachedViewState !== cachedState) {
+          sessionStateByRuntimeIdRef.current.set(cachedRuntimeId, cachedViewState)
+        }
+
+        syncSessionStateToView(cachedRuntimeId, cachedViewState)
 
         try {
           const usage = await requestGateway<UsageStats>('session.usage', { session_id: cachedRuntimeId })

@@ -2838,6 +2838,13 @@ class SessionDB:
         if not session_id:
             return session_id
 
+        try:
+            compression_tip = self.get_compression_tip(session_id)
+        except Exception:
+            compression_tip = session_id
+        if compression_tip and compression_tip != session_id:
+            return compression_tip
+
         with self._lock:
             # If this session already has messages, nothing to redirect.
             try:

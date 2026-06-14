@@ -336,6 +336,61 @@ def test_session_resume_returns_hydrated_messages(server, monkeypatch):
     ]
 
 
+def test_session_resume_resolves_compression_parent_to_tip(server, monkeypatch):
+    db_events = []
+    made_agents = []
+
+    class _DB:
+        def get_session(self, sid):
+            if sid in {"compressed-parent", "compression-tip"}:
+                return {"id": sid}
+            return None
+
+        def get_session_by_title(self, _title):
+            return None
+
+        def resolve_resume_session_id(self, sid):
+            return "compression-tip" if sid == "compressed-parent" else sid
+
+        def reopen_session(self, sid):
+            db_events.append(("reopen", sid))
+
+        def get_messages_as_conversation(self, sid, include_ancestors=False):
+            db_events.append(("history", sid, include_ancestors))
+            if include_ancestors:
+                return [
+                    {"role": "user", "content": "parent turn"},
+                    {"role": "assistant", "content": "tip reply"},
+                ]
+            return [{"role": "assistant", "content": "tip reply"}]
+
+    def _make_agent(_sid, key, session_id=None, session_db=None):
+        made_agents.append((key, session_id))
+        return object()
+
+    monkeypatch.setattr(server, "_get_db", lambda: _DB())
+    monkeypatch.setattr(server, "_make_agent", _make_agent)
+    monkeypatch.setattr(server, "_init_session", lambda sid, key, agent, history, cols=80: None)
+    monkeypatch.setattr(server, "_session_info", lambda _agent, _session=None: {"model": "test/model"})
+
+    resp = server.handle_request(
+        {
+            "id": "r1",
+            "method": "session.resume",
+            "params": {"session_id": "compressed-parent", "cols": 100},
+        }
+    )
+
+    assert "error" not in resp
+    assert resp["result"]["resumed"] == "compression-tip"
+    assert resp["result"]["messages"] == [
+        {"role": "user", "text": "parent turn"},
+        {"role": "assistant", "text": "tip reply"},
+    ]
+    assert ("reopen", "compression-tip") in db_events
+    assert made_agents == [("compression-tip", "compression-tip")]
+
+
 def test_session_resume_handles_multimodal_list_content(server, monkeypatch):
     """A user message persisted with list-shaped multimodal content used to
     crash session resume with ``'list' object has no attribute 'strip'``."""
