@@ -962,6 +962,7 @@ export interface Translations {
   statusStack: {
     agents: string
     background: (count: number) => string
+    loopWorkers: (count: number) => string
     subagents: (count: number) => string
     todos: (done: number, total: number) => string
     running: string

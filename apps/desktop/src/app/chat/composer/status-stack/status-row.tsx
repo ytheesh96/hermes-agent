@@ -31,6 +31,10 @@ const TODO_GLYPHS: Record<Exclude<TodoStatus, 'in_progress' | 'pending'>, { icon
 // Left slot: braille spinner while running, otherwise a small status dot
 // (green = done, red = failed) so the slot is always filled and rows align.
 function leadingGlyph(item: ComposerStatusItem, s: Translations['statusStack']): ReactNode {
+  if (item.type === 'loop-worker' && item.state === 'running') {
+    return <Codicon className="text-violet-400/85" name="circuit-board" size="0.8rem" />
+  }
+
   if (item.todoStatus === 'pending') {
     return (
       <span
@@ -94,7 +98,7 @@ export const StatusItemRow = memo(function StatusItemRow({ item, onDismiss, onOp
         : onDismiss && { label: s.dismiss, onClick: () => onDismiss(item.id) }
       : null
 
-  const canOpen = item.type === 'subagent' && !!onOpen
+  const canOpen = (item.type === 'subagent' || item.type === 'loop-worker') && !!onOpen
   const hasOutput = item.type === 'background' && !!item.output
   const onActivate = canOpen ? onOpen : hasOutput ? () => setOutputOpen(open => !open) : undefined
 
@@ -140,6 +144,16 @@ export const StatusItemRow = memo(function StatusItemRow({ item, onDismiss, onOp
         {item.type === 'subagent' && item.currentTool && (
           <span className="shrink-0 truncate text-[0.62rem] leading-4 text-muted-foreground/70">
             {toolLabel(item.currentTool)}
+          </span>
+        )}
+        {item.type === 'loop-worker' && (
+          <span className="shrink-0 rounded border border-violet-400/25 bg-violet-500/10 px-1 text-[0.58rem] font-semibold uppercase tracking-[0.12em] text-violet-300/90">
+            Kanban
+          </span>
+        )}
+        {item.type === 'loop-worker' && item.statusDetail && (
+          <span className="shrink-0 truncate text-[0.62rem] leading-4 text-muted-foreground/70">
+            {item.statusDetail}
           </span>
         )}
         {failed && typeof item.exitCode === 'number' && item.exitCode !== 0 && (

@@ -6,9 +6,9 @@ import { $gateway } from './gateway'
 import { $subagentsBySession, type SubagentProgress } from './subagents'
 import { $todosBySession } from './todos'
 
-/** Composer status stack feed — merged todos, subagents, background per session. */
+/** Composer status stack feed — merged todos, Loop workers, subagents, background per session. */
 export type StatusItemState = 'done' | 'failed' | 'running'
-export type StatusItemType = 'background' | 'subagent' | 'todo'
+export type StatusItemType = 'background' | 'loop-worker' | 'subagent' | 'todo'
 
 export interface ComposerStatusItem {
   /** background: non-zero exit shown inline when failed. */
@@ -18,6 +18,8 @@ export interface ComposerStatusItem {
   id: string
   /** background process: captured stdout/stderr tail for the inline viewer. */
   output?: string
+  /** loop-worker: compact status/assignee shown on the right. */
+  statusDetail?: string
   /** subagent: its own stored session id — row click opens that session window
    *  (livestreamed by the gateway's child-session mirror). */
   sessionId?: string
@@ -31,6 +33,7 @@ export interface ComposerStatusItem {
 // Writable source for background work, synced from the gateway's process
 // registry (`terminal(background=true)` spawns) via `process.list`.
 export const $backgroundStatusBySession = atom<Record<string, ComposerStatusItem[]>>({})
+export const $loopWorkerStatusBySession = atom<Record<string, ComposerStatusItem[]>>({})
 
 // Rows the user X-ed away. The registry keeps finished processes around for a
 // while, so without this every refresh would resurrect a dismissed row.
@@ -55,8 +58,8 @@ const todoToItem = (t: TodoItem): ComposerStatusItem => ({
 
 // The single thing the stack reads: a typed, merged item list per session.
 export const $statusItemsBySession = computed(
-  [$subagentsBySession, $backgroundStatusBySession, $todosBySession],
-  (subs, background, todos) => {
+  [$subagentsBySession, $backgroundStatusBySession, $todosBySession, $loopWorkerStatusBySession],
+  (subs, background, todos, loopWorkers) => {
     const out: Record<string, ComposerStatusItem[]> = {}
 
     const push = (sid: string, items: ComposerStatusItem[]) => {
@@ -67,6 +70,10 @@ export const $statusItemsBySession = computed(
 
     for (const [sid, list] of Object.entries(todos)) {
       push(sid, list.map(todoToItem))
+    }
+
+    for (const [sid, list] of Object.entries(loopWorkers)) {
+      push(sid, list)
     }
 
     for (const [sid, list] of Object.entries(subs)) {
@@ -82,7 +89,7 @@ export const $statusItemsBySession = computed(
 )
 
 // Fixed render order for the groups in the stack (top → bottom, above queue).
-const TYPE_ORDER: readonly StatusItemType[] = ['todo', 'subagent', 'background']
+const TYPE_ORDER: readonly StatusItemType[] = ['todo', 'loop-worker', 'subagent', 'background']
 
 export interface StatusGroup {
   items: ComposerStatusItem[]
@@ -103,6 +110,19 @@ export function groupStatusItems(items: readonly ComposerStatusItem[]): StatusGr
   }
 
   return TYPE_ORDER.filter(type => byType.has(type)).map(type => ({ items: byType.get(type)!, type }))
+}
+
+export function setLoopWorkerStatusItems(sid: string, items: ComposerStatusItem[]) {
+  const current = $loopWorkerStatusBySession.get()
+  const next = { ...current }
+
+  if (items.length > 0) {
+    next[sid] = items
+  } else {
+    delete next[sid]
+  }
+
+  $loopWorkerStatusBySession.set(next)
 }
 
 const writeBackground = (sid: string, items: ComposerStatusItem[]) => {

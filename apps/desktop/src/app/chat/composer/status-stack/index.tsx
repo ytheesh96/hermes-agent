@@ -33,6 +33,10 @@ const groupLabel = (group: StatusGroup, s: Translations['statusStack']) => {
     return s.todos(group.items.filter(i => i.todoStatus === 'completed').length, group.items.length)
   }
 
+  if (group.type === 'loop-worker') {
+    return s.loopWorkers(group.items.length)
+  }
+
   return group.type === 'subagent' ? s.subagents(group.items.length) : s.background(group.items.length)
 }
 
@@ -109,6 +113,8 @@ export function ComposerStatusStack({ lead, queue, sessionId }: ComposerStatusSt
         icon={
           group.type === 'todo' ? (
             <Codicon className="text-muted-foreground/70" name="checklist" size="0.8rem" />
+          ) : group.type === 'loop-worker' ? (
+            <Codicon className="text-violet-400/80" name="circuit-board" size="0.8rem" />
           ) : undefined
         }
         label={groupLabel(group, t.statusStack)}

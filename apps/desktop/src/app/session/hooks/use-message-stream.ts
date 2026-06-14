@@ -22,6 +22,11 @@ import {
   stripGeneratedImageEchoes
 } from '@/lib/generated-images'
 import { triggerHaptic } from '@/lib/haptics'
+import {
+  invalidateLoopSourceFromEvent,
+  isLoopSourceInvalidationEvent,
+  type LoopSourceChangedEvent
+} from '@/lib/loop-source-events'
 import { isProviderSetupErrorMessage } from '@/lib/provider-setup-errors'
 import { parseTodos } from '@/lib/todos'
 import { setClarifyRequest } from '@/store/clarify'
@@ -29,6 +34,7 @@ import { refreshBackgroundProcesses } from '@/store/composer-status'
 import { $gateway } from '@/store/gateway'
 import { notify } from '@/store/notifications'
 import { requestDesktopOnboarding } from '@/store/onboarding'
+import { $activeGatewayProfile, normalizeProfileKey } from '@/store/profile'
 import { clearAllPrompts, setApprovalRequest, setSecretRequest, setSudoRequest } from '@/store/prompts'
 import {
   setCurrentBranch,
@@ -700,12 +706,20 @@ export function useMessageStream({
     (event: RpcEvent) => {
       const payload = event.payload as GatewayEventPayload | undefined
       const explicitSid = event.session_id || ''
+      const payloadRecord = asRecord(payload)
 
-      if (!explicitSid && gatewayEventRequiresSessionId(event.type)) {
+      const payloadSessionId = firstString(
+        payloadRecord.source_session_id,
+        payloadRecord.root_session_id,
+        payloadRecord.parent_session_id,
+        payloadRecord.worker_session_id
+      )
+
+      if (!explicitSid && gatewayEventRequiresSessionId(event.type) && !payloadSessionId) {
         return
       }
 
-      const sessionId = explicitSid || activeSessionIdRef.current
+      const sessionId = explicitSid || payloadSessionId || activeSessionIdRef.current
       const isActiveEvent = !!sessionId && sessionId === activeSessionIdRef.current
 
       if (event.type === 'gateway.ready') {
@@ -928,6 +942,13 @@ export function useMessageStream({
             event.type
           )
         }
+      } else if (isLoopSourceInvalidationEvent(event.type, payload)) {
+        void invalidateLoopSourceFromEvent(queryClient, {
+          activeProfile: normalizeProfileKey($activeGatewayProfile.get()),
+          activeSessionIds: [activeSessionIdRef.current, sessionId],
+          event: payloadRecord as LoopSourceChangedEvent,
+          selectedTaskId: typeof payloadRecord.task_id === 'string' ? payloadRecord.task_id : undefined
+        })
       } else if (event.type === 'clarify.request') {
         // Surface the clarify tool's overlay. The Python side is blocked on
         // `clarify.respond`, so without this handler the agent would hang

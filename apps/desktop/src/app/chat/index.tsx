@@ -21,6 +21,7 @@ import { quickModelOptions, sessionTitle, toRuntimeMessage } from '@/lib/chat-ru
 import { useIncrementalExternalStoreRuntime } from '@/lib/incremental-external-store-runtime'
 import { cn } from '@/lib/utils'
 import type { ComposerAttachment } from '@/store/composer'
+import { type ComposerStatusItem, setLoopWorkerStatusItems } from '@/store/composer-status'
 import { $pinnedSessionIds } from '@/store/layout'
 import { $activeGatewayProfile, $gatewaySwapTarget } from '@/store/profile'
 import {
@@ -58,7 +59,13 @@ import { type DroppedFile, partitionDroppedFiles } from './hooks/use-composer-ac
 import { useFileDropZone } from './hooks/use-file-drop-zone'
 import { LoopPanel, type LoopTaskAction, LoopTaskStack } from './loop-panel'
 import { loopSessionSourceRefetchInterval } from './loop-refresh'
-import { deriveLoopPanelStateFromTenantSource, type LoopRow, type TenantLoopSource } from './loop-state'
+import {
+  deriveLoopPanelStateFromTenantSource,
+  type LoopRow,
+  type LoopWorkerRun,
+  normalizeLoopWorkers,
+  type TenantLoopSource
+} from './loop-state'
 import { ScrollToBottomButton } from './scroll-to-bottom-button'
 import { SessionActionsMenu } from './sidebar/session-actions-menu'
 import { threadLoadingState } from './thread-loading'
@@ -179,6 +186,21 @@ interface ChatRuntimeBoundaryProps {
 }
 
 const NO_MESSAGES: ChatMessage[] = []
+
+function loopWorkerStatusItem(worker: LoopWorkerRun): ComposerStatusItem {
+  const failed = worker.state === 'failed' || worker.state === 'stale' || worker.state === 'blocked'
+  const done = worker.state === 'done'
+  const detail = [worker.profile, worker.state].filter(Boolean).join(' · ')
+
+  return {
+    id: `loop-worker:${worker.taskId}:${worker.runId}`,
+    sessionId: worker.workerSessionId || undefined,
+    state: failed ? 'failed' : done ? 'done' : 'running',
+    statusDetail: detail || undefined,
+    title: worker.taskTitle,
+    type: 'loop-worker'
+  }
+}
 
 /**
  * Owns the $messages subscription and the assistant-ui external-store runtime.
@@ -382,6 +404,21 @@ export function ChatView({
     () => deriveLoopPanelStateFromTenantSource(loopSourceQuery.data),
     [loopSourceQuery.data]
   )
+
+  const loopWorkerItems = useMemo(
+    () => normalizeLoopWorkers(loopSourceQuery.data).map(loopWorkerStatusItem),
+    [loopSourceQuery.data]
+  )
+
+  useEffect(() => {
+    if (!loopSourceSessionId) {
+      return
+    }
+
+    setLoopWorkerStatusItems(loopSourceSessionId, loopWorkerItems)
+
+    return () => setLoopWorkerStatusItems(loopSourceSessionId, [])
+  }, [loopSourceSessionId, loopWorkerItems])
 
   const loopPanelState = tenantLoopPanelState
   const [selectedLoopTaskId, setSelectedLoopTaskId] = useState<string | null>(null)

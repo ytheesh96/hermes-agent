@@ -1,6 +1,14 @@
 import { beforeEach, describe, expect, it } from 'vitest'
 
-import { $backgroundStatusBySession, dismissBackgroundProcess, reconcileBackgroundProcesses } from './composer-status'
+import {
+  $backgroundStatusBySession,
+  $loopWorkerStatusBySession,
+  $statusItemsBySession,
+  dismissBackgroundProcess,
+  groupStatusItems,
+  reconcileBackgroundProcesses,
+  setLoopWorkerStatusItems
+} from './composer-status'
 
 const SID = 'sess-1'
 
@@ -18,6 +26,7 @@ const items = () => $backgroundStatusBySession.get()[SID] ?? []
 describe('reconcileBackgroundProcesses', () => {
   beforeEach(() => {
     $backgroundStatusBySession.set({})
+    $loopWorkerStatusBySession.set({})
   })
 
   it('maps registry entries to status items', () => {
@@ -95,5 +104,29 @@ describe('reconcileBackgroundProcesses', () => {
     reconcileBackgroundProcesses(SID, [])
 
     expect($backgroundStatusBySession.get()).toEqual({})
+  })
+})
+
+describe('Loop worker composer status', () => {
+  beforeEach(() => {
+    $backgroundStatusBySession.set({})
+    $loopWorkerStatusBySession.set({})
+  })
+
+  it('surfaces Loop workers as their own group before delegate subagents', () => {
+    setLoopWorkerStatusItems(SID, [
+      {
+        id: 'worker:t_loop:7',
+        state: 'running',
+        title: 'Implement Loop worker parity',
+        type: 'loop-worker'
+      }
+    ])
+
+    const items = $statusItemsBySession.get()[SID] ?? []
+    const groups = groupStatusItems(items)
+
+    expect(groups.map(group => group.type)).toEqual(['loop-worker'])
+    expect(groups[0]?.items[0]).toMatchObject({ title: 'Implement Loop worker parity', type: 'loop-worker' })
   })
 })
