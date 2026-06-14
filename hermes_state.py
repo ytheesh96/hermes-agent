@@ -2014,6 +2014,61 @@ class SessionDB:
 
         return chain
 
+    def get_compression_lineage_root_to_tip(self, session_id: str) -> List[str]:
+        """Return the full compression chain containing ``session_id``.
+
+        ``get_compression_lineage()`` walks forward from a known root. UI and
+        resume callers often start from the current tip, so first walk backward
+        across compression-only parent edges, then project forward again.
+        """
+        if not session_id:
+            return []
+
+        current = session_id
+        seen = set()
+        with self._lock:
+            for _ in range(100):
+                if not current or current in seen:
+                    break
+                seen.add(current)
+                row = self._conn.execute(
+                    """
+                    SELECT
+                        child.parent_session_id AS parent_id,
+                        child.started_at AS child_started_at,
+                        parent.ended_at AS parent_ended_at,
+                        parent.end_reason AS parent_end_reason
+                    FROM sessions child
+                    LEFT JOIN sessions parent ON parent.id = child.parent_session_id
+                    WHERE child.id = ?
+                    """,
+                    (current,),
+                ).fetchone()
+                if row is None:
+                    break
+                parent_id = row["parent_id"] if hasattr(row, "keys") else row[0]
+                child_started_at = (
+                    row["child_started_at"] if hasattr(row, "keys") else row[1]
+                )
+                parent_ended_at = (
+                    row["parent_ended_at"] if hasattr(row, "keys") else row[2]
+                )
+                parent_end_reason = (
+                    row["parent_end_reason"] if hasattr(row, "keys") else row[3]
+                )
+                if (
+                    not parent_id
+                    or parent_end_reason != "compression"
+                    or parent_ended_at is None
+                    or child_started_at is None
+                    or child_started_at < parent_ended_at
+                ):
+                    break
+                current = parent_id
+
+        lineage = self.get_compression_lineage(current)
+        return lineage or [session_id]
+
     def list_sessions_rich(
         self,
         source: str = None,
@@ -2894,6 +2949,7 @@ class SessionDB:
         session_id: str,
         include_ancestors: bool = False,
         include_inactive: bool = False,
+        include_compression_lineage: bool = False,
     ) -> List[Dict[str, Any]]:
         """
         Load messages in the OpenAI conversation format (role + content dicts).
@@ -2904,7 +2960,9 @@ class SessionDB:
         as well. See :meth:`rewind_to_message`.
         """
         session_ids = [session_id]
-        if include_ancestors:
+        if include_compression_lineage:
+            session_ids = self.get_compression_lineage_root_to_tip(session_id)
+        elif include_ancestors:
             session_ids = self._session_lineage_root_to_tip(session_id)
 
         active_clause = "" if include_inactive else " AND active = 1"
@@ -2972,7 +3030,7 @@ class SessionDB:
                     except (json.JSONDecodeError, TypeError):
                         logger.warning("Failed to deserialize codex_message_items, falling back to None")
                         msg["codex_message_items"] = None
-            if include_ancestors and self._is_duplicate_replayed_user_message(messages, msg):
+            if len(session_ids) > 1 and self._is_duplicate_replayed_user_message(messages, msg):
                 continue
             messages.append(msg)
         return messages

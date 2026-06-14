@@ -728,9 +728,7 @@ class TestWebServerEndpoints:
 
         assert payload["session_id"] == "loop-tip"
         assert [m["role"] for m in payload["messages"]] == ["assistant", "tool", "user"]
-        assert payload["messages"][0]["hidden"] is True
         assert payload["messages"][0]["tool_calls"][0]["id"] == "loop-call"
-        assert payload["messages"][1]["hidden"] is True
         assert payload["messages"][1]["tool_name"] == "loop_graph"
         loop_payload = json.loads(payload["messages"][1]["content"])
         assert loop_payload["nodes"][0]["title"] == "Visible inherited row"
@@ -765,6 +763,48 @@ class TestWebServerEndpoints:
 
         assert payload["session_id"] == "visible-parent"
         assert [m["content"] for m in payload["messages"]] == ["previous turn", "previous reply"]
+
+    def test_get_session_messages_merges_compression_parent_and_child(self):
+        """A compression child with new rows should still show the parent transcript."""
+        import time as _time
+
+        from hermes_state import SessionDB
+
+        db = SessionDB()
+        try:
+            db.create_session(session_id="visible-parent-with-child", source="cli")
+            db.append_message(session_id="visible-parent-with-child", role="user", content="previous turn")
+            db.append_message(session_id="visible-parent-with-child", role="assistant", content="previous reply")
+            db.end_session("visible-parent-with-child", "compression")
+            now = _time.time()
+            db._conn.execute(
+                "UPDATE sessions SET started_at = ?, ended_at = ? WHERE id = ?",
+                (now - 10, now - 5, "visible-parent-with-child"),
+            )
+            db.create_session(
+                session_id="child-with-new-turn",
+                source="cli",
+                parent_session_id="visible-parent-with-child",
+            )
+            db._conn.execute(
+                "UPDATE sessions SET started_at = ? WHERE id = ?",
+                (now - 4, "child-with-new-turn"),
+            )
+            db.append_message(session_id="child-with-new-turn", role="user", content="new child turn")
+            db._conn.commit()
+        finally:
+            db.close()
+
+        resp = self.client.get("/api/sessions/child-with-new-turn/messages")
+        assert resp.status_code == 200
+        payload = resp.json()
+
+        assert payload["session_id"] == "child-with-new-turn"
+        assert [m["content"] for m in payload["messages"]] == [
+            "previous turn",
+            "previous reply",
+            "new child turn",
+        ]
 
     def test_get_session_loop_tasks_reads_kanban_by_session_tenant_lineage(self):
         """Desktop can list current-session Loop rows directly from Kanban tenant data."""

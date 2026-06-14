@@ -15,7 +15,7 @@ import time
 import uuid
 from datetime import datetime
 from pathlib import Path
-from typing import Any, Optional
+from typing import Any, Dict, List, Optional
 
 from hermes_constants import (
     get_hermes_home,
@@ -3877,6 +3877,22 @@ def _(rid, params: dict) -> dict:
         return _ok(rid, {"session_id": None})
 
 
+def _resume_history_for_agent(db: Any, session_id: str) -> List[Dict[str, Any]]:
+    """Load model history for resume, preserving compression continuations."""
+    try:
+        history = db.get_messages_as_conversation(
+            session_id,
+            include_compression_lineage=True,
+        )
+    except TypeError:
+        # Older test doubles and out-of-tree SessionDB shims only understand
+        # the legacy signature. Fall back to the exact previous behavior.
+        return db.get_messages_as_conversation(session_id)
+    except Exception:
+        return db.get_messages_as_conversation(session_id)
+    return history
+
+
 @method("session.resume")
 def _(rid, params: dict) -> dict:
     target = params.get("session_id", "")
@@ -4052,7 +4068,7 @@ def _(rid, params: dict) -> dict:
     )
     try:
         db.reopen_session(target)
-        history = db.get_messages_as_conversation(target)
+        history = _resume_history_for_agent(db, target)
         display_history = db.get_messages_as_conversation(
             target, include_ancestors=True
         )

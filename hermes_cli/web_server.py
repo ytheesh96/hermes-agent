@@ -6663,16 +6663,30 @@ def _inherited_loop_graph_snapshot_for_dashboard(db: Any, session_id: str) -> Li
 
 
 def _messages_for_dashboard_session(db: Any, session_id: str) -> Tuple[str, List[Dict[str, Any]]]:
-    """Return display messages for a session, including empty compression tips.
+    """Return display messages for a session, including compression lineage.
 
     ``resolve_resume_session_id`` handles the common case where an old empty
     compression segment should read from a later child that holds messages. A
-    freshly-created continuation can be empty in the other direction: the
-    selected session is the child, but the latest visible transcript still sits
-    in its compression parent until the next turn is flushed. In that case the
-    desktop should still show the parent transcript instead of a blank chat.
+    continuation can also have a few new rows while its visible transcript still
+    lives in the compression parent. In that case the desktop should show the
+    parent transcript plus the child continuation.
     """
     resolved_id = db.resolve_resume_session_id(session_id)
+    try:
+        lineage_ids = db.get_compression_lineage_root_to_tip(resolved_id)
+    except Exception:
+        lineage_ids = [resolved_id]
+    if len(lineage_ids) > 1:
+        merged_messages: List[Dict[str, Any]] = []
+        display_session_id = resolved_id
+        for lineage_id in lineage_ids:
+            lineage_messages = db.get_messages(lineage_id)
+            if lineage_messages:
+                merged_messages.extend(lineage_messages)
+                display_session_id = lineage_id
+        if merged_messages:
+            return display_session_id, merged_messages
+
     messages = db.get_messages(resolved_id)
     if messages:
         return resolved_id, messages

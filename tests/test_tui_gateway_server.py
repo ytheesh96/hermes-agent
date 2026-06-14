@@ -919,6 +919,83 @@ def test_session_resume_uses_parent_lineage_for_display(monkeypatch):
     assert captured["history_calls"] == [("tip", False), ("tip", True)]
 
 
+def test_session_resume_uses_compression_lineage_for_agent_history(monkeypatch):
+    captured = {}
+
+    class FakeDB:
+        def get_session(self, target):
+            return {"id": target}
+
+        def get_session_by_title(self, target):
+            return None
+
+        def resolve_resume_session_id(self, target):
+            return target
+
+        def reopen_session(self, target):
+            captured["reopened"] = target
+
+        def get_messages_as_conversation(
+            self,
+            target,
+            include_ancestors=False,
+            include_compression_lineage=False,
+        ):
+            captured.setdefault("history_calls", []).append(
+                (target, include_ancestors, include_compression_lineage)
+            )
+            if include_compression_lineage or include_ancestors:
+                return [
+                    {"role": "user", "content": "parent prompt"},
+                    {"role": "assistant", "content": "parent answer"},
+                    {"role": "user", "content": "tip prompt"},
+                ]
+            return [{"role": "user", "content": "tip prompt"}]
+
+    def fake_init_session(sid, key, agent, history, cols=80):
+        captured["agent_history"] = list(history)
+        server._sessions[sid] = {
+            "agent": agent,
+            "created_at": time.time(),
+            "history": list(history),
+            "history_lock": threading.Lock(),
+            "session_key": key,
+        }
+
+    monkeypatch.setattr(server, "_get_db", lambda: FakeDB())
+    monkeypatch.setattr(server, "_find_live_session_by_key", lambda target: None)
+    monkeypatch.setattr(server, "_claim_active_session_slot", lambda *a, **k: (None, None))
+    monkeypatch.setattr(server, "_enable_gateway_prompts", lambda: None)
+    monkeypatch.setattr(server, "_set_session_context", lambda target: [])
+    monkeypatch.setattr(server, "_clear_session_context", lambda tokens: None)
+    monkeypatch.setattr(
+        server,
+        "_make_agent",
+        lambda *args, **kwargs: types.SimpleNamespace(model="test"),
+    )
+    monkeypatch.setattr(
+        server,
+        "_session_info",
+        lambda agent, *a: {"model": "test", "tools": {}, "skills": {}},
+    )
+    monkeypatch.setattr(server, "_init_session", fake_init_session)
+
+    resp = server.handle_request(
+        {"id": "1", "method": "session.resume", "params": {"session_id": "tip"}}
+    )
+
+    assert resp["result"]["messages"] == [
+        {"role": "user", "text": "parent prompt"},
+        {"role": "assistant", "text": "parent answer"},
+        {"role": "user", "text": "tip prompt"},
+    ]
+    assert captured["agent_history"] == [
+        {"role": "user", "content": "parent prompt"},
+        {"role": "assistant", "content": "parent answer"},
+        {"role": "user", "content": "tip prompt"},
+    ]
+
+
 def test_session_resume_passes_stored_runtime_to_agent(monkeypatch):
     captured = {}
 
