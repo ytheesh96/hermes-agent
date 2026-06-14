@@ -19,12 +19,15 @@ import { cn } from '@/lib/utils'
 import type { CompactLoopTask, LoopPanelState, LoopPanelStatus, LoopRow, LoopTaskDetail, LoopWorkerActivity, TenantLoopTask } from './loop-state'
 
 export type LoopTaskAction =
+  | 'accept-review'
   | 'block'
   | 'decompose'
   | 'details'
+  | 'escalate-review'
   | 'kanban'
   | 'logs'
   | 'park'
+  | 'reject-review'
   | 'start'
   | 'unblock'
   | 'worker-run'
@@ -183,6 +186,70 @@ function attentionRows(rows: LoopRow[]): LoopRow[] {
     .map(item => item.row)
 }
 
+const ACTIVE_OVERVIEW_STATUSES = new Set(['claimed', 'in_progress', 'running'])
+const QUEUED_OVERVIEW_STATUSES = new Set(['queued', 'ready', 'scheduled', 'todo', 'triage'])
+const DONE_OVERVIEW_STATUSES = new Set(['archived', 'cancelled', 'complete', 'completed', 'done'])
+
+function isRootLoopRow(row: LoopRow): boolean {
+  return row.parents.length === 0 && row.parentCount === 0
+}
+
+function rootLoopRow(rows: LoopRow[]): LoopRow | null {
+  return rows.find(isRootLoopRow) || rows[0] || null
+}
+
+function isDoneLoopRow(row: LoopRow): boolean {
+  return DONE_OVERVIEW_STATUSES.has(normalizedLoopValue(row.status))
+}
+
+function isActiveLoopRow(row: LoopRow): boolean {
+  const status = normalizedLoopValue(row.status)
+
+  return ACTIVE_OVERVIEW_STATUSES.has(status)
+}
+
+function isQueuedLoopRow(row: LoopRow): boolean {
+  const status = normalizedLoopValue(row.status)
+
+  return QUEUED_OVERVIEW_STATUSES.has(status)
+}
+
+function isReviewDecisionRow(row: LoopRow): boolean {
+  const text = attentionText(row)
+
+  return (
+    text.includes('review-required') ||
+    text.includes('review required') ||
+    text.includes('review decision') ||
+    text.includes('foreground acceptance') ||
+    text.includes('user acceptance')
+  )
+}
+
+interface RootOverviewGroups {
+  active: LoopRow[]
+  attention: LoopRow[]
+  completed: LoopRow[]
+  queued: LoopRow[]
+}
+
+function rootOverviewGroups(state: LoopPanelState, root: LoopRow): RootOverviewGroups {
+  const descendants = state.rows.filter(row => row.taskId !== root.taskId)
+  const attention = attentionRows(descendants)
+  const attentionIds = new Set(attention.map(row => row.taskId))
+
+  return {
+    active: descendants.filter(row => !attentionIds.has(row.taskId) && isActiveLoopRow(row)),
+    attention,
+    queued: descendants.filter(row => !attentionIds.has(row.taskId) && isQueuedLoopRow(row)),
+    completed: descendants.filter(row => !attentionIds.has(row.taskId) && isDoneLoopRow(row))
+  }
+}
+
+function shortEvidence(row: LoopRow): string {
+  return row.latestSummary || row.result || row.latestRun?.summary || row.workerActivity?.summary || row.workerActivity?.summary_preview || ''
+}
+
 function idsFromTask(task: TenantLoopTask, key: 'children' | 'parents'): string[] {
   const includedKey = key === 'parents' ? 'included_parent_ids' : 'included_child_ids'
   const explicit = task[includedKey] || task.links?.[key] || []
@@ -231,6 +298,7 @@ function detailRowFromTaskDetail(detail?: LoopTaskDetail | null, selectedTaskId?
     taskId: task.id,
     tenant: task.tenant,
     title: task.title || task.id,
+    workerActivity: task.worker_activity || undefined,
     workspaceKind: task.workspace_kind,
     workspacePath: task.workspace_path
   }
@@ -615,6 +683,95 @@ function workerStatusLine(worker: LoopWorkerActivity): string {
   return [worker.status, worker.profile, worker.worker_pid ? `pid ${worker.worker_pid}` : ''].filter(Boolean).join(' · ')
 }
 
+
+function metadataLines(metadata: unknown): string[] {
+  if (!metadata || typeof metadata !== 'object' || Array.isArray(metadata)) {
+    return []
+  }
+
+  const record = metadata as Record<string, unknown>
+  const lines: string[] = []
+  const changedFiles = Array.isArray(record.changed_files) ? record.changed_files.map(String).filter(Boolean) : []
+  const artifacts = Array.isArray(record.artifacts) ? record.artifacts.map(String).filter(Boolean) : []
+  const verification = Array.isArray(record.verification) ? record.verification : []
+
+  if (changedFiles.length) {
+    lines.push(`Changed files: ${changedFiles.slice(0, 4).join(', ')}${changedFiles.length > 4 ? ` +${changedFiles.length - 4} more` : ''}`)
+  }
+
+  if (artifacts.length) {
+    lines.push(`Artifacts: ${artifacts.slice(0, 3).join(', ')}${artifacts.length > 3 ? ` +${artifacts.length - 3} more` : ''}`)
+  }
+
+  if (verification.length) {
+    lines.push(`Verification: ${verification.length} recorded check${verification.length === 1 ? '' : 's'}`)
+  }
+
+  return lines
+}
+
+function EvidenceDetails({ detail, row }: { detail?: LoopTaskDetail | null; row: LoopRow }) {
+  const runs = detail?.runs || []
+  const latestRun = runs.at(-1) || row.latestRun || null
+  const comments = detail?.comments || []
+  const metadata = latestRun?.metadata
+  const metadataSummary = metadataLines(metadata)
+
+  const summary = (() => {
+    const candidate = row.latestSummary || latestRun?.summary
+
+    if (!candidate || candidate === row.workerActivity?.summary || candidate === row.workerActivity?.summary_preview) {
+      return undefined
+    }
+
+    return candidate
+  })()
+
+  const result = row.result || latestRun?.outcome || row.workerActivity?.outcome
+  const error = latestRun?.error || row.workerActivity?.error || row.workerActivity?.error_preview
+
+  if (!summary && !result && !error && metadataSummary.length === 0 && comments.length === 0 && runs.length === 0) {
+    return <EmptyDetail>No structured evidence recorded yet.</EmptyDetail>
+  }
+
+  return (
+    <div className="grid gap-2 text-(--ui-text-secondary)">
+      {summary && <p className="m-0 whitespace-pre-wrap text-[0.72rem] leading-relaxed">{summary}</p>}
+      {result && <p className="m-0 text-[0.7rem]"><span className="font-medium text-(--ui-text-primary)">Result:</span> {result}</p>}
+      {error && <p className="m-0 whitespace-pre-wrap text-[0.7rem] text-destructive/90">{error}</p>}
+      {metadataSummary.length > 0 && (
+        <ul className="m-0 grid list-none gap-1 p-0 text-[0.68rem] text-(--ui-text-tertiary)">
+          {metadataSummary.map(line => <li key={line}>{line}</li>)}
+        </ul>
+      )}
+      {runs.length > 0 && <p className="m-0 text-[0.66rem] text-(--ui-text-tertiary)">Run history: {runs.length} recorded run{runs.length === 1 ? '' : 's'}</p>}
+      {comments.length > 0 && (
+        <div className="grid gap-1">
+          <p className="m-0 text-[0.62rem] font-medium uppercase tracking-wide text-(--ui-text-tertiary)">Recent comments</p>
+          {comments.slice(-3).map((comment, index) => (
+            <p className="m-0 whitespace-pre-wrap text-[0.68rem] text-(--ui-text-secondary)" key={comment.id || index}>{comment.body || 'Empty comment'}</p>
+          ))}
+        </div>
+      )}
+    </div>
+  )
+}
+
+function ReviewDecisionControls({ onTaskAction, row }: { onTaskAction?: (action: LoopTaskAction, row: LoopRow) => void; row: LoopRow }) {
+  const unavailable = true
+
+  return (
+    <div className="grid gap-2">
+      <div className="flex flex-wrap gap-1.5" data-testid="loop-review-decision-controls">
+        <Button aria-label="Accept review" className="h-7 px-2 text-xs" disabled={unavailable} onClick={() => onTaskAction?.('accept-review', row)} type="button" variant="default">Accept</Button>
+        <Button aria-label="Reject review" className="h-7 px-2 text-xs" disabled={unavailable} onClick={() => onTaskAction?.('reject-review', row)} type="button" variant="outline">Reject</Button>
+        <Button aria-label="Escalate review" className="h-7 px-2 text-xs" disabled={unavailable} onClick={() => onTaskAction?.('escalate-review', row)} type="button" variant="outline">Escalate</Button>
+      </div>
+      {unavailable && <EmptyDetail>Review decisions are unavailable until the gateway exposes drawer decision actions.</EmptyDetail>}
+    </div>
+  )
+}
+
 function WorkerActivityDetails({
   onTaskAction,
   row
@@ -699,8 +856,82 @@ function WorkerActivityDetails({
   )
 }
 
+
+function RootOverviewGroup({ emptyCopy, label, onSelectTaskId, rows }: { emptyCopy: string; label: string; onSelectTaskId?: (taskId: string) => void; rows: LoopRow[] }) {
+  return (
+    <DetailSection title={label}>
+      {rows.length === 0 ? (
+        <EmptyDetail>{emptyCopy}</EmptyDetail>
+      ) : (
+        <div className="grid gap-1">
+          {rows.map(row => (
+            <Button
+              aria-label={`Focus child task ${row.taskId}`}
+              className="h-auto justify-start px-2 py-1 text-left text-xs"
+              disabled={!onSelectTaskId}
+              key={row.taskId}
+              onClick={() => onSelectTaskId?.(row.taskId)}
+              type="button"
+              variant="ghost"
+            >
+              <span className="grid min-w-0 flex-1 gap-0.5">
+                <span className="truncate text-(--ui-text-primary)">{row.title}</span>
+                <span className="truncate text-[0.62rem] text-(--ui-text-tertiary)">{row.status} · {row.taskId}</span>
+                {shortEvidence(row) && <span className="truncate text-[0.62rem] text-(--ui-text-tertiary)">{shortEvidence(row)}</span>}
+              </span>
+            </Button>
+          ))}
+        </div>
+      )}
+    </DetailSection>
+  )
+}
+
+function LoopRootOverview({ onRefresh, onSelectTaskId, onTaskAction, root, state }: { onRefresh?: () => void; onSelectTaskId?: (taskId: string) => void; onTaskAction?: (action: LoopTaskAction, row: LoopRow) => void; root: LoopRow; state: LoopPanelState }) {
+  const groups = rootOverviewGroups(state, root)
+
+  const summaryItems = [
+    `${groups.active.length} active`,
+    `${groups.attention.length} needs attention`,
+    `${groups.queued.length} queued`,
+    `${groups.completed.length} completed`
+  ]
+
+  return (
+    <div className="grid gap-3">
+      <DetailSection title="Root overview">
+        <div className="grid gap-2">
+          <div className="flex items-center gap-2 font-medium text-(--ui-text-primary)">
+            <LoopStatusIndicator row={root} />
+            <h3 className="m-0 min-w-0 truncate text-sm font-semibold text-(--ui-text-primary)">{root.title}</h3>
+          </div>
+          <div className="font-mono text-(--ui-text-tertiary)">{root.taskId}</div>
+          <div className="flex flex-wrap gap-1.5">
+            {summaryItems.map(item => <span className="rounded bg-(--ui-fill-quaternary) px-1.5 py-0.5 text-[0.64rem] text-(--ui-text-tertiary)" key={item}>{item}</span>)}
+          </div>
+          {root.latestSummary && <p className="m-0 whitespace-pre-wrap text-[0.72rem] leading-relaxed text-(--ui-text-secondary)">{root.latestSummary}</p>}
+        </div>
+      </DetailSection>
+
+      <RootOverviewGroup emptyCopy="No active children." label="Active/running children" onSelectTaskId={onSelectTaskId} rows={groups.active} />
+      <RootOverviewGroup emptyCopy="No children need foreground attention." label="Needs attention" onSelectTaskId={onSelectTaskId} rows={groups.attention} />
+      <RootOverviewGroup emptyCopy="No queued or pending children." label="Queued/pending" onSelectTaskId={onSelectTaskId} rows={groups.queued} />
+      <RootOverviewGroup emptyCopy="No completed child evidence yet." label="Completed/audit" onSelectTaskId={onSelectTaskId} rows={groups.completed} />
+
+      <DetailSection title="Audit trail">
+        <EmptyDetail>Queued, completed, and attention children stay inspectable here even when they are not composer rows.</EmptyDetail>
+      </DetailSection>
+
+      <DetailSection title="Safe actions">
+        <LoopTaskActions onRefresh={onRefresh} onTaskAction={onTaskAction} row={root} />
+      </DetailSection>
+    </div>
+  )
+}
+
 function LoopTaskDetails({
   backLabel,
+  detail,
   onBack,
   onRefresh,
   onSelectTaskId,
@@ -718,9 +949,18 @@ function LoopTaskDetails({
   rowById: Map<string, LoopRow>
 }) {
   const lineage = lineageItems(row)
+  const reviewMode = isReviewDecisionRow(row)
 
   return (
     <div className="grid gap-3">
+      {reviewMode && (
+        <DetailSection title="Review decision">
+          <div className="grid gap-2">
+            <p className="m-0 text-xs text-(--ui-text-secondary)">{attentionReason(row)}</p>
+            <ReviewDecisionControls onTaskAction={onTaskAction} row={row} />
+          </div>
+        </DetailSection>
+      )}
       <DetailSection title="Header">
         <div className="grid gap-2">
           {backLabel && onBack && (
@@ -739,6 +979,10 @@ function LoopTaskDetails({
 
       <DetailSection title="Description">
         {row.body?.trim() ? <TaskDescription text={row.body} /> : <EmptyDetail>No description provided.</EmptyDetail>}
+      </DetailSection>
+
+      <DetailSection title="Evidence / proof">
+        <EvidenceDetails detail={detail} row={row} />
       </DetailSection>
 
       <DetailSection title="Lineage/source">
@@ -834,6 +1078,10 @@ export function LoopPanel({
     [focusedTaskId, selectedTaskDetail, state]
   )
 
+  const rootRow = useMemo(() => rootLoopRow(state?.rows || []), [state])
+  const rootOverviewEligible = Boolean(rootRow && (rootRow.children.length > 0 || rootRow.childCount > 0))
+  const showingRootOverview = Boolean(rootOverviewEligible && rootRow && (!focusedTaskId || focusedTaskId === rootRow.taskId))
+
   const rowById = useMemo(() => {
     const rows = state?.rows || []
     const map = new Map(rows.map(row => [row.taskId, row]))
@@ -871,10 +1119,17 @@ export function LoopPanel({
     if (previous) {
       focusDrawerTask(previous.taskId)
       setNavigationStack(stack => stack.slice(0, -1))
+    } else if (rootRow && focusedTaskId !== rootRow.taskId) {
+      focusDrawerTask(rootRow.taskId)
     }
-  }, [focusDrawerTask, navigationStack])
+  }, [focusDrawerTask, focusedTaskId, navigationStack, rootRow])
 
   const backTarget = navigationStack.at(-1)
+
+  const detailBackLabel =
+    backTarget?.taskId === rootRow?.taskId ? 'root overview' : backTarget?.title || (rootRow && focusedTaskId !== rootRow.taskId ? 'root overview' : null)
+
+  const detailBack = detailBackLabel ? goBack : undefined
 
   const startResize = useCallback((event: ReactPointerEvent<HTMLDivElement>) => {
     if (event.button !== 0) {
@@ -984,15 +1239,26 @@ export function LoopPanel({
           )}
 
           <div className="min-h-0 flex-1 overflow-auto">
-            {selected ? (
+            {showingRootOverview && rootRow ? (
+              <div className="grid gap-3">
+                <h3 className="m-0 text-xs font-semibold uppercase tracking-wide text-(--ui-text-tertiary)">Loop/Kanban overview</h3>
+                <LoopRootOverview
+                  onRefresh={onRefresh}
+                  onSelectTaskId={selectRelatedTask}
+                  onTaskAction={onTaskAction}
+                  root={rootRow}
+                  state={state}
+                />
+              </div>
+            ) : selected ? (
               <div className="grid gap-3">
                 <h3 className="m-0 text-xs font-semibold uppercase tracking-wide text-(--ui-text-tertiary)">Loop details</h3>
                 <LoopTaskDetails
-                  backLabel={backTarget?.title}
+                  backLabel={detailBackLabel}
                   detail={selectedTaskDetail}
-                  onBack={backTarget ? goBack : undefined}
+                  onBack={detailBack}
                   onRefresh={onRefresh}
-                  onSelectTaskId={onSelectTaskId || onFocusTaskId ? selectRelatedTask : undefined}
+                  onSelectTaskId={selectRelatedTask}
                   onTaskAction={onTaskAction}
                   row={selected}
                   rowById={rowById}

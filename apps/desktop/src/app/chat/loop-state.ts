@@ -132,6 +132,7 @@ export interface TenantLoopTask {
   warnings?: unknown
   workspace_kind?: null | string
   workspace_path?: null | string
+  worker_activity?: null | LoopWorkerActivity
 }
 
 export interface TenantLoopSource {
@@ -500,7 +501,7 @@ function tenantRowFromTask(task: TenantLoopTask, depths: Map<string, number>, wo
   const children = taskChildren(task)
   const status = normalizedStatus(task.status)
   const latestRun = task.latest_run || null
-  const workerActivity = latestWorkerForTask(task, workers)
+  const workerActivity = task.worker_activity || latestWorkerForTask(task, workers)
   const latestRunActive = ACTIVE_STATUSES.has(normalizedStatus(latestRun?.status))
   const latestWorkerActive = ACTIVE_STATUSES.has(normalizedStatus(workerActivity?.status))
   const unfinishedRunnable = RUNNABLE_STATUSES.has(status) && !COMPLETE_STATUSES.has(status)

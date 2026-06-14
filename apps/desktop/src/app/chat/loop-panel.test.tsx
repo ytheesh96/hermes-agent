@@ -466,6 +466,130 @@ describe('LoopPanel', () => {
     expect(onRefresh).toHaveBeenCalledTimes(1)
   })
 
+  it('renders root overview groups, opens focused child details, and returns back to the root overview', () => {
+    const state = deriveLoopPanelStateFromTenantSource({
+      session_id: 'sess-option-a',
+      tenant: 'tenant-a',
+      latest_event_id: 404,
+      tasks: [
+        {
+          id: 't_root',
+          title: 'Root Task',
+          status: 'running',
+          tenant: 'tenant-a',
+          assignee: 'foreground',
+          latest_summary: 'awaiting foreground acceptance',
+          included_child_ids: ['t_running', 't_review', 't_queued', 't_done'],
+          included_parent_ids: []
+        },
+        {
+          id: 't_running',
+          title: 'Active child',
+          status: 'running',
+          tenant: 'tenant-a',
+          assignee: 'peacock',
+          included_child_ids: [],
+          included_parent_ids: ['t_root']
+        },
+        {
+          id: 't_review',
+          title: 'Review child',
+          status: 'blocked',
+          tenant: 'tenant-a',
+          assignee: 'reviewer-qa',
+          latest_summary: 'review-required: inspect proof',
+          included_child_ids: [],
+          included_parent_ids: ['t_root']
+        },
+        {
+          id: 't_queued',
+          title: 'Queued child',
+          status: 'ready',
+          tenant: 'tenant-a',
+          included_child_ids: [],
+          included_parent_ids: ['t_root']
+        },
+        {
+          id: 't_done',
+          title: 'Completed child',
+          status: 'done',
+          tenant: 'tenant-a',
+          latest_summary: 'verified evidence',
+          included_child_ids: [],
+          included_parent_ids: ['t_root']
+        }
+      ]
+    })
+
+    render(<LoopPanel open selectedTaskId="t_root" state={state} />)
+
+    expect(screen.getByRole('heading', { name: /Root overview/i })).toBeTruthy()
+    expect(screen.getByText('1 active')).toBeTruthy()
+    expect(screen.getByText('1 needs attention')).toBeTruthy()
+    expect(screen.getByText('1 queued')).toBeTruthy()
+    expect(screen.getByText('1 completed')).toBeTruthy()
+    expect(screen.getByText('Active/running children')).toBeTruthy()
+    expect(screen.getByText('Needs attention')).toBeTruthy()
+    expect(screen.getByText('Queued/pending')).toBeTruthy()
+    expect(screen.getByText('Completed/audit')).toBeTruthy()
+    expect(screen.getByText('Queued child')).toBeTruthy()
+    expect(screen.queryByRole('button', { name: /accept review/i })).toBeNull()
+
+    fireEvent.click(screen.getByRole('button', { name: /Focus child task t_review/i }))
+    expect(screen.getByRole('heading', { name: /Review decision/i })).toBeTruthy()
+    expect(screen.getByRole('heading', { name: /Review child/i })).toBeTruthy()
+    expect(screen.getByText('review-required: inspect proof')).toBeTruthy()
+    expect(screen.getByRole('button', { name: /accept review/i })).toBeTruthy()
+    expect(screen.getByRole('button', { name: /reject review/i })).toBeTruthy()
+    expect(screen.getByRole('button', { name: /escalate review/i })).toBeTruthy()
+    expect((screen.getByRole('button', { name: /accept review/i }) as HTMLButtonElement).disabled).toBe(true)
+    expect(screen.getByText(/Review decisions are unavailable/i)).toBeTruthy()
+
+    fireEvent.click(screen.getByRole('button', { name: /Back to root overview/i }))
+    expect(screen.getByRole('heading', { name: /Root overview/i })).toBeTruthy()
+  })
+
+  it('keeps completed roots in overview mode and does not show review controls for non-review blockers', () => {
+    const state = deriveLoopPanelStateFromTenantSource({
+      session_id: 'sess-option-a-done-root',
+      tenant: 'tenant-a',
+      latest_event_id: 405,
+      tasks: [
+        {
+          id: 't_root',
+          title: 'Root Task',
+          status: 'done',
+          tenant: 'tenant-a',
+          latest_summary: 'final evidence accepted',
+          included_child_ids: ['t_blocked'],
+          included_parent_ids: []
+        },
+        {
+          id: 't_blocked',
+          title: 'Credential blocker',
+          status: 'blocked',
+          tenant: 'tenant-a',
+          latest_summary: 'blocked: missing private token',
+          included_child_ids: [],
+          included_parent_ids: ['t_root']
+        }
+      ]
+    })
+
+    render(<LoopPanel open selectedTaskId="t_root" state={state} />)
+
+    expect(screen.getByRole('heading', { name: /Root overview/i })).toBeTruthy()
+    expect(screen.getByText('final evidence accepted')).toBeTruthy()
+    expect(screen.getByText('Credential blocker')).toBeTruthy()
+
+    fireEvent.click(screen.getByRole('button', { name: /Focus child task t_blocked/i }))
+    expect(screen.getByRole('heading', { name: /Credential blocker/i })).toBeTruthy()
+    expect(screen.getByText('blocked: missing private token')).toBeTruthy()
+    expect(screen.queryByRole('button', { name: /accept review/i })).toBeNull()
+    expect(screen.queryByRole('button', { name: /reject review/i })).toBeNull()
+    expect(screen.queryByRole('button', { name: /escalate review/i })).toBeNull()
+  })
+
   it('renders worker activity links, run details, and log tails in the task drawer', () => {
     const state = deriveLoopPanelStateFromTenantSource({
       session_id: 'sess-workers',
@@ -834,11 +958,11 @@ describe('LoopPanel', () => {
     expect(screen.queryByText(/"tasks"/)).toBeNull()
 
     fireEvent.click(screen.getByRole('button', { name: /select blocked by task t_parent/i }))
+    expect(screen.getByRole('heading', { name: /Root overview/i })).toBeTruthy()
     expect(screen.getByRole('heading', { name: /Design parent/i })).toBeTruthy()
-    expect(screen.getByText('Parent body')).toBeTruthy()
-    expect(screen.getByText('Not blocked by any tasks.')).toBeTruthy()
+    expect(screen.getByText('parent complete')).toBeTruthy()
 
-    fireEvent.click(screen.getAllByRole('button', { name: /select blocking task t_child/i })[0]!)
+    fireEvent.click(screen.getAllByRole('button', { name: /Focus child task t_child/i })[0]!)
     expect(screen.getByRole('heading', { name: /Build child/i })).toBeTruthy()
 
     fireEvent.click(screen.getAllByRole('button', { name: /select blocking task t_grandchild/i })[0]!)
@@ -976,10 +1100,11 @@ describe('LoopPanel', () => {
     expect(screen.getByText('Archived task details unavailable')).toBeTruthy()
 
     fireEvent.click(screen.getByRole('button', { name: /select blocked by task t_parent/i }))
+    expect(screen.getByRole('heading', { name: /Root overview/i })).toBeTruthy()
     expect(screen.getByRole('heading', { name: /Available prerequisite/i })).toBeTruthy()
-    expect(screen.getByRole('button', { name: /back to Blocked implementation/i })).toBeTruthy()
+    expect(screen.getByRole('button', { name: /Focus child task t_child/i })).toBeTruthy()
 
-    fireEvent.click(screen.getByRole('button', { name: /back to Blocked implementation/i }))
+    fireEvent.click(screen.getByRole('button', { name: /Focus child task t_child/i }))
     expect(screen.getByRole('heading', { name: /Blocked implementation/i })).toBeTruthy()
     expect(screen.getByText('Blocked by')).toBeTruthy()
     expect(screen.queryByText('Parent tasks')).toBeNull()

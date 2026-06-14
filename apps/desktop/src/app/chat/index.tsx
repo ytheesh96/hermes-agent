@@ -58,7 +58,7 @@ import { droppedFileInlineRefs, type SessionDragPayload, sessionInlineRef } from
 import type { ChatBarState } from './composer/types'
 import { type DroppedFile, partitionDroppedFiles } from './hooks/use-composer-actions'
 import { useFileDropZone } from './hooks/use-file-drop-zone'
-import { LoopPanel, type LoopTaskAction, LoopTaskStack } from './loop-panel'
+import { LoopPanel, type LoopTaskAction } from './loop-panel'
 import { loopSessionSourceRefetchInterval } from './loop-refresh'
 import { deriveLoopPanelStateFromTenantSource, type LoopRow, type TenantLoopSource } from './loop-state'
 import { ScrollToBottomButton } from './scroll-to-bottom-button'
@@ -572,17 +572,7 @@ export function ChatView({
                     queueSessionKey={selectedSessionId || activeSessionId}
                     sessionId={activeSessionId}
                     state={chatBarState}
-                    statusStackLead={
-                      loopPanelState?.rows.length ? (
-                        <LoopTaskStack
-                          onRefresh={() => void loopSourceQuery.refetch()}
-                          onSelectTaskId={handleSelectLoopTaskId}
-                          refreshing={loopSourceQuery.isFetching}
-                          selectedTaskId={selectedLoopTaskId}
-                          state={loopPanelState}
-                        />
-                      ) : null
-                    }
+                    statusStackLead={null}
                   />
                 </Suspense>
               )}

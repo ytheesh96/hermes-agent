@@ -90,7 +90,7 @@ export function ComposerStatusStack({ lead, queue, sessionId, onOpenKanbanTask }
   const openAgents = () => navigate(AGENTS_ROUTE)
 
   const openStatusItem = (item: ComposerStatusItem) => {
-    if (item.type === 'todo' && item.kanbanTaskId && onOpenKanbanTask) {
+    if (item.kanbanTaskId && onOpenKanbanTask) {
       onOpenKanbanTask(item.kanbanTaskId)
 
       return
@@ -98,12 +98,6 @@ export function ComposerStatusStack({ lead, queue, sessionId, onOpenKanbanTask }
 
     if (item.sessionId) {
       void openSessionInNewWindow(item.sessionId, { watch: true })
-
-      return
-    }
-
-    if (item.kanbanTaskId && onOpenKanbanTask) {
-      onOpenKanbanTask(item.kanbanTaskId)
 
       return
     }

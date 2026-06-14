@@ -110,31 +110,43 @@ describe('reconcileKanbanSessionSource', () => {
     $kanbanStatusBySession.set({})
   })
 
-  it('adds durable Kanban tasks to the existing Tasks group and workers to a Kanban agents group', () => {
+  it('shows only the root Kanban task in Tasks and only active/attention children in Subagents', () => {
     reconcileKanbanSessionSource(SID, {
       tasks: [
-        { id: 't_running', status: 'running', title: 'Running Kanban task' },
-        { id: 't_blocked', status: 'blocked', title: 'Blocked Kanban task' },
-        { id: 't_done', status: 'done', title: 'Completed Kanban task' }
+        { id: 't_root', status: 'running', title: 'Root Kanban task', included_parent_ids: [], included_child_ids: ['t_running', 't_queued', 't_review', 't_done'] },
+        { id: 't_running', status: 'running', title: 'Running child', included_parent_ids: ['t_root'], included_child_ids: [] },
+        { id: 't_queued', status: 'ready', title: 'Queued child', included_parent_ids: ['t_root'], included_child_ids: [] },
+        { id: 't_review', status: 'blocked', title: 'Review child', latest_summary: 'review-required: needs eyes', included_parent_ids: ['t_root'], included_child_ids: [] },
+        { id: 't_done', status: 'done', title: 'Completed child', included_parent_ids: ['t_root'], included_child_ids: [] }
       ],
       workers: [
         {
           run_id: 7,
           task_id: 't_running',
-          task_title: 'Running Kanban task',
+          task_title: 'Running child',
           profile: 'peacock',
           status: 'running',
+          task_status: 'running',
           worker_session_id: 'worker-session-7',
           log_tail: 'worker log tail'
         },
         {
           run_id: 8,
-          task_id: 't_blocked',
-          task_title: 'Blocked Kanban task',
+          task_id: 't_review',
+          task_title: 'Review child',
           profile: 'reviewer-qa',
-          status: 'completed',
-          outcome: 'failed',
-          error: 'blocked by review gate'
+          status: 'done',
+          task_status: 'blocked',
+          summary: 'review-required: needs eyes'
+        },
+        {
+          run_id: 9,
+          task_id: 't_done',
+          task_title: 'Completed child',
+          profile: 'reviewer-qa',
+          status: 'done',
+          task_status: 'done',
+          summary: 'accepted'
         }
       ]
     })
@@ -144,14 +156,14 @@ describe('reconcileKanbanSessionSource', () => {
 
     expect(groups.map(group => group.type)).toEqual(['todo', 'kanban-agent'])
     expect(groups[0]!.items.map(item => [item.id, item.kanbanTaskId, item.todoStatus])).toEqual([
-      ['kanban-task:t_running', 't_running', 'in_progress'],
-      ['kanban-task:t_blocked', 't_blocked', 'pending'],
-      ['kanban-task:t_done', 't_done', 'completed']
+      ['kanban-task:t_root', 't_root', 'in_progress']
     ])
     expect(groups[1]!.items.map(item => [item.id, item.state, item.sessionId, item.output])).toEqual([
       ['kanban-agent:t_running:7', 'running', 'worker-session-7', 'worker log tail'],
-      ['kanban-agent:t_blocked:8', 'failed', undefined, 'blocked by review gate']
+      ['kanban-agent:t_review:8', 'failed', undefined, 'review-required: needs eyes']
     ])
+    expect(items.map(item => item.kanbanTaskId)).not.toContain('t_queued')
+    expect(items.map(item => item.kanbanTaskId)).not.toContain('t_done')
   })
 
   it('clears stale Kanban rows when session-source metadata disappears', () => {

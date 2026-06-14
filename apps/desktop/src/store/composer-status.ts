@@ -65,11 +65,16 @@ const todoToItem = (t: TodoItem): ComposerStatusItem => ({
   type: 'todo'
 })
 
-const ACTIVE_KANBAN_TASK_STATUSES = new Set(['claimed', 'in_progress', 'ready', 'running'])
+const ACTIVE_KANBAN_TASK_STATUSES = new Set(['claimed', 'in_progress', 'running'])
+const PENDING_KANBAN_TASK_STATUSES = new Set(['queued', 'ready', 'scheduled', 'todo', 'triage'])
 const DONE_KANBAN_TASK_STATUSES = new Set(['archived', 'cancelled', 'complete', 'completed', 'done'])
 const FAILED_KANBAN_RUN_STATES = new Set(['crashed', 'error', 'failed', 'gave_up', 'interrupted', 'spawn_failed', 'timed_out', 'timeout'])
 
-const normalized = (value: unknown): string => (typeof value === 'string' && value.trim() ? value.trim().toLowerCase() : '')
+const normalized = (value: unknown): string => (typeof value === 'string' && value.trim() ? value.trim().toLowerCase().replaceAll('-', '_') : '')
+
+const taskParentIds = (task: TenantLoopTask): string[] => task.included_parent_ids || task.links?.parents || []
+
+const isRootKanbanTask = (task: TenantLoopTask): boolean => taskParentIds(task).length === 0
 
 const kanbanTaskTodoStatus = (task: TenantLoopTask): TodoStatus => {
   const status = normalized(task.status)
@@ -78,11 +83,11 @@ const kanbanTaskTodoStatus = (task: TenantLoopTask): TodoStatus => {
     return 'completed'
   }
 
-  if (ACTIVE_KANBAN_TASK_STATUSES.has(status)) {
-    return 'in_progress'
+  if (PENDING_KANBAN_TASK_STATUSES.has(status)) {
+    return 'pending'
   }
 
-  return 'pending'
+  return 'in_progress'
 }
 
 const kanbanTaskToItem = (task: TenantLoopTask): ComposerStatusItem => {
@@ -91,23 +96,51 @@ const kanbanTaskToItem = (task: TenantLoopTask): ComposerStatusItem => {
   return {
     id: `kanban-task:${task.id}`,
     kanbanTaskId: task.id,
-    state: todoStatus === 'in_progress' ? 'running' : 'done',
+    state: todoStatus === 'completed' ? 'done' : 'running',
     title: task.title || task.id,
     todoStatus,
     type: 'todo'
   }
 }
 
-const kanbanWorkerState = (worker: LoopWorkerActivity): StatusItemState => {
+const workerAttentionText = (worker: LoopWorkerActivity): string =>
+  [worker.summary, worker.summary_preview, worker.error, worker.error_preview, worker.outcome, worker.status, worker.task_status]
+    .filter((value): value is string => Boolean(value))
+    .join(' ')
+    .toLowerCase()
+
+const workerNeedsForegroundAttention = (worker: LoopWorkerActivity): boolean => {
   const status = normalized(worker.status)
   const outcome = normalized(worker.outcome)
   const taskStatus = normalized(worker.task_status)
+  const text = workerAttentionText(worker)
 
-  if (FAILED_KANBAN_RUN_STATES.has(status) || FAILED_KANBAN_RUN_STATES.has(outcome) || taskStatus === 'blocked') {
+  return (
+    taskStatus === 'blocked' ||
+    status === 'blocked' ||
+    outcome === 'blocked' ||
+    FAILED_KANBAN_RUN_STATES.has(status) ||
+    FAILED_KANBAN_RUN_STATES.has(outcome) ||
+    text.includes('review-required') ||
+    text.includes('review required') ||
+    text.includes('human approval') ||
+    text.includes('needs approval')
+  )
+}
+
+const workerIsActive = (worker: LoopWorkerActivity): boolean => {
+  const status = normalized(worker.status)
+  const taskStatus = normalized(worker.task_status)
+
+  return ACTIVE_KANBAN_TASK_STATUSES.has(status) || ACTIVE_KANBAN_TASK_STATUSES.has(taskStatus)
+}
+
+const kanbanWorkerState = (worker: LoopWorkerActivity): StatusItemState => {
+  if (workerNeedsForegroundAttention(worker)) {
     return 'failed'
   }
 
-  if (ACTIVE_KANBAN_TASK_STATUSES.has(status) || ACTIVE_KANBAN_TASK_STATUSES.has(taskStatus)) {
+  if (workerIsActive(worker)) {
     return 'running'
   }
 
@@ -150,11 +183,16 @@ export function reconcileKanbanSessionSource(sid: string, source: TenantLoopSour
     return
   }
 
-  const tasks = (source.tasks || [])
-    .filter(task => task.id && normalized(task.status) !== 'archived')
-    .map(kanbanTaskToItem)
+  const visibleTasks = (source.tasks || []).filter(task => task.id && normalized(task.status) !== 'archived')
+  const rootTask = visibleTasks.find(isRootKanbanTask) || visibleTasks[0]
+  const tasks = rootTask ? [kanbanTaskToItem(rootTask)] : []
 
-  const agents = (source.workers || []).filter(worker => worker.task_id && Number.isFinite(worker.run_id)).map(kanbanWorkerToItem)
+  const rootTaskId = rootTask?.id
+
+  const agents = (source.workers || [])
+    .filter(worker => worker.task_id && Number.isFinite(worker.run_id) && worker.task_id !== rootTaskId)
+    .filter(worker => workerIsActive(worker) || workerNeedsForegroundAttention(worker))
+    .map(kanbanWorkerToItem)
 
   writeKanbanStatus(sid, [...tasks, ...agents])
 }
