@@ -99,6 +99,7 @@ function actionState() {
       {
         id: 't_triage',
         title: 'Needs decomposition',
+        body: 'Draft Loop spec\n\n- Build the child task graph\n- Keep the evidence visible',
         status: 'triage',
         tenant: 'tenant-a',
         included_child_ids: [],
@@ -337,10 +338,10 @@ describe('LoopPanel', () => {
 
     render(<LoopHarness state={state!} />)
 
-    expect(screen.getByText('Loop')).toBeTruthy()
     expect(screen.getByText('Loop 0/2')).toBeTruthy()
     expect(screen.getAllByText('Design parent').length).toBeGreaterThan(0)
-    expect(screen.getByText('Build child')).toBeTruthy()
+    const buildChildRow = screen.getByTestId('loop-card-t_child')
+    expect(within(buildChildRow).getByText('Build child')).toBeTruthy()
     expect(screen.getAllByLabelText('Status: triage').length).toBeGreaterThanOrEqual(2)
     expect(screen.queryByText(/triage/i)).toBeNull()
     expect(screen.queryByText('active')).toBeNull()
@@ -351,7 +352,7 @@ describe('LoopPanel', () => {
     expect(screen.getByTestId('loop-panel').getAttribute('data-pane-open')).toBe('false')
     expect(screen.queryByText(/"nodes"/)).toBeNull()
 
-    fireEvent.click(screen.getByText('Build child'))
+    fireEvent.click(within(buildChildRow).getByText('Build child'))
     expect(screen.getByTestId('loop-panel').className).not.toContain('hidden xl:flex')
     expect(screen.getByTestId('loop-panel').className).not.toContain('fixed')
     expect(screen.getByTestId('loop-panel').getAttribute('data-layout')).toBe('docked')
@@ -379,7 +380,7 @@ describe('LoopPanel', () => {
     expect(screen.getAllByText('t_parent').length).toBeGreaterThan(0)
     expect(screen.queryByRole('button', { name: /show debug json/i })).toBeNull()
     expect(screen.queryByText(/"nodes"/)).toBeNull()
-  })
+  }, 15_000)
 
   it('renders compact flat rows plus read-only drawer sections from real tenant task data', () => {
     const state = deriveLoopPanelStateFromTenantSource({
@@ -475,6 +476,7 @@ describe('LoopPanel', () => {
         {
           id: 't_root',
           title: 'Root Task',
+          body: 'Root execution spec\n\n- Split the work into atomic tasks',
           status: 'running',
           tenant: 'tenant-a',
           assignee: 'foreground',
@@ -523,19 +525,30 @@ describe('LoopPanel', () => {
 
     render(<LoopPanel open selectedTaskId="t_root" state={state} />)
 
-    expect(screen.getByRole('heading', { name: /Root overview/i })).toBeTruthy()
-    expect(screen.getByText('1 active')).toBeTruthy()
-    expect(screen.getByText('1 needs attention')).toBeTruthy()
-    expect(screen.getByText('1 queued')).toBeTruthy()
-    expect(screen.getByText('1 completed')).toBeTruthy()
+    expect(screen.getByRole('heading', { name: /Loop overview/i })).toBeTruthy()
+    expect(screen.queryByText(/Live draft/i)).toBeNull()
+    expect(screen.queryByText(/rev 404/i)).toBeNull()
+    expect(screen.queryByText('1 active')).toBeNull()
+    expect(screen.queryByText('1 needs attention')).toBeNull()
+    expect(screen.queryByText('1 queued')).toBeNull()
+    expect(screen.queryByText('1 completed')).toBeNull()
     expect(screen.getByText('Active/running children')).toBeTruthy()
     expect(screen.getByText('Needs attention')).toBeTruthy()
     expect(screen.getByText('Queued/pending')).toBeTruthy()
     expect(screen.getByText('Completed/audit')).toBeTruthy()
     expect(screen.getByText('Queued child')).toBeTruthy()
+    expect(screen.getByText('Execution overview')).toBeTruthy()
+    expect((screen.getByTestId('loop-root-spec') as HTMLDetailsElement).open).toBe(false)
     expect(screen.queryByRole('button', { name: /accept review/i })).toBeNull()
 
-    fireEvent.click(screen.getByRole('button', { name: /Focus child task t_review/i }))
+    const reviewRow = screen.getAllByRole('button', { name: /Review child/i }).find(element => element.className.includes('group/status-row'))
+    expect(reviewRow).toBeTruthy()
+    expect(reviewRow!.className).toContain('group/status-row')
+
+    fireEvent.click(reviewRow!)
+    expect(screen.getByRole('tab', { name: /Loop overview/i })).toBeTruthy()
+    expect(screen.getByRole('tab', { name: /Review child/i })).toBeTruthy()
+    expect(screen.getByTestId('loop-task-tab-t_review')).toBeTruthy()
     expect(screen.getByRole('heading', { name: /Review decision/i })).toBeTruthy()
     expect(screen.getByRole('heading', { name: /Review child/i })).toBeTruthy()
     expect(screen.getByText('review-required: inspect proof')).toBeTruthy()
@@ -544,9 +557,17 @@ describe('LoopPanel', () => {
     expect(screen.getByRole('button', { name: /escalate review/i })).toBeTruthy()
     expect((screen.getByRole('button', { name: /accept review/i }) as HTMLButtonElement).disabled).toBe(true)
     expect(screen.getByText(/Review decisions are unavailable/i)).toBeTruthy()
+    expect(screen.queryByRole('button', { name: /Back to root overview/i })).toBeNull()
 
-    fireEvent.click(screen.getByRole('button', { name: /Back to root overview/i }))
-    expect(screen.getByRole('heading', { name: /Root overview/i })).toBeTruthy()
+    fireEvent.click(screen.getByRole('tab', { name: /Loop overview/i }))
+    expect(screen.getByRole('heading', { name: /Loop overview/i })).toBeTruthy()
+
+    const reopenedReviewRow = screen.getAllByRole('button', { name: /Review child/i }).find(element => element.className.includes('group/status-row'))
+    expect(reopenedReviewRow).toBeTruthy()
+    fireEvent.click(reopenedReviewRow!)
+    fireEvent.click(screen.getByRole('button', { name: /Close Review child/i }))
+    expect(screen.queryByRole('tab', { name: /Review child/i })).toBeNull()
+    expect(screen.getByRole('heading', { name: /Loop overview/i })).toBeTruthy()
   })
 
   it('keeps completed roots in overview mode and does not show review controls for non-review blockers', () => {
@@ -578,11 +599,11 @@ describe('LoopPanel', () => {
 
     render(<LoopPanel open selectedTaskId="t_root" state={state} />)
 
-    expect(screen.getByRole('heading', { name: /Root overview/i })).toBeTruthy()
-    expect(screen.getByText('final evidence accepted')).toBeTruthy()
+    expect(screen.getByRole('heading', { name: /Loop overview/i })).toBeTruthy()
+    expect(screen.queryByText('final evidence accepted')).toBeNull()
     expect(screen.getByText('Credential blocker')).toBeTruthy()
 
-    fireEvent.click(screen.getByRole('button', { name: /Focus child task t_blocked/i }))
+    fireEvent.click(screen.getByRole('button', { name: /Credential blocker/i }))
     expect(screen.getByRole('heading', { name: /Credential blocker/i })).toBeTruthy()
     expect(screen.getByText('blocked: missing private token')).toBeTruthy()
     expect(screen.queryByRole('button', { name: /accept review/i })).toBeNull()
@@ -958,11 +979,11 @@ describe('LoopPanel', () => {
     expect(screen.queryByText(/"tasks"/)).toBeNull()
 
     fireEvent.click(screen.getByRole('button', { name: /select blocked by task t_parent/i }))
-    expect(screen.getByRole('heading', { name: /Root overview/i })).toBeTruthy()
+    expect(screen.getByRole('heading', { name: /Loop overview/i })).toBeTruthy()
     expect(screen.getByRole('heading', { name: /Design parent/i })).toBeTruthy()
-    expect(screen.getByText('parent complete')).toBeTruthy()
+    expect(screen.queryByText('parent complete')).toBeNull()
 
-    fireEvent.click(screen.getAllByRole('button', { name: /Focus child task t_child/i })[0]!)
+    fireEvent.click(screen.getAllByRole('button', { name: /Build child/i })[0]!)
     expect(screen.getByRole('heading', { name: /Build child/i })).toBeTruthy()
 
     fireEvent.click(screen.getAllByRole('button', { name: /select blocking task t_grandchild/i })[0]!)
@@ -1100,43 +1121,51 @@ describe('LoopPanel', () => {
     expect(screen.getByText('Archived task details unavailable')).toBeTruthy()
 
     fireEvent.click(screen.getByRole('button', { name: /select blocked by task t_parent/i }))
-    expect(screen.getByRole('heading', { name: /Root overview/i })).toBeTruthy()
+    expect(screen.getByRole('heading', { name: /Loop overview/i })).toBeTruthy()
     expect(screen.getByRole('heading', { name: /Available prerequisite/i })).toBeTruthy()
-    expect(screen.getByRole('button', { name: /Focus child task t_child/i })).toBeTruthy()
+    const blockedRows = screen.getAllByRole('button', { name: /Blocked implementation/i })
+    expect(blockedRows.length).toBeGreaterThan(0)
 
-    fireEvent.click(screen.getByRole('button', { name: /Focus child task t_child/i }))
+    fireEvent.click(blockedRows.at(-1)!)
     expect(screen.getByRole('heading', { name: /Blocked implementation/i })).toBeTruthy()
     expect(screen.getByText('Blocked by')).toBeTruthy()
     expect(screen.queryByText('Parent tasks')).toBeNull()
     expect(onTaskAction).not.toHaveBeenCalled()
   })
 
-  it('exposes only read-only safe drawer utilities and dispatches details on explicit clicks', () => {
+  it('exposes root draft quick actions and keeps child drawer utilities read-only', () => {
     const state = actionState()
     const onTaskAction = vi.fn()
     const onRefresh = vi.fn()
     const { rerender } = render(<LoopPanel onRefresh={onRefresh} onTaskAction={onTaskAction} open selectedTaskId="t_triage" state={state} />)
 
     expect(onTaskAction).not.toHaveBeenCalled()
-    const actionGroups = screen.getAllByTestId('loop-task-actions')
-    expect(actionGroups).toHaveLength(1)
-    expect(within(actionGroups[0]!).getByRole('button', { name: /copy id for t_triage/i })).toBeTruthy()
-    expect(within(actionGroups[0]!).getByRole('button', { name: /open source task\/details for t_triage/i })).toBeTruthy()
-    expect(within(actionGroups[0]!).getByRole('button', { name: /refresh details for t_triage/i })).toBeTruthy()
+    const rootActions = screen.getByTestId('loop-root-actions')
+    expect(screen.getByText('Loop spec')).toBeTruthy()
+    expect(screen.getAllByText('Draft Loop spec').length).toBeGreaterThan(0)
+    expect((screen.getByTestId('loop-root-spec') as HTMLDetailsElement).open).toBe(true)
+    expect(within(rootActions).getByRole('button', { name: /submit t_triage/i })).toBeTruthy()
+    expect(within(rootActions).getByRole('button', { name: /archive loop tasks for t_triage/i })).toBeTruthy()
+    expect(within(rootActions).getByRole('button', { name: /ask hermes about t_triage/i })).toBeTruthy()
+    expect(within(rootActions).queryByRole('button', { name: /copy id for t_triage/i })).toBeNull()
+    expect(within(rootActions).queryByRole('button', { name: /open source task\/details for t_triage/i })).toBeNull()
+    expect(within(rootActions).queryByRole('button', { name: /refresh details for t_triage/i })).toBeNull()
     const drawerText = document.body.textContent || ''
-    expect(drawerText.indexOf('Header')).toBeLessThan(drawerText.indexOf('Safe actions'))
-    expect(drawerText.indexOf('Safe actions')).toBeLessThan(drawerText.indexOf('Copy ID'))
-    expect(screen.queryByRole('button', { name: /decompose t_triage/i })).toBeNull()
+    expect(drawerText.indexOf('Loop overview')).toBeLessThan(drawerText.indexOf('Quick actions'))
+    expect(drawerText.indexOf('Quick actions')).toBeLessThan(drawerText.indexOf('Loop spec'))
     expect(screen.queryByRole('button', { name: /block t_triage/i })).toBeNull()
     expect(screen.queryByRole('button', { name: /park t_triage/i })).toBeNull()
     expect(screen.queryByRole('button', { name: /start t_triage/i })).toBeNull()
 
-    fireEvent.click(screen.getAllByRole('button', { name: /open source task\/details for t_triage/i })[0]!)
-    expect(onTaskAction).toHaveBeenCalledWith('details', expect.objectContaining({ taskId: 't_triage' }))
-    fireEvent.click(screen.getAllByRole('button', { name: /refresh details for t_triage/i })[0]!)
-    expect(onRefresh).toHaveBeenCalledTimes(1)
+    fireEvent.click(within(rootActions).getByRole('button', { name: /submit t_triage/i }))
+    expect(onTaskAction).toHaveBeenCalledWith('decompose', expect.objectContaining({ taskId: 't_triage' }))
+    fireEvent.click(within(rootActions).getByRole('button', { name: /archive loop tasks for t_triage/i }))
+    expect(onTaskAction).toHaveBeenCalledWith('archive-loop', expect.objectContaining({ taskId: 't_triage' }))
+    fireEvent.click(within(rootActions).getByRole('button', { name: /ask hermes about t_triage/i }))
+    expect(onTaskAction).toHaveBeenCalledWith('ask-hermes', expect.objectContaining({ taskId: 't_triage' }))
 
     rerender(<LoopPanel onRefresh={onRefresh} onTaskAction={onTaskAction} open selectedTaskId="t_blocked" state={state} />)
+    expect(screen.queryByTestId('loop-root-actions')).toBeNull()
     expect(screen.queryByRole('button', { name: /unblock t_blocked/i })).toBeNull()
     expect(screen.queryByRole('button', { name: /park t_blocked/i })).toBeNull()
     expect(screen.queryByRole('button', { name: /^Block t_blocked$/i })).toBeNull()

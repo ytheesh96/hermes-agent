@@ -37,7 +37,7 @@ const groupLabel = (group: StatusGroup, s: Translations['statusStack']) => {
     return s.subagents(group.items.length)
   }
 
-  return group.type === 'kanban-agent' ? `${group.items.length} Kanban agent${group.items.length === 1 ? '' : 's'}` : s.background(group.items.length)
+  return group.type === 'kanban-agent' ? `${group.items.length} Loopagent${group.items.length === 1 ? '' : 's'}` : s.background(group.items.length)
 }
 
 interface ComposerStatusStackProps {

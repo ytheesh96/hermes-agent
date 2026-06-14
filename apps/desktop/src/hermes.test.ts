@@ -1,6 +1,6 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 
-import { getLoopSessionSource, getLoopTaskDetail, getSessionMessages, listAllProfileSessions, listSessions, updateLoopTaskStatus } from './hermes'
+import { decomposeLoopTask, getLoopSessionSource, getLoopTaskDetail, getSessionMessages, listAllProfileSessions, listSessions, updateLoopTaskStatus } from './hermes'
 
 const emptySessionsResponse = {
   limit: 0,
@@ -87,6 +87,20 @@ describe('Hermes REST session helpers', () => {
       method: 'PATCH',
       path: '/api/plugins/kanban/tasks/t_blocked',
       profile: 'peacock'
+    })
+  })
+
+  it('decomposes Loop root tasks through the profile-scoped kanban API', async () => {
+    api.mockResolvedValue({ child_ids: [], fanout: false, ok: true, task_id: 't_root' })
+
+    await decomposeLoopTask('t_root', 'peacock')
+
+    expect(api).toHaveBeenCalledWith({
+      body: {},
+      method: 'POST',
+      path: '/api/plugins/kanban/tasks/t_root/decompose',
+      profile: 'peacock',
+      timeoutMs: 600_000
     })
   })
 })

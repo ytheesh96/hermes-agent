@@ -137,12 +137,7 @@ export const StatusItemRow = memo(function StatusItemRow({ item, onDismiss, onOp
         >
           {item.title}
         </span>
-        {item.type === 'kanban-agent' && (
-          <span className="shrink-0 rounded border border-amber-500/25 bg-amber-500/10 px-1 text-[0.55rem] font-semibold uppercase tracking-wide text-amber-700 dark:text-amber-300">
-            Kanban
-          </span>
-        )}
-        {(item.type === 'subagent' || item.type === 'kanban-agent') && item.currentTool && (
+        {(item.type === 'todo' || item.type === 'subagent' || item.type === 'kanban-agent') && item.currentTool && (
           <span className="shrink-0 truncate text-[0.62rem] leading-4 text-muted-foreground/70">
             {toolLabel(item.currentTool)}
           </span>

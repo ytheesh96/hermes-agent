@@ -637,6 +637,19 @@ def _worker_session_id_from_metadata(metadata: Any) -> Optional[str]:
     return text or None
 
 
+def _worker_current_tool_from_metadata(metadata: Any) -> Optional[str]:
+    if not isinstance(metadata, dict):
+        return None
+    for key in ("current_tool", "currentTool", "current_tool_name", "tool_name", "last_tool"):
+        value = metadata.get(key)
+        if value is None:
+            continue
+        text = str(value).strip()
+        if text:
+            return text
+    return None
+
+
 def _log_tail_payload(task_id: str, *, board: Optional[str], tail_bytes: int = 8192) -> dict[str, Any]:
     log_path = kanban_db.worker_log_path(task_id, board=board)
     exists = log_path.exists()
@@ -737,6 +750,7 @@ def _worker_activity_for_tasks(
         outcome = run.get("outcome")
         summary_preview = _preview_text(run.get("summary"))
         error_preview = _preview_text(run.get("error"))
+        current_tool = _worker_current_tool_from_metadata(run.get("metadata"))
         out[task_id] = {
             "task_id": task_id,
             "run_id": run.get("id"),
@@ -755,6 +769,8 @@ def _worker_activity_for_tasks(
             "summary_preview": summary_preview,
             "error_preview": error_preview,
         }
+        if current_tool:
+            out[task_id]["current_tool"] = current_tool
         out[task_id].update(_log_tail_payload(task_id, board=board))
     return out
 

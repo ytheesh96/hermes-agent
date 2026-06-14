@@ -15,7 +15,7 @@ import { Backdrop } from '@/components/Backdrop'
 import { PromptOverlays } from '@/components/prompt-overlays'
 import { Button } from '@/components/ui/button'
 import { Codicon } from '@/components/ui/codicon'
-import { getGlobalModelOptions, getLoopSessionSource, getLoopTaskDetail, type HermesGateway, updateLoopTaskStatus } from '@/hermes'
+import { decomposeLoopTask, getGlobalModelOptions, getLoopSessionSource, getLoopTaskDetail, type HermesGateway, updateLoopTaskStatus } from '@/hermes'
 import type { ChatMessage } from '@/lib/chat-messages'
 import { quickModelOptions, sessionTitle, toRuntimeMessage } from '@/lib/chat-runtime'
 import { useIncrementalExternalStoreRuntime } from '@/lib/incremental-external-store-runtime'
@@ -60,7 +60,7 @@ import { type DroppedFile, partitionDroppedFiles } from './hooks/use-composer-ac
 import { useFileDropZone } from './hooks/use-file-drop-zone'
 import { LoopPanel, type LoopTaskAction } from './loop-panel'
 import { loopSessionSourceRefetchInterval } from './loop-refresh'
-import { deriveLoopPanelStateFromTenantSource, type LoopRow, type TenantLoopSource } from './loop-state'
+import { deriveLoopPanelStateFromTenantSource, type LoopPanelState, type LoopRow, type TenantLoopSource } from './loop-state'
 import { ScrollToBottomButton } from './scroll-to-bottom-button'
 import { SessionActionsMenu } from './sidebar/session-actions-menu'
 import { threadLoadingState } from './thread-loading'
@@ -100,6 +100,43 @@ interface ChatHeaderProps {
   onToggleSelectedPin: () => void
   routedSessionId: null | string
   selectedSessionId: null | string
+}
+
+function normalizeLoopStatus(status?: null | string): string {
+  return (status || '').trim().toLowerCase().replaceAll('-', '_')
+}
+
+function archiveableLoopRows(state: LoopPanelState | null, fallback: LoopRow): LoopRow[] {
+  const rows = state?.rows.length ? state.rows : [fallback]
+  const seen = new Set<string>()
+
+  return rows.filter(row => {
+    if (seen.has(row.taskId) || normalizeLoopStatus(row.status) === 'archived') {
+      return false
+    }
+
+    seen.add(row.taskId)
+
+    return true
+  })
+}
+
+function buildLoopTriageDraft(root: LoopRow, state: LoopPanelState | null): string {
+  const body = (root.body || '').trim()
+  const relatedRows = (state?.rows || [])
+    .filter(row => row.taskId !== root.taskId)
+    .slice(0, 20)
+    .map(row => `- ${row.taskId} [${row.status}] ${row.title}`)
+
+  return [
+    'Help me triage this Loop spec in Kanban.',
+    `Root task: ${root.taskId} - ${root.title}`,
+    `Status: ${root.status}`,
+    body ? `Spec:\n${body}` : null,
+    relatedRows.length ? `Current Loop tasks:\n${relatedRows.join('\n')}` : null
+  ]
+    .filter((part): part is string => Boolean(part))
+    .join('\n\n')
 }
 
 function ChatHeader({
@@ -423,6 +460,24 @@ export function ChatView({
     }
   })
 
+  const loopTaskDecomposeMutation = useMutation({
+    mutationFn: ({ taskId }: { taskId: string }) => decomposeLoopTask(taskId, activeGatewayProfile),
+    onSuccess: async () => {
+      await queryClient.invalidateQueries({ queryKey: ['loop-session-source', activeGatewayProfile, loopSourceSessionId] })
+      await queryClient.invalidateQueries({ queryKey: ['loop-task-detail', activeGatewayProfile] })
+    }
+  })
+
+  const loopTaskArchiveMutation = useMutation({
+    mutationFn: async ({ taskIds }: { taskIds: string[] }) => {
+      await Promise.all(taskIds.map(taskId => updateLoopTaskStatus(taskId, 'archived', activeGatewayProfile)))
+    },
+    onSuccess: async () => {
+      await queryClient.invalidateQueries({ queryKey: ['loop-session-source', activeGatewayProfile, loopSourceSessionId] })
+      await queryClient.invalidateQueries({ queryKey: ['loop-task-detail', activeGatewayProfile] })
+    }
+  })
+
   useEffect(() => {
     setSelectedLoopTaskId(null)
     setFocusedLoopTaskId(null)
@@ -456,9 +511,31 @@ export function ChatView({
         return
       }
 
+      if (action === 'ask-hermes') {
+        requestComposerInsert(buildLoopTriageDraft(row, loopPanelState), { mode: 'block', target: 'main' })
+
+        return
+      }
+
+      if (action === 'decompose') {
+        loopTaskDecomposeMutation.mutate({ taskId: row.taskId })
+
+        return
+      }
+
+      if (action === 'archive-loop') {
+        const taskIds = archiveableLoopRows(loopPanelState, row).map(task => task.taskId)
+
+        if (taskIds.length) {
+          loopTaskArchiveMutation.mutate({ taskIds })
+        }
+
+        return
+      }
+
       const nextStatusByAction: Partial<Record<LoopTaskAction, string>> = {
+        archive: 'archived',
         block: 'blocked',
-        decompose: 'ready',
         park: 'scheduled',
         start: 'ready',
         unblock: 'ready'
@@ -472,7 +549,7 @@ export function ChatView({
 
       loopTaskStatusMutation.mutate({ status: nextStatus, taskId: row.taskId })
     },
-    [handleSelectLoopTaskId, loopTaskStatusMutation]
+    [handleSelectLoopTaskId, loopPanelState, loopTaskArchiveMutation, loopTaskDecomposeMutation, loopTaskStatusMutation]
   )
 
   // Drop files anywhere in the conversation area, not just on the composer

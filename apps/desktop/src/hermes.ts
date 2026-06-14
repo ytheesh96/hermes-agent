@@ -278,6 +278,25 @@ export function updateLoopTaskStatus(
   })
 }
 
+export interface LoopTaskDecomposeResult {
+  child_ids: string[]
+  fanout: boolean
+  new_title?: string | null
+  ok: boolean
+  reason?: string | null
+  task_id: string
+}
+
+export function decomposeLoopTask(taskId: string, profile?: string | null): Promise<LoopTaskDecomposeResult> {
+  return window.hermesDesktop.api<LoopTaskDecomposeResult>({
+    ...(profile ? { profile } : profileScoped()),
+    path: `/api/plugins/kanban/tasks/${encodeURIComponent(taskId)}/decompose`,
+    method: 'POST',
+    body: {},
+    timeoutMs: 10 * 60_000
+  })
+}
+
 export function renameSession(
   id: string,
   title: string,

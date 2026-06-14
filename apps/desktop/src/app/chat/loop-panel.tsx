@@ -9,17 +9,23 @@ import {
   useState
 } from 'react'
 
+import { StatusItemRow } from '@/app/chat/composer/status-stack/status-row'
 import { CompactMarkdown } from '@/components/chat/compact-markdown'
 import { StatusRow } from '@/components/chat/status-row'
 import { StatusSection } from '@/components/chat/status-section'
 import { Button } from '@/components/ui/button'
 import { Codicon } from '@/components/ui/codicon'
+import { LogView } from '@/components/ui/log-view'
 import { cn } from '@/lib/utils'
+import type { ComposerStatusItem, StatusItemState } from '@/store/composer-status'
 
-import type { CompactLoopTask, LoopPanelState, LoopPanelStatus, LoopRow, LoopTaskDetail, LoopWorkerActivity, TenantLoopTask } from './loop-state'
+import type { CompactLoopTask, LoopPanelState, LoopRow, LoopTaskDetail, LoopWorkerActivity, TenantLoopTask } from './loop-state'
 
 export type LoopTaskAction =
   | 'accept-review'
+  | 'archive'
+  | 'archive-loop'
+  | 'ask-hermes'
   | 'block'
   | 'decompose'
   | 'details'
@@ -37,23 +43,12 @@ const LOOP_PANEL_DEFAULT_WIDTH = 352
 const LOOP_PANEL_MIN_WIDTH = 256
 const LOOP_PANEL_MAX_WIDTH = 560
 const LOOP_PANEL_RESIZE_STEP = 16
+const LOOP_OVERVIEW_TAB_ID = 'loop-overview'
 
 function clampLoopPanelWidth(width: number): number {
   const viewportMax = typeof window === 'undefined' ? LOOP_PANEL_MAX_WIDTH : Math.max(LOOP_PANEL_MIN_WIDTH, Math.min(LOOP_PANEL_MAX_WIDTH, window.innerWidth * 0.58))
 
   return Math.min(viewportMax, Math.max(LOOP_PANEL_MIN_WIDTH, Math.round(width)))
-}
-
-function statusCopy(status: LoopPanelStatus): string {
-  if (status === 'stale') {
-    return 'Stale revision'
-  }
-
-  if (status === 'error') {
-    return 'Error'
-  }
-
-  return 'Live draft'
 }
 
 function statusIndicatorClass(status: string): string {
@@ -79,13 +74,19 @@ function statusIndicatorClass(status: string): string {
 }
 
 function LoopStatusIndicator({ row }: { row: LoopRow }) {
+  const draftStatus = row.status.trim().toLowerCase().replaceAll('-', '_') === 'triage'
+
   return (
     <span
       aria-label={`Status: ${row.status}`}
       className="grid w-3.5 shrink-0 place-items-center overflow-hidden"
       role="img"
     >
-      <span aria-hidden="true" className={cn('rounded-full', statusIndicatorClass(row.status))} />
+      {draftStatus ? (
+        <span aria-hidden="true" className="box-border size-[0.7rem] rounded-full border border-dashed border-(--ui-text-tertiary)" />
+      ) : (
+        <span aria-hidden="true" className={cn('rounded-full', statusIndicatorClass(row.status))} />
+      )}
     </span>
   )
 }
@@ -233,8 +234,38 @@ interface RootOverviewGroups {
   queued: LoopRow[]
 }
 
+function rootDescendantRows(state: LoopPanelState, root: LoopRow): LoopRow[] {
+  const rowsById = new Map(state.rows.map(row => [row.taskId, row]))
+  const seen = new Set<string>()
+
+  const queue = [
+    ...root.children,
+    ...state.rows
+      .filter(row => row.taskId !== root.taskId && row.parents.includes(root.taskId))
+      .map(row => row.taskId)
+  ]
+
+  while (queue.length) {
+    const taskId = queue.shift()!
+
+    if (seen.has(taskId) || taskId === root.taskId) {
+      continue
+    }
+
+    seen.add(taskId)
+
+    const row = rowsById.get(taskId)
+
+    if (row) {
+      queue.push(...row.children)
+    }
+  }
+
+  return state.rows.filter(row => seen.has(row.taskId))
+}
+
 function rootOverviewGroups(state: LoopPanelState, root: LoopRow): RootOverviewGroups {
-  const descendants = state.rows.filter(row => row.taskId !== root.taskId)
+  const descendants = rootDescendantRows(state, root)
   const attention = attentionRows(descendants)
   const attentionIds = new Set(attention.map(row => row.taskId))
 
@@ -244,10 +275,6 @@ function rootOverviewGroups(state: LoopPanelState, root: LoopRow): RootOverviewG
     queued: descendants.filter(row => !attentionIds.has(row.taskId) && isQueuedLoopRow(row)),
     completed: descendants.filter(row => !attentionIds.has(row.taskId) && isDoneLoopRow(row))
   }
-}
-
-function shortEvidence(row: LoopRow): string {
-  return row.latestSummary || row.result || row.latestRun?.summary || row.workerActivity?.summary || row.workerActivity?.summary_preview || ''
 }
 
 function idsFromTask(task: TenantLoopTask, key: 'children' | 'parents'): string[] {
@@ -651,6 +678,59 @@ function LoopTaskActions({
   )
 }
 
+function LoopRootActions({
+  archiveableTaskCount,
+  decomposed,
+  onTaskAction,
+  root
+}: {
+  archiveableTaskCount: number
+  decomposed: boolean
+  onTaskAction?: (action: LoopTaskAction, row: LoopRow) => void
+  root: LoopRow
+}) {
+  const status = normalizedLoopValue(root.status)
+  const canSubmit = !decomposed && !TERMINAL_LOOP_STATUSES.has(status)
+
+  return (
+    <div className="flex flex-wrap gap-1.5" data-testid="loop-root-actions">
+      <Button
+        aria-label={`Submit ${root.taskId}`}
+        className="h-7 gap-1.5 px-2 text-xs"
+        disabled={!onTaskAction || !canSubmit}
+        onClick={() => onTaskAction?.('decompose', root)}
+        type="button"
+        variant="default"
+      >
+        <Codicon name="send" size="0.82rem" />
+        <span>Submit</span>
+      </Button>
+      <Button
+        aria-label={`Archive Loop tasks for ${root.taskId}`}
+        className="h-7 gap-1.5 px-2 text-xs"
+        disabled={!onTaskAction || archiveableTaskCount === 0}
+        onClick={() => onTaskAction?.('archive-loop', root)}
+        type="button"
+        variant="outline"
+      >
+        <Codicon name="archive" size="0.82rem" />
+        <span>Archive</span>
+      </Button>
+      <Button
+        aria-label={`Ask Hermes about ${root.taskId}`}
+        className="h-7 gap-1.5 px-2 text-xs"
+        disabled={!onTaskAction}
+        onClick={() => onTaskAction?.('ask-hermes', root)}
+        type="button"
+        variant="outline"
+      >
+        <Codicon name="comment-discussion" size="0.82rem" />
+        <span>Ask Hermes</span>
+      </Button>
+    </div>
+  )
+}
+
 function descriptionHasMarkdown(text: string): boolean {
   return /(^|\n)\s{0,3}(#{1,6}\s|[-*+]\s|\d+\.\s|```|>\s|\[[^\]]+\]\([^)]+\)|- \[[ xX]\])/m.test(text) || /`[^`]+`/.test(text)
 }
@@ -666,6 +746,35 @@ function TaskDescription({ text }: { text: string }) {
     <CompactMarkdown text={cleanedText} />
   ) : (
     <p className="m-0 whitespace-pre-wrap text-(--ui-text-secondary)">{cleanedText}</p>
+  )
+}
+
+function rootSpecPreview(text?: null | string): string {
+  const firstLine = cleanTaskMarkdown(text || '')
+    .split('\n')
+    .map(line => line.trim())
+    .find(Boolean)
+
+  if (!firstLine) {
+    return 'No description provided.'
+  }
+
+  return firstLine.length > 96 ? `${firstLine.slice(0, 93)}...` : firstLine
+}
+
+function LoopRootSpec({ decomposed, root }: { decomposed: boolean; root: LoopRow }) {
+  return (
+    <DetailSection title="Loop spec">
+      <details className="group/spec" data-testid="loop-root-spec" open={!decomposed}>
+        <summary className="flex cursor-pointer list-none items-center gap-1.5 text-xs text-(--ui-text-secondary) [&::-webkit-details-marker]:hidden">
+          <Codicon className="shrink-0 transition-transform group-open/spec:rotate-90" name="chevron-right" size="0.8rem" />
+          <span className="min-w-0 flex-1 truncate">{rootSpecPreview(root.body)}</span>
+        </summary>
+        <div className="mt-2 border-t border-(--ui-stroke-tertiary) pt-2">
+          <TaskDescription text={root.body || ''} />
+        </div>
+      </details>
+    </DetailSection>
   )
 }
 
@@ -835,9 +944,7 @@ function WorkerActivityDetails({
       </div>
 
       {worker.log_tail ? (
-        <pre className="m-0 max-h-32 overflow-auto rounded border border-(--ui-stroke-tertiary) bg-(--ui-fill-quaternary) p-2 text-[0.65rem] whitespace-pre-wrap text-(--ui-text-secondary)">
-          {worker.log_tail}
-        </pre>
+        <LogView className="max-h-32">{worker.log_tail}</LogView>
       ) : worker.log_tail_available ? (
         <EmptyDetail>Worker log exists; open logs to inspect it.</EmptyDetail>
       ) : null}
@@ -856,30 +963,115 @@ function WorkerActivityDetails({
   )
 }
 
+const loopTextValue = (value: unknown): string | undefined => (typeof value === 'string' && value.trim() ? value.trim() : undefined)
 
-function RootOverviewGroup({ emptyCopy, label, onSelectTaskId, rows }: { emptyCopy: string; label: string; onSelectTaskId?: (taskId: string) => void; rows: LoopRow[] }) {
+const loopToolLabel = (name: string): string =>
+  name
+    .split('_')
+    .filter(Boolean)
+    .map(part => part[0]!.toUpperCase() + part.slice(1))
+    .join(' ') || name
+
+const loopRecordFrom = (value: unknown): Record<string, unknown> | null =>
+  value && typeof value === 'object' && !Array.isArray(value) ? (value as Record<string, unknown>) : null
+
+function currentToolFromLoopRecord(record: Record<string, unknown> | null): string | undefined {
+  if (!record) {
+    return undefined
+  }
+
+  for (const key of ['current_tool', 'currentTool', 'current_tool_name', 'tool_name', 'active_tool', 'last_tool']) {
+    const value = loopTextValue(record[key])
+
+    if (value) {
+      return loopToolLabel(value)
+    }
+  }
+
+  return undefined
+}
+
+function loopWorkerCurrentTool(row: LoopRow): string | undefined {
+  const worker = row.workerActivity
+  const direct = currentToolFromLoopRecord(worker ? (worker as unknown as Record<string, unknown>) : null)
+
+  if (direct) {
+    return direct
+  }
+
+  for (const event of (worker?.recent_task_events || []).slice().reverse()) {
+    const fromPayload = currentToolFromLoopRecord(loopRecordFrom(event.payload))
+
+    if (fromPayload) {
+      return fromPayload
+    }
+  }
+
+  return currentToolFromLoopRecord(loopRecordFrom(row.latestRun?.metadata))
+}
+
+function loopAgentActivityLabel(row: LoopRow): string | undefined {
+  const profile = loopTextValue(row.workerActivity?.profile) || loopTextValue(row.latestRun?.profile) || loopTextValue(row.assignee)
+  const currentTool = loopWorkerCurrentTool(row)
+
+  return [profile, currentTool].filter(Boolean).join(' · ') || profile || currentTool
+}
+
+function loopOverviewItemState(row: LoopRow): StatusItemState {
+  const status = normalizedLoopValue(row.status)
+  const runStatus = normalizedLoopValue(row.latestRun?.status)
+  const runOutcome = normalizedLoopValue(row.latestRun?.outcome)
+
+  if (attentionScore(row) > 0 || FAILED_LOOP_STATUSES.has(status) || FAILED_LOOP_STATUSES.has(runStatus) || FAILED_LOOP_STATUSES.has(runOutcome)) {
+    return 'failed'
+  }
+
+  if (isActiveLoopRow(row) || row.active) {
+    return 'running'
+  }
+
+  return 'done'
+}
+
+function loopOverviewStatusItem(row: LoopRow): ComposerStatusItem {
+  const queued = isQueuedLoopRow(row)
+
+  return {
+    currentTool: queued ? 'Loop' : loopAgentActivityLabel(row),
+    id: `kanban-agent:${row.taskId}:${row.workerActivity?.run_id ?? row.latestRun?.id ?? 'overview'}`,
+    kanbanTaskId: row.taskId,
+    runId: row.workerActivity?.run_id ?? row.latestRun?.id,
+    sessionId: row.workerActivity?.worker_session_id || row.latestRun?.worker_session_id || undefined,
+    state: queued ? 'running' : loopOverviewItemState(row),
+    title: row.title,
+    todoStatus: queued ? 'pending' : undefined,
+    type: queued ? 'todo' : 'kanban-agent'
+  }
+}
+
+function RootOverviewGroup({
+  emptyCopy,
+  label,
+  onOpenTaskTab,
+  rows
+}: {
+  emptyCopy: string
+  label: string
+  onOpenTaskTab?: (row: LoopRow) => void
+  rows: LoopRow[]
+}) {
   return (
     <DetailSection title={label}>
       {rows.length === 0 ? (
         <EmptyDetail>{emptyCopy}</EmptyDetail>
       ) : (
-        <div className="grid gap-1">
+        <div className="flex flex-col gap-0.5">
           {rows.map(row => (
-            <Button
-              aria-label={`Focus child task ${row.taskId}`}
-              className="h-auto justify-start px-2 py-1 text-left text-xs"
-              disabled={!onSelectTaskId}
+            <StatusItemRow
+              item={loopOverviewStatusItem(row)}
               key={row.taskId}
-              onClick={() => onSelectTaskId?.(row.taskId)}
-              type="button"
-              variant="ghost"
-            >
-              <span className="grid min-w-0 flex-1 gap-0.5">
-                <span className="truncate text-(--ui-text-primary)">{row.title}</span>
-                <span className="truncate text-[0.62rem] text-(--ui-text-tertiary)">{row.status} · {row.taskId}</span>
-                {shortEvidence(row) && <span className="truncate text-[0.62rem] text-(--ui-text-tertiary)">{shortEvidence(row)}</span>}
-              </span>
-            </Button>
+              onOpen={onOpenTaskTab ? () => onOpenTaskTab(row) : undefined}
+            />
           ))}
         </div>
       )}
@@ -887,44 +1079,58 @@ function RootOverviewGroup({ emptyCopy, label, onSelectTaskId, rows }: { emptyCo
   )
 }
 
-function LoopRootOverview({ onRefresh, onSelectTaskId, onTaskAction, root, state }: { onRefresh?: () => void; onSelectTaskId?: (taskId: string) => void; onTaskAction?: (action: LoopTaskAction, row: LoopRow) => void; root: LoopRow; state: LoopPanelState }) {
+function LoopRootOverview({
+  onOpenTaskTab,
+  onTaskAction,
+  root,
+  state
+}: {
+  onOpenTaskTab?: (row: LoopRow) => void
+  onTaskAction?: (action: LoopTaskAction, row: LoopRow) => void
+  root: LoopRow
+  state: LoopPanelState
+}) {
   const groups = rootOverviewGroups(state, root)
-
-  const summaryItems = [
-    `${groups.active.length} active`,
-    `${groups.attention.length} needs attention`,
-    `${groups.queued.length} queued`,
-    `${groups.completed.length} completed`
-  ]
+  const groupedCount = groups.active.length + groups.attention.length + groups.queued.length + groups.completed.length
+  const childCount = Math.max(root.childCount, root.children.length, groupedCount)
+  const decomposed = childCount > 0
+  const archiveableTaskCount = state.rows.filter(row => normalizedLoopValue(row.status) !== 'archived').length
 
   return (
     <div className="grid gap-3">
-      <DetailSection title="Root overview">
+      <section className="rounded-lg border border-(--ui-stroke-tertiary) bg-(--ui-surface-background) p-3 text-xs">
         <div className="grid gap-2">
           <div className="flex items-center gap-2 font-medium text-(--ui-text-primary)">
             <LoopStatusIndicator row={root} />
             <h3 className="m-0 min-w-0 truncate text-sm font-semibold text-(--ui-text-primary)">{root.title}</h3>
           </div>
           <div className="font-mono text-(--ui-text-tertiary)">{root.taskId}</div>
-          <div className="flex flex-wrap gap-1.5">
-            {summaryItems.map(item => <span className="rounded bg-(--ui-fill-quaternary) px-1.5 py-0.5 text-[0.64rem] text-(--ui-text-tertiary)" key={item}>{item}</span>)}
-          </div>
-          {root.latestSummary && <p className="m-0 whitespace-pre-wrap text-[0.72rem] leading-relaxed text-(--ui-text-secondary)">{root.latestSummary}</p>}
         </div>
+      </section>
+
+      <DetailSection title="Quick actions">
+        <LoopRootActions
+          archiveableTaskCount={archiveableTaskCount}
+          decomposed={decomposed}
+          onTaskAction={onTaskAction}
+          root={root}
+        />
       </DetailSection>
 
-      <RootOverviewGroup emptyCopy="No active children." label="Active/running children" onSelectTaskId={onSelectTaskId} rows={groups.active} />
-      <RootOverviewGroup emptyCopy="No children need foreground attention." label="Needs attention" onSelectTaskId={onSelectTaskId} rows={groups.attention} />
-      <RootOverviewGroup emptyCopy="No queued or pending children." label="Queued/pending" onSelectTaskId={onSelectTaskId} rows={groups.queued} />
-      <RootOverviewGroup emptyCopy="No completed child evidence yet." label="Completed/audit" onSelectTaskId={onSelectTaskId} rows={groups.completed} />
+      <LoopRootSpec decomposed={decomposed} root={root} />
 
-      <DetailSection title="Audit trail">
-        <EmptyDetail>Queued, completed, and attention children stay inspectable here even when they are not composer rows.</EmptyDetail>
-      </DetailSection>
-
-      <DetailSection title="Safe actions">
-        <LoopTaskActions onRefresh={onRefresh} onTaskAction={onTaskAction} row={root} />
-      </DetailSection>
+      {decomposed ? (
+        <div className="grid gap-2" data-testid="loop-root-execution-overview">
+          <h3 className="m-0 text-xs font-semibold uppercase tracking-wide text-(--ui-text-tertiary)">Execution overview</h3>
+          <RootOverviewGroup emptyCopy="No active children." label="Active/running children" onOpenTaskTab={onOpenTaskTab} rows={groups.active} />
+          <RootOverviewGroup emptyCopy="No children need foreground attention." label="Needs attention" onOpenTaskTab={onOpenTaskTab} rows={groups.attention} />
+          <RootOverviewGroup emptyCopy="No queued or pending children." label="Queued/pending" onOpenTaskTab={onOpenTaskTab} rows={groups.queued} />
+          <RootOverviewGroup emptyCopy="No completed child evidence yet." label="Completed/audit" onOpenTaskTab={onOpenTaskTab} rows={groups.completed} />
+          <DetailSection title="Audit trail">
+            <EmptyDetail>Queued, completed, and attention children stay inspectable here even when they are not composer rows.</EmptyDetail>
+          </DetailSection>
+        </div>
+      ) : null}
     </div>
   )
 }
@@ -1041,6 +1247,117 @@ function LoopTaskDetails({
   )
 }
 
+interface LoopPanelTaskTab {
+  taskId: string
+  title: string
+}
+
+interface LoopPanelTabBarProps {
+  activeTaskTabId: null | string
+  baseLabel: string
+  onClosePane?: () => void
+  onCloseTaskTab: (taskId: string) => void
+  onSelectBaseTab: () => void
+  onSelectTaskTab: (taskId: string) => void
+  taskTabs: LoopPanelTaskTab[]
+}
+
+function LoopPanelTabBar({
+  activeTaskTabId,
+  baseLabel,
+  onClosePane,
+  onCloseTaskTab,
+  onSelectBaseTab,
+  onSelectTaskTab,
+  taskTabs
+}: LoopPanelTabBarProps) {
+  const tabs = [
+    { id: LOOP_OVERVIEW_TAB_ID, label: baseLabel, taskId: null },
+    ...taskTabs.map(tab => ({ id: `loop-task:${tab.taskId}`, label: tab.title, taskId: tab.taskId }))
+  ]
+
+  return (
+    <div className="group/loop-tabs flex h-(--titlebar-height) shrink-0 border-b border-(--ui-stroke-tertiary) bg-(--ui-sidebar-surface-background)">
+      <div
+        className="flex min-w-0 flex-1 overflow-x-auto overflow-y-hidden overscroll-x-contain [-ms-overflow-style:none] [scrollbar-width:none] [&::-webkit-scrollbar]:hidden"
+        role="tablist"
+      >
+        {tabs.map(tab => {
+          const active = tab.taskId ? tab.taskId === activeTaskTabId : !activeTaskTabId
+          const selectTab = tab.taskId ? () => onSelectTaskTab(tab.taskId!) : onSelectBaseTab
+
+          return (
+            <div
+              className={cn(
+                'group/tab relative flex h-full min-w-0 max-w-48 shrink-0 items-center text-[0.6875rem] font-medium [-webkit-app-region:no-drag] last:border-r last:border-(--ui-stroke-quaternary)',
+                active
+                  ? 'bg-(--ui-editor-surface-background) text-foreground [--tab-bg:var(--ui-editor-surface-background)]'
+                  : 'border-r border-(--ui-stroke-quaternary) text-(--ui-text-tertiary) [--tab-bg:var(--ui-sidebar-surface-background)] hover:bg-(--chrome-action-hover) hover:text-foreground'
+              )}
+              data-testid={tab.taskId ? `loop-task-tab-${tab.taskId}` : 'loop-overview-tab'}
+              key={tab.id}
+              onAuxClick={event => {
+                if (!tab.taskId || event.button !== 1) {
+                  return
+                }
+
+                event.preventDefault()
+                onCloseTaskTab(tab.taskId)
+              }}
+              onMouseDown={event => {
+                if (tab.taskId && event.button === 1) {
+                  event.preventDefault()
+                }
+              }}
+            >
+              {active && <span aria-hidden="true" className="absolute inset-x-0 top-0 h-px bg-(--ui-stroke-primary)" />}
+              <button
+                aria-selected={active}
+                className="flex h-full min-w-0 max-w-full items-center overflow-hidden pl-3 pr-2 text-left outline-none"
+                onClick={selectTab}
+                role="tab"
+                title={tab.label}
+                type="button"
+              >
+                <span className="block min-w-0 truncate">{tab.label}</span>
+              </button>
+              {tab.taskId && (
+                <>
+                  <span
+                    aria-hidden="true"
+                    className="pointer-events-none absolute inset-y-0 right-0 w-9 bg-[linear-gradient(to_right,transparent,var(--tab-bg)_55%)] opacity-0 transition-opacity group-hover/tab:opacity-100 group-focus-within/tab:opacity-100"
+                  />
+                  <button
+                    aria-label={`Close ${tab.label}`}
+                    className="pointer-events-none absolute right-1.5 top-1/2 grid size-4 -translate-y-1/2 place-items-center rounded-sm text-(--ui-text-tertiary) opacity-0 transition-[background-color,color,opacity] hover:bg-(--ui-bg-secondary) hover:text-foreground focus-visible:pointer-events-auto focus-visible:opacity-100 group-hover/tab:pointer-events-auto group-hover/tab:opacity-100 group-focus-within/tab:pointer-events-auto group-focus-within/tab:opacity-100"
+                    onClick={event => {
+                      event.stopPropagation()
+                      onCloseTaskTab(tab.taskId)
+                    }}
+                    type="button"
+                  >
+                    <Codicon name="close" size="0.75rem" />
+                  </button>
+                </>
+              )}
+            </div>
+          )
+        })}
+      </div>
+      {onClosePane && (
+        <button
+          aria-label="Hide Loop panel"
+          className="mr-1.5 grid size-6 shrink-0 self-center place-items-center rounded-md text-(--ui-text-tertiary) opacity-0 transition-opacity hover:bg-(--ui-control-hover-background) hover:text-foreground focus-visible:opacity-100 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-sidebar-ring group-hover/loop-tabs:opacity-100 [-webkit-app-region:no-drag]"
+          onClick={onClosePane}
+          type="button"
+        >
+          <Codicon name="close" size="0.75rem" />
+        </button>
+      )}
+    </div>
+  )
+}
+
 export function LoopPanel({
   enableDebugJson = false,
   hidden = false,
@@ -1057,8 +1374,16 @@ export function LoopPanel({
   const [debugOpen, setDebugOpen] = useState(false)
   const [navigationStack, setNavigationStack] = useState<LoopRow[]>([])
   const [focusedTaskId, setFocusedTaskId] = useState<null | string>(selectedTaskId || null)
+  const [taskTabs, setTaskTabs] = useState<LoopPanelTaskTab[]>([])
+  const [activeTaskTabId, setActiveTaskTabId] = useState<null | string>(null)
   const internalFocusTaskIdRef = useRef<null | string>(null)
   const [panelWidth, setPanelWidth] = useState(LOOP_PANEL_DEFAULT_WIDTH)
+  const stateRootTaskId = state?.rootTaskId || ''
+
+  useEffect(() => {
+    setTaskTabs([])
+    setActiveTaskTabId(null)
+  }, [stateRootTaskId])
 
   useEffect(() => {
     const nextSelectedTaskId = selectedTaskId || null
@@ -1071,6 +1396,7 @@ export function LoopPanel({
 
     setFocusedTaskId(nextSelectedTaskId)
     setNavigationStack([])
+    setActiveTaskTabId(null)
   }, [selectedTaskId])
 
   const selected = useMemo(
@@ -1078,21 +1404,27 @@ export function LoopPanel({
     [focusedTaskId, selectedTaskDetail, state]
   )
 
+  const activeTaskTabRow = useMemo(
+    () => activeTaskTabId ? selectedRowFrom(state, activeTaskTabId, selectedTaskDetail) : null,
+    [activeTaskTabId, selectedTaskDetail, state]
+  )
+
   const rootRow = useMemo(() => rootLoopRow(state?.rows || []), [state])
-  const rootOverviewEligible = Boolean(rootRow && (rootRow.children.length > 0 || rootRow.childCount > 0))
+  const rootOverviewEligible = Boolean(rootRow && (rootRow.children.length > 0 || rootRow.childCount > 0 || normalizedLoopValue(rootRow.status) === 'triage'))
   const showingRootOverview = Boolean(rootOverviewEligible && rootRow && (!focusedTaskId || focusedTaskId === rootRow.taskId))
+  const renderedTaskId = activeTaskTabId || focusedTaskId
 
   const rowById = useMemo(() => {
     const rows = state?.rows || []
     const map = new Map(rows.map(row => [row.taskId, row]))
-    const detailRow = detailRowFromTaskDetail(selectedTaskDetail, focusedTaskId)
+    const detailRow = detailRowFromTaskDetail(selectedTaskDetail, renderedTaskId)
 
     if (detailRow) {
       map.set(detailRow.taskId, detailRow)
     }
 
     return map
-  }, [focusedTaskId, selectedTaskDetail, state])
+  }, [renderedTaskId, selectedTaskDetail, state])
 
   const focusDrawerTask = useCallback((taskId: string) => {
     setFocusedTaskId(taskId)
@@ -1113,6 +1445,71 @@ export function LoopPanel({
     focusDrawerTask(taskId)
   }, [focusDrawerTask, selected])
 
+  const openTaskTab = useCallback((row: LoopRow) => {
+    setTaskTabs(tabs => {
+      const existingIndex = tabs.findIndex(tab => tab.taskId === row.taskId)
+
+      if (existingIndex >= 0) {
+        return tabs.map(tab => tab.taskId === row.taskId ? { ...tab, title: row.title || row.taskId } : tab)
+      }
+
+      return [...tabs, { taskId: row.taskId, title: row.title || row.taskId }]
+    })
+    setActiveTaskTabId(row.taskId)
+    setNavigationStack([])
+    focusDrawerTask(row.taskId)
+  }, [focusDrawerTask])
+
+  const selectTaskTab = useCallback((taskId: string) => {
+    setActiveTaskTabId(taskId)
+    setNavigationStack([])
+    focusDrawerTask(taskId)
+  }, [focusDrawerTask])
+
+  const selectBaseTab = useCallback(() => {
+    setActiveTaskTabId(null)
+    setNavigationStack([])
+
+    if (rootRow) {
+      focusDrawerTask(rootRow.taskId)
+    } else {
+      setFocusedTaskId(null)
+    }
+  }, [focusDrawerTask, rootRow])
+
+  const closeTaskTab = useCallback((taskId: string) => {
+    const index = taskTabs.findIndex(tab => tab.taskId === taskId)
+
+    if (index < 0) {
+      return
+    }
+
+    const nextTabs = taskTabs.filter(tab => tab.taskId !== taskId)
+    setTaskTabs(nextTabs)
+
+    if (taskId !== activeTaskTabId) {
+      return
+    }
+
+    const nextTab = nextTabs[index] || nextTabs[index - 1] || null
+    setNavigationStack([])
+
+    if (nextTab) {
+      setActiveTaskTabId(nextTab.taskId)
+      focusDrawerTask(nextTab.taskId)
+
+      return
+    }
+
+    setActiveTaskTabId(null)
+
+    if (rootRow) {
+      focusDrawerTask(rootRow.taskId)
+    } else {
+      setFocusedTaskId(null)
+    }
+  }, [activeTaskTabId, focusDrawerTask, rootRow, taskTabs])
+
   const goBack = useCallback(() => {
     const previous = navigationStack.at(-1)
 
@@ -1130,6 +1527,8 @@ export function LoopPanel({
     backTarget?.taskId === rootRow?.taskId ? 'root overview' : backTarget?.title || (rootRow && focusedTaskId !== rootRow.taskId ? 'root overview' : null)
 
   const detailBack = detailBackLabel ? goBack : undefined
+  const baseTabLabel = activeTaskTabId && rootOverviewEligible ? 'Loop overview' : showingRootOverview ? 'Loop overview' : selected?.title || rootRow?.title || 'Loop'
+  const missingTaskId = activeTaskTabId || focusedTaskId
 
   const startResize = useCallback((event: ReactPointerEvent<HTMLDivElement>) => {
     if (event.button !== 0) {
@@ -1203,28 +1602,16 @@ export function LoopPanel({
       </div>
 
       <div className="relative flex h-full min-h-0 min-w-0 flex-col overflow-hidden bg-(--ui-editor-surface-background) pt-(--titlebar-height)">
+        <LoopPanelTabBar
+          activeTaskTabId={activeTaskTabId}
+          baseLabel={baseTabLabel}
+          onClosePane={onHide}
+          onCloseTaskTab={closeTaskTab}
+          onSelectBaseTab={selectBaseTab}
+          onSelectTaskTab={selectTaskTab}
+          taskTabs={taskTabs}
+        />
         <div className="flex min-h-0 min-w-0 flex-1 flex-col p-3">
-          <div className="mb-3 flex items-start justify-between gap-3">
-            <div className="min-w-0">
-              <h2 className="m-0 text-sm font-semibold text-(--ui-text-primary)">Loop</h2>
-              <p className="m-0 mt-0.5 text-xs text-(--ui-text-tertiary)">
-                {statusCopy(state.status)} · rev {state.revision || '—'}
-              </p>
-            </div>
-            <div className="flex shrink-0 items-center gap-1">
-              {state.rootTaskId && (
-                <span className="rounded bg-(--ui-fill-quaternary) px-1.5 py-0.5 font-mono text-[0.65rem] text-(--ui-text-tertiary)">
-                  {state.rootTaskId}
-                </span>
-              )}
-              {onHide && (
-                <Button aria-label="Hide Loop panel" className="size-7 p-0" onClick={onHide} type="button" variant="ghost">
-                  <Codicon name="close" size="0.875rem" />
-                </Button>
-              )}
-            </div>
-          </div>
-
           {state.message && (
             <div
               className={cn(
@@ -1239,12 +1626,34 @@ export function LoopPanel({
           )}
 
           <div className="min-h-0 flex-1 overflow-auto">
-            {showingRootOverview && rootRow ? (
+            {activeTaskTabId ? (
+              activeTaskTabRow ? (
+                <div className="grid gap-3">
+                  <h3 className="m-0 text-xs font-semibold uppercase tracking-wide text-(--ui-text-tertiary)">Loop details</h3>
+                  <LoopTaskDetails
+                    backLabel={null}
+                    detail={selectedTaskDetail}
+                    onRefresh={onRefresh}
+                    onSelectTaskId={selectRelatedTask}
+                    onTaskAction={onTaskAction}
+                    row={activeTaskTabRow}
+                    rowById={rowById}
+                  />
+                </div>
+              ) : (
+                <section className="rounded-lg border border-amber-500/30 bg-amber-500/10 p-3 text-xs text-amber-700 dark:text-amber-300">
+                  <h3 className="m-0 mb-2 text-xs font-semibold uppercase tracking-wide">Selected task unavailable</h3>
+                  <p className="m-0">
+                    Task <span className="font-mono">{activeTaskTabId}</span> is missing from the latest Loop source. It may have been archived,
+                    deleted, or refreshed out of this session lineage. Select another tab or close the panel.
+                  </p>
+                </section>
+              )
+            ) : showingRootOverview && rootRow ? (
               <div className="grid gap-3">
-                <h3 className="m-0 text-xs font-semibold uppercase tracking-wide text-(--ui-text-tertiary)">Loop/Kanban overview</h3>
+                <h3 className="m-0 text-xs font-semibold uppercase tracking-wide text-(--ui-text-tertiary)">Loop overview</h3>
                 <LoopRootOverview
-                  onRefresh={onRefresh}
-                  onSelectTaskId={selectRelatedTask}
+                  onOpenTaskTab={openTaskTab}
                   onTaskAction={onTaskAction}
                   root={rootRow}
                   state={state}
@@ -1264,11 +1673,11 @@ export function LoopPanel({
                   rowById={rowById}
                 />
               </div>
-            ) : focusedTaskId ? (
+            ) : missingTaskId ? (
               <section className="rounded-lg border border-amber-500/30 bg-amber-500/10 p-3 text-xs text-amber-700 dark:text-amber-300">
                 <h3 className="m-0 mb-2 text-xs font-semibold uppercase tracking-wide">Selected task unavailable</h3>
                 <p className="m-0">
-                  Task <span className="font-mono">{focusedTaskId}</span> is missing from the latest Loop source. It may have been archived,
+                  Task <span className="font-mono">{missingTaskId}</span> is missing from the latest Loop source. It may have been archived,
                   deleted, or refreshed out of this session lineage. Select another row or close the panel.
                 </p>
               </section>

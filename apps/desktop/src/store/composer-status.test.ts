@@ -126,6 +126,7 @@ describe('reconcileKanbanSessionSource', () => {
           task_id: 't_running',
           task_title: 'Running child',
           profile: 'peacock',
+          current_tool: 'terminal',
           status: 'running',
           task_status: 'running',
           worker_session_id: 'worker-session-7',
@@ -138,7 +139,8 @@ describe('reconcileKanbanSessionSource', () => {
           profile: 'reviewer-qa',
           status: 'done',
           task_status: 'blocked',
-          summary: 'review-required: needs eyes'
+          summary: 'review-required: needs eyes',
+          recent_task_events: [{ kind: 'heartbeat', payload: { tool_name: 'apply_patch' } }]
         },
         {
           run_id: 9,
@@ -156,12 +158,12 @@ describe('reconcileKanbanSessionSource', () => {
     const groups = groupStatusItems(items)
 
     expect(groups.map(group => group.type)).toEqual(['todo', 'kanban-agent'])
-    expect(groups[0]!.items.map(item => [item.id, item.kanbanTaskId, item.todoStatus])).toEqual([
-      ['kanban-task:t_root', 't_root', 'in_progress']
+    expect(groups[0]!.items.map(item => [item.id, item.kanbanTaskId, item.todoStatus, item.currentTool])).toEqual([
+      ['kanban-task:t_root', 't_root', 'in_progress', 'Loop']
     ])
-    expect(groups[1]!.items.map(item => [item.id, item.state, item.sessionId, item.output])).toEqual([
-      ['kanban-agent:t_running:7', 'running', 'worker-session-7', 'worker log tail'],
-      ['kanban-agent:t_review:8', 'failed', undefined, 'review-required: needs eyes']
+    expect(groups[1]!.items.map(item => [item.id, item.state, item.sessionId, item.output, item.currentTool])).toEqual([
+      ['kanban-agent:t_running:7', 'running', 'worker-session-7', 'worker log tail', 'peacock · Terminal'],
+      ['kanban-agent:t_review:8', 'failed', undefined, 'review-required: needs eyes', 'reviewer-qa · Apply Patch']
     ])
     expect(items.map(item => item.kanbanTaskId)).not.toContain('t_queued')
     expect(items.map(item => item.kanbanTaskId)).not.toContain('t_done')
@@ -185,8 +187,8 @@ describe('reconcileKanbanSessionSource', () => {
 
     const bySession = $kanbanStatusBySession.get()
     expect(bySession['compression-root']).toBeUndefined()
-    expect(bySession['runtime-tip']?.map(item => [item.id, item.kanbanTaskId, item.todoStatus])).toEqual([
-      ['kanban-task:t_root', 't_root', 'completed']
+    expect(bySession['runtime-tip']?.map(item => [item.id, item.kanbanTaskId, item.todoStatus, item.currentTool])).toEqual([
+      ['kanban-task:t_root', 't_root', 'completed', 'Loop']
     ])
   })
 })

@@ -24,7 +24,11 @@ export interface LoopTaskEvent {
 }
 
 export interface LoopWorkerActivity {
+  active_tool?: null | string
   claim_expires?: null | number
+  current_tool?: null | string
+  current_tool_name?: null | string
+  currentTool?: null | string
   ended_at?: null | number
   error?: null | string
   error_preview?: null | string
@@ -47,6 +51,7 @@ export interface LoopWorkerActivity {
   task_id: string
   task_status?: null | string
   task_title?: null | string
+  tool_name?: null | string
   worker_pid?: null | number
   worker_session_id?: null | string
 }

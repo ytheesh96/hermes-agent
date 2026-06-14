@@ -14,7 +14,7 @@ export type StatusItemType = 'background' | 'kanban-agent' | 'subagent' | 'todo'
 export interface ComposerStatusItem {
   /** background: non-zero exit shown inline when failed. */
   exitCode?: number
-  /** subagent: active tool label shown on the right. */
+  /** subagent/Loop task: secondary status label shown on the right. */
   currentTool?: string
   id: string
   /** background process: captured stdout/stderr tail for the inline viewer. */
@@ -71,6 +71,14 @@ const DONE_KANBAN_TASK_STATUSES = new Set(['archived', 'cancelled', 'complete', 
 const FAILED_KANBAN_RUN_STATES = new Set(['crashed', 'error', 'failed', 'gave_up', 'interrupted', 'spawn_failed', 'timed_out', 'timeout'])
 
 const normalized = (value: unknown): string => (typeof value === 'string' && value.trim() ? value.trim().toLowerCase().replaceAll('-', '_') : '')
+const textValue = (value: unknown): string | undefined => (typeof value === 'string' && value.trim() ? value.trim() : undefined)
+
+const humanToolLabel = (name: string): string =>
+  name
+    .split('_')
+    .filter(Boolean)
+    .map(part => part[0]!.toUpperCase() + part.slice(1))
+    .join(' ') || name
 
 const taskParentIds = (task: TenantLoopTask): string[] => task.included_parent_ids || task.links?.parents || []
 
@@ -94,6 +102,7 @@ const kanbanTaskToItem = (task: TenantLoopTask): ComposerStatusItem => {
   const todoStatus = kanbanTaskTodoStatus(task)
 
   return {
+    currentTool: 'Loop',
     id: `kanban-task:${task.id}`,
     kanbanTaskId: task.id,
     state: todoStatus === 'completed' ? 'done' : 'running',
@@ -147,8 +156,52 @@ const kanbanWorkerState = (worker: LoopWorkerActivity): StatusItemState => {
   return 'done'
 }
 
+const recordFrom = (value: unknown): Record<string, unknown> | null =>
+  value && typeof value === 'object' && !Array.isArray(value) ? (value as Record<string, unknown>) : null
+
+const currentToolFromRecord = (record: Record<string, unknown> | null): string | undefined => {
+  if (!record) {
+    return undefined
+  }
+
+  for (const key of ['current_tool', 'currentTool', 'current_tool_name', 'tool_name', 'active_tool', 'last_tool']) {
+    const value = textValue(record[key])
+
+    if (value) {
+      return humanToolLabel(value)
+    }
+  }
+
+  return undefined
+}
+
+const kanbanWorkerCurrentTool = (worker: LoopWorkerActivity): string | undefined => {
+  const direct = currentToolFromRecord(worker as unknown as Record<string, unknown>)
+
+  if (direct) {
+    return direct
+  }
+
+  for (const event of (worker.recent_task_events || []).slice().reverse()) {
+    const fromPayload = currentToolFromRecord(recordFrom(event.payload))
+
+    if (fromPayload) {
+      return fromPayload
+    }
+  }
+
+  return undefined
+}
+
+const kanbanWorkerActivityLabel = (worker: LoopWorkerActivity): string | undefined => {
+  const profile = textValue(worker.profile)
+  const currentTool = kanbanWorkerCurrentTool(worker)
+
+  return [profile, currentTool].filter(Boolean).join(' · ') || profile || currentTool || textValue(worker.status) || textValue(worker.outcome)
+}
+
 const kanbanWorkerToItem = (worker: LoopWorkerActivity): ComposerStatusItem => ({
-  currentTool: [worker.profile, worker.status || worker.outcome].filter(Boolean).join(' · ') || undefined,
+  currentTool: kanbanWorkerActivityLabel(worker),
   id: `kanban-agent:${worker.task_id}:${worker.run_id}`,
   kanbanTaskId: worker.task_id,
   output: worker.log_tail || worker.summary || worker.summary_preview || worker.error || worker.error_preview || undefined,
