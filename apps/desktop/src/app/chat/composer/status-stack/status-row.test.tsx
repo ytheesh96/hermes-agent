@@ -8,15 +8,15 @@ import { StatusItemRow } from './status-row'
 afterEach(() => cleanup())
 
 describe('StatusItemRow worker visuals', () => {
-  it('badges Loop workers distinctly from delegate subagents', () => {
+  it('badges Kanban agents distinctly from delegate subagents', () => {
     const { rerender } = render(
       <I18nProvider configClient={null}>
         <StatusItemRow
           item={{
-            id: 'worker:t_loop:7',
+            id: 'kanban-agent:t_loop:7',
             state: 'running',
             title: 'Implement Loop worker parity',
-            type: 'loop-worker'
+            type: 'kanban-agent'
           }}
         />
       </I18nProvider>

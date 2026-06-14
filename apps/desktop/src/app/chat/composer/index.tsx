@@ -168,6 +168,7 @@ export function ChatBar({
   statusStackLead,
   state,
   onCancel,
+  onOpenKanbanTask,
   onAddUrl,
   onAttachDroppedItems,
   onAttachImageBlob,
@@ -1862,6 +1863,7 @@ export function ChatBar({
               accounts for it. Collapses to nothing when every status is empty. */}
           <ComposerStatusStack
             lead={statusStackLead}
+            onOpenKanbanTask={onOpenKanbanTask}
             queue={
               activeQueueSessionKey && queuedPrompts.length > 0 ? (
                 <QueuePanel

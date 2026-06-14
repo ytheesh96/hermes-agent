@@ -466,6 +466,61 @@ describe('LoopPanel', () => {
     expect(onRefresh).toHaveBeenCalledTimes(1)
   })
 
+  it('renders worker activity links, run details, and log tails in the task drawer', () => {
+    const state = deriveLoopPanelStateFromTenantSource({
+      session_id: 'sess-workers',
+      tenant: 'tenant-a',
+      latest_event_id: 303,
+      now: 1_000,
+      tasks: [
+        {
+          id: 't_worker',
+          title: 'Implement worker overlay',
+          status: 'running',
+          tenant: 'tenant-a',
+          current_run_id: 42,
+          included_child_ids: [],
+          included_parent_ids: []
+        }
+      ],
+      workers: [
+        {
+          run_id: 42,
+          task_id: 't_worker',
+          task_title: 'Implement worker overlay',
+          profile: 'peacock',
+          status: 'running',
+          task_status: 'running',
+          started_at: 900,
+          last_heartbeat_at: 990,
+          worker_pid: 12345,
+          worker_session_id: 'worker-session-42',
+          summary: 'building drawer links',
+          log_tail_available: true,
+          log_tail: 'last worker log line',
+          recent_task_events: [{ id: 9, task_id: 't_worker', kind: 'heartbeat', created_at: 990, run_id: 42 }]
+        }
+      ]
+    })
+
+    const onTaskAction = vi.fn()
+    render(<LoopPanel onTaskAction={onTaskAction} open selectedTaskId="t_worker" state={state} />)
+
+    expect(screen.getByText('Worker activity')).toBeTruthy()
+    expect(screen.getByText('Run #42')).toBeTruthy()
+    expect(screen.getByText('running · peacock · pid 12345')).toBeTruthy()
+    expect(screen.getByText('building drawer links')).toBeTruthy()
+    expect(screen.getByText('last worker log line')).toBeTruthy()
+    expect(screen.getByText('heartbeat')).toBeTruthy()
+
+    fireEvent.click(screen.getByRole('button', { name: /open worker session worker-session-42/i }))
+    expect(onTaskAction).toHaveBeenCalledWith('worker-session', expect.objectContaining({ taskId: 't_worker' }))
+    fireEvent.click(screen.getByRole('button', { name: /inspect worker run #42/i }))
+    expect(onTaskAction).toHaveBeenCalledWith('worker-run', expect.objectContaining({ taskId: 't_worker' }))
+    fireEvent.click(screen.getByRole('button', { name: /open worker logs for t_worker/i }))
+    expect(onTaskAction).toHaveBeenCalledWith('logs', expect.objectContaining({ taskId: 't_worker' }))
+  })
+
   it('renders debug JSON only when explicitly enabled for development diagnostics', () => {
     const state = deriveLoopPanelState([
       toolMessage({

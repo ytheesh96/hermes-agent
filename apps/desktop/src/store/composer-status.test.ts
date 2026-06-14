@@ -2,12 +2,11 @@ import { beforeEach, describe, expect, it } from 'vitest'
 
 import {
   $backgroundStatusBySession,
-  $loopWorkerStatusBySession,
-  $statusItemsBySession,
+  $kanbanStatusBySession,
   dismissBackgroundProcess,
   groupStatusItems,
   reconcileBackgroundProcesses,
-  setLoopWorkerStatusItems
+  reconcileKanbanSessionSource
 } from './composer-status'
 
 const SID = 'sess-1'
@@ -26,7 +25,6 @@ const items = () => $backgroundStatusBySession.get()[SID] ?? []
 describe('reconcileBackgroundProcesses', () => {
   beforeEach(() => {
     $backgroundStatusBySession.set({})
-    $loopWorkerStatusBySession.set({})
   })
 
   it('maps registry entries to status items', () => {
@@ -107,26 +105,59 @@ describe('reconcileBackgroundProcesses', () => {
   })
 })
 
-describe('Loop worker composer status', () => {
+describe('reconcileKanbanSessionSource', () => {
   beforeEach(() => {
-    $backgroundStatusBySession.set({})
-    $loopWorkerStatusBySession.set({})
+    $kanbanStatusBySession.set({})
   })
 
-  it('surfaces Loop workers as their own group before delegate subagents', () => {
-    setLoopWorkerStatusItems(SID, [
-      {
-        id: 'worker:t_loop:7',
-        state: 'running',
-        title: 'Implement Loop worker parity',
-        type: 'loop-worker'
-      }
-    ])
+  it('adds durable Kanban tasks to the existing Tasks group and workers to a Kanban agents group', () => {
+    reconcileKanbanSessionSource(SID, {
+      tasks: [
+        { id: 't_running', status: 'running', title: 'Running Kanban task' },
+        { id: 't_blocked', status: 'blocked', title: 'Blocked Kanban task' },
+        { id: 't_done', status: 'done', title: 'Completed Kanban task' }
+      ],
+      workers: [
+        {
+          run_id: 7,
+          task_id: 't_running',
+          task_title: 'Running Kanban task',
+          profile: 'peacock',
+          status: 'running',
+          worker_session_id: 'worker-session-7',
+          log_tail: 'worker log tail'
+        },
+        {
+          run_id: 8,
+          task_id: 't_blocked',
+          task_title: 'Blocked Kanban task',
+          profile: 'reviewer-qa',
+          status: 'completed',
+          outcome: 'failed',
+          error: 'blocked by review gate'
+        }
+      ]
+    })
 
-    const items = $statusItemsBySession.get()[SID] ?? []
+    const items = $kanbanStatusBySession.get()[SID] ?? []
     const groups = groupStatusItems(items)
 
-    expect(groups.map(group => group.type)).toEqual(['loop-worker'])
-    expect(groups[0]?.items[0]).toMatchObject({ title: 'Implement Loop worker parity', type: 'loop-worker' })
+    expect(groups.map(group => group.type)).toEqual(['todo', 'kanban-agent'])
+    expect(groups[0]!.items.map(item => [item.id, item.kanbanTaskId, item.todoStatus])).toEqual([
+      ['kanban-task:t_running', 't_running', 'in_progress'],
+      ['kanban-task:t_blocked', 't_blocked', 'pending'],
+      ['kanban-task:t_done', 't_done', 'completed']
+    ])
+    expect(groups[1]!.items.map(item => [item.id, item.state, item.sessionId, item.output])).toEqual([
+      ['kanban-agent:t_running:7', 'running', 'worker-session-7', 'worker log tail'],
+      ['kanban-agent:t_blocked:8', 'failed', undefined, 'blocked by review gate']
+    ])
+  })
+
+  it('clears stale Kanban rows when session-source metadata disappears', () => {
+    reconcileKanbanSessionSource(SID, { tasks: [{ id: 't_running', status: 'running', title: 'Running' }] })
+    reconcileKanbanSessionSource(SID, null)
+
+    expect($kanbanStatusBySession.get()).toEqual({})
   })
 })

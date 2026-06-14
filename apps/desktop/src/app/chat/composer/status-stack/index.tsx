@@ -33,16 +33,18 @@ const groupLabel = (group: StatusGroup, s: Translations['statusStack']) => {
     return s.todos(group.items.filter(i => i.todoStatus === 'completed').length, group.items.length)
   }
 
-  if (group.type === 'loop-worker') {
-    return s.loopWorkers(group.items.length)
+  if (group.type === 'subagent') {
+    return s.subagents(group.items.length)
   }
 
-  return group.type === 'subagent' ? s.subagents(group.items.length) : s.background(group.items.length)
+  return group.type === 'kanban-agent' ? `${group.items.length} Kanban agent${group.items.length === 1 ? '' : 's'}` : s.background(group.items.length)
 }
 
 interface ComposerStatusStackProps {
   /** Session-scoped sections supplied by the chat shell (e.g. Loop rows). */
   lead?: ReactNode
+  /** Open/focus the durable Loop/Kanban side panel for a task row. */
+  onOpenKanbanTask?: (taskId: string) => void
   /** The queue, built by the composer (it owns the queue's callbacks). Rendered
    *  as the last group so it stays fused to the composer like before. */
   queue: ReactNode
@@ -54,7 +56,7 @@ interface ComposerStatusStackProps {
  * every session-scoped status — subagents, background tasks, queue — grouped by
  * type and separated by light dividers. Collapses to nothing when empty.
  */
-export function ComposerStatusStack({ lead, queue, sessionId }: ComposerStatusStackProps) {
+export function ComposerStatusStack({ lead, queue, sessionId, onOpenKanbanTask }: ComposerStatusStackProps) {
   const { t } = useI18n()
   const navigate = useNavigate()
   const itemsBySession = useStore($statusItemsBySession)
@@ -87,8 +89,27 @@ export function ComposerStatusStack({ lead, queue, sessionId }: ComposerStatusSt
 
   const openAgents = () => navigate(AGENTS_ROUTE)
 
-  const openSubagent = (item: ComposerStatusItem) =>
-    item.sessionId ? void openSessionInNewWindow(item.sessionId, { watch: true }) : openAgents()
+  const openStatusItem = (item: ComposerStatusItem) => {
+    if (item.type === 'todo' && item.kanbanTaskId && onOpenKanbanTask) {
+      onOpenKanbanTask(item.kanbanTaskId)
+
+      return
+    }
+
+    if (item.sessionId) {
+      void openSessionInNewWindow(item.sessionId, { watch: true })
+
+      return
+    }
+
+    if (item.kanbanTaskId && onOpenKanbanTask) {
+      onOpenKanbanTask(item.kanbanTaskId)
+
+      return
+    }
+
+    openAgents()
+  }
 
   const sections: { key: string; node: ReactNode }[] = lead ? [{ key: 'lead', node: lead }] : []
 
@@ -97,7 +118,7 @@ export function ComposerStatusStack({ lead, queue, sessionId }: ComposerStatusSt
     node: (
       <StatusSection
         accessory={
-          group.type === 'subagent' ? (
+          group.type === 'subagent' || group.type === 'kanban-agent' ? (
             <Button
               className="text-muted-foreground/75 hover:text-foreground/90"
               onClick={openAgents}
@@ -113,8 +134,6 @@ export function ComposerStatusStack({ lead, queue, sessionId }: ComposerStatusSt
         icon={
           group.type === 'todo' ? (
             <Codicon className="text-muted-foreground/70" name="checklist" size="0.8rem" />
-          ) : group.type === 'loop-worker' ? (
-            <Codicon className="text-violet-400/80" name="circuit-board" size="0.8rem" />
           ) : undefined
         }
         label={groupLabel(group, t.statusStack)}
@@ -124,7 +143,7 @@ export function ComposerStatusStack({ lead, queue, sessionId }: ComposerStatusSt
             item={item}
             key={item.id}
             onDismiss={sessionId ? id => dismissBackgroundProcess(sessionId, id) : undefined}
-            onOpen={() => openSubagent(item)}
+            onOpen={() => openStatusItem(item)}
             onStop={sessionId ? id => stopBackgroundProcess(sessionId, id) : undefined}
           />
         ))}

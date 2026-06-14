@@ -627,10 +627,79 @@ def _preview_text(value: Any, *, max_chars: int = 200) -> Optional[str]:
     return text[: max(0, max_chars)]
 
 
+def _worker_session_id_from_metadata(metadata: Any) -> Optional[str]:
+    if not isinstance(metadata, dict):
+        return None
+    value = metadata.get("worker_session_id")
+    if value is None:
+        return None
+    text = str(value).strip()
+    return text or None
+
+
+def _log_tail_payload(task_id: str, *, board: Optional[str], tail_bytes: int = 8192) -> dict[str, Any]:
+    log_path = kanban_db.worker_log_path(task_id, board=board)
+    exists = log_path.exists()
+    size = log_path.stat().st_size if exists else 0
+    content: Optional[str] = None
+    if exists and tail_bytes > 0:
+        content = kanban_db.read_worker_log(task_id, tail_bytes=tail_bytes, board=board)
+    return {
+        "log_path": str(log_path),
+        "log_tail_available": exists,
+        "log_size_bytes": size,
+        "log_tail": content if exists and tail_bytes > 0 else None,
+        "log_tail_truncated": bool(exists and tail_bytes > 0 and size > tail_bytes),
+    }
+
+
+def _recent_events_by_task(
+    conn: sqlite3.Connection,
+    task_ids: list[str],
+    *,
+    limit_per_task: int = 5,
+) -> dict[str, list[dict[str, Any]]]:
+    if not task_ids or limit_per_task <= 0:
+        return {task_id: [] for task_id in task_ids}
+    placeholders = ",".join("?" for _ in task_ids)
+    rows = conn.execute(
+        f"""
+        SELECT * FROM (
+            SELECT e.*, ROW_NUMBER() OVER (
+                PARTITION BY e.task_id ORDER BY e.id DESC
+            ) AS rn
+            FROM task_events e
+            WHERE e.task_id IN ({placeholders})
+        ) ranked
+        WHERE rn <= ?
+        ORDER BY task_id ASC, created_at ASC, id ASC
+        """,
+        tuple(task_ids) + (limit_per_task,),
+    ).fetchall()
+    events_by_task: dict[str, list[dict[str, Any]]] = {task_id: [] for task_id in task_ids}
+    for row in rows:
+        try:
+            payload = json.loads(row["payload"]) if row["payload"] else None
+        except Exception:
+            payload = None
+        event = kanban_db.Event(
+            id=row["id"],
+            task_id=row["task_id"],
+            kind=row["kind"],
+            payload=payload,
+            created_at=row["created_at"],
+            run_id=(int(row["run_id"]) if "run_id" in row.keys() and row["run_id"] is not None else None),
+        )
+        events_by_task.setdefault(row["task_id"], []).append(_event_dict(event))
+    return events_by_task
+
+
 def _worker_activity_for_tasks(
     conn: sqlite3.Connection,
     task_ids: list[str],
     latest_runs: dict[str, dict[str, Any]],
+    *,
+    board: Optional[str],
 ) -> dict[str, dict[str, Any]]:
     """Reconstruct compact worker status from durable runs/events only.
 
@@ -660,6 +729,7 @@ def _worker_activity_for_tasks(
         tuple(task_ids),
     ).fetchall()
     latest_events = {row["task_id"]: row for row in event_rows}
+    recent_events = _recent_events_by_task(conn, task_ids)
     out: dict[str, dict[str, Any]] = {}
     for task_id, run in latest_runs.items():
         event = latest_events.get(task_id)
@@ -668,6 +738,7 @@ def _worker_activity_for_tasks(
         summary_preview = _preview_text(run.get("summary"))
         error_preview = _preview_text(run.get("error"))
         out[task_id] = {
+            "task_id": task_id,
             "run_id": run.get("id"),
             "status": status,
             "outcome": outcome,
@@ -675,11 +746,16 @@ def _worker_activity_for_tasks(
             "started_at": run.get("started_at"),
             "ended_at": run.get("ended_at"),
             "last_heartbeat_at": run.get("last_heartbeat_at"),
+            "worker_session_id": run.get("worker_session_id") or _worker_session_id_from_metadata(run.get("metadata")),
+            "worker_pid": run.get("worker_pid"),
+            "claim_expires": run.get("claim_expires"),
+            "recent_task_events": recent_events.get(task_id, []),
             "latest_event_id": int(event["id"]) if event is not None else None,
             "latest_event_kind": event["kind"] if event is not None else None,
             "summary_preview": summary_preview,
             "error_preview": error_preview,
         }
+        out[task_id].update(_log_tail_payload(task_id, board=board))
     return out
 
 
@@ -800,7 +876,7 @@ def get_session_source(
 
         summary_map = kanban_db.latest_summaries(conn, task_ids)
         latest_runs = _latest_runs_for_tasks(conn, task_ids)
-        worker_activity = _worker_activity_for_tasks(conn, task_ids, latest_runs)
+        worker_activity = _worker_activity_for_tasks(conn, task_ids, latest_runs, board=selected_board or board)
         source_revision = _latest_event_id_for_tasks(conn, task_ids)
         comment_counts: dict[str, int] = {}
         if task_ids:
@@ -849,6 +925,11 @@ def get_session_source(
             "tenants": tenant_filters,
             "include_archived": include_archived,
             "tasks": payload_tasks,
+            "workers": [
+                {**worker_activity[task.id], "task_title": task.title, "task_status": task.status}
+                for task in ordered_tasks
+                if task.id in worker_activity
+            ],
             "links": included_links,
             "external_links": [link for link in all_links if link not in included_links],
             "latest_event_id": source_revision,
@@ -1041,7 +1122,7 @@ def get_task(
         full_summary = kanban_db.latest_summary(conn, task_id)
         task_d = _task_dict(task, latest_summary=full_summary)
         latest_runs = _latest_runs_for_tasks(conn, [task_id])
-        worker_activity = _worker_activity_for_tasks(conn, [task_id], latest_runs).get(task_id)
+        worker_activity = _worker_activity_for_tasks(conn, [task_id], latest_runs, board=board).get(task_id)
         if worker_activity:
             task_d["worker_activity"] = worker_activity
         latest_event_id = _latest_event_id_for_tasks(conn, [task_id])

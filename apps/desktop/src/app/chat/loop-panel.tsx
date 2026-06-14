@@ -16,9 +16,19 @@ import { Button } from '@/components/ui/button'
 import { Codicon } from '@/components/ui/codicon'
 import { cn } from '@/lib/utils'
 
-import type { CompactLoopTask, LoopPanelState, LoopPanelStatus, LoopRow, LoopTaskDetail, TenantLoopTask } from './loop-state'
+import type { CompactLoopTask, LoopPanelState, LoopPanelStatus, LoopRow, LoopTaskDetail, LoopWorkerActivity, TenantLoopTask } from './loop-state'
 
-export type LoopTaskAction = 'block' | 'decompose' | 'details' | 'kanban' | 'logs' | 'park' | 'start' | 'unblock'
+export type LoopTaskAction =
+  | 'block'
+  | 'decompose'
+  | 'details'
+  | 'kanban'
+  | 'logs'
+  | 'park'
+  | 'start'
+  | 'unblock'
+  | 'worker-run'
+  | 'worker-session'
 
 const LOOP_PANEL_DEFAULT_WIDTH = 352
 const LOOP_PANEL_MIN_WIDTH = 256
@@ -601,6 +611,94 @@ function lineageItems(row: LoopRow): string[] {
   ].filter(Boolean)
 }
 
+function workerStatusLine(worker: LoopWorkerActivity): string {
+  return [worker.status, worker.profile, worker.worker_pid ? `pid ${worker.worker_pid}` : ''].filter(Boolean).join(' · ')
+}
+
+function WorkerActivityDetails({
+  onTaskAction,
+  row
+}: {
+  onTaskAction?: (action: LoopTaskAction, row: LoopRow) => void
+  row: LoopRow
+}) {
+  const worker = row.workerActivity
+
+  if (!worker) {
+    return <EmptyDetail>No worker run metadata recorded for this task.</EmptyDetail>
+  }
+
+  const recentEvents = worker.recent_task_events || []
+
+  return (
+    <div className="grid gap-2 text-(--ui-text-secondary)">
+      <div className="grid gap-1">
+        <div className="flex flex-wrap items-center gap-1.5">
+          <span className="font-mono text-[0.72rem] text-(--ui-text-primary)">Run #{worker.run_id}</span>
+          {workerStatusLine(worker) ? <span className="text-[0.68rem] text-(--ui-text-tertiary)">{workerStatusLine(worker)}</span> : null}
+        </div>
+        {(worker.summary || worker.summary_preview || worker.error || worker.error_preview) && (
+          <p className="m-0 whitespace-pre-wrap text-[0.72rem] leading-relaxed">
+            {worker.summary || worker.summary_preview || worker.error || worker.error_preview}
+          </p>
+        )}
+      </div>
+
+      <div className="flex flex-wrap gap-1.5">
+        <Button
+          aria-label={worker.worker_session_id ? `Open worker session ${worker.worker_session_id}` : `No worker session recorded for run #${worker.run_id}`}
+          className="h-7 px-2 text-xs"
+          disabled={!onTaskAction || !worker.worker_session_id}
+          onClick={() => onTaskAction?.('worker-session', row)}
+          type="button"
+          variant="outline"
+        >
+          {worker.worker_session_id ? 'Open worker session' : 'No worker session'}
+        </Button>
+        <Button
+          aria-label={`Inspect worker run #${worker.run_id}`}
+          className="h-7 px-2 text-xs"
+          disabled={!onTaskAction}
+          onClick={() => onTaskAction?.('worker-run', row)}
+          type="button"
+          variant="outline"
+        >
+          Inspect run
+        </Button>
+        <Button
+          aria-label={`Open worker logs for ${row.taskId}`}
+          className="h-7 px-2 text-xs"
+          disabled={!onTaskAction || !worker.log_tail_available}
+          onClick={() => onTaskAction?.('logs', row)}
+          type="button"
+          variant="outline"
+        >
+          Worker logs
+        </Button>
+      </div>
+
+      {worker.log_tail ? (
+        <pre className="m-0 max-h-32 overflow-auto rounded border border-(--ui-stroke-tertiary) bg-(--ui-fill-quaternary) p-2 text-[0.65rem] whitespace-pre-wrap text-(--ui-text-secondary)">
+          {worker.log_tail}
+        </pre>
+      ) : worker.log_tail_available ? (
+        <EmptyDetail>Worker log exists; open logs to inspect it.</EmptyDetail>
+      ) : null}
+
+      {recentEvents.length > 0 ? (
+        <div className="grid gap-0.5">
+          <p className="m-0 text-[0.62rem] font-medium uppercase tracking-wide text-(--ui-text-tertiary)">Recent events</p>
+          {recentEvents.slice(-5).map((event, index) => (
+            <p className="m-0 font-mono text-[0.66rem] text-(--ui-text-tertiary)" key={`${event.id || index}:${event.kind}`}>
+              {event.kind || 'event'}
+            </p>
+          ))}
+        </div>
+      ) : null}
+    </div>
+  )
+}
+
 function LoopTaskDetails({
   backLabel,
   onBack,
@@ -688,6 +786,10 @@ function LoopTaskDetails({
         />
       </DetailSection>
 
+      <DetailSection title="Worker activity">
+        <WorkerActivityDetails onTaskAction={onTaskAction} row={row} />
+      </DetailSection>
+
       <DetailSection title="Safe actions">
         <LoopTaskActions onRefresh={onRefresh} onTaskAction={onTaskAction} row={row} />
       </DetailSection>
@@ -719,6 +821,7 @@ export function LoopPanel({
 
     if (internalFocusTaskIdRef.current === nextSelectedTaskId) {
       internalFocusTaskIdRef.current = null
+
       return
     }
 
@@ -746,6 +849,7 @@ export function LoopPanel({
   const focusDrawerTask = useCallback((taskId: string) => {
     setFocusedTaskId(taskId)
     internalFocusTaskIdRef.current = taskId
+
     if (onFocusTaskId) {
       onFocusTaskId(taskId)
     } else {

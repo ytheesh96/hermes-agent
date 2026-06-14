@@ -29,6 +29,8 @@ export interface LoopWorkerActivity {
   error?: null | string
   error_preview?: null | string
   last_heartbeat_at?: null | number
+  latest_event_id?: null | number
+  latest_event_kind?: null | string
   log_path?: null | string
   log_size_bytes?: number
   log_tail?: null | string
@@ -128,7 +130,6 @@ export interface TenantLoopTask {
   tenant?: null | string
   title: string
   warnings?: unknown
-  worker_activity?: null | Omit<LoopWorkerActivity, 'task_id' | 'task_status' | 'task_title'>
   workspace_kind?: null | string
   workspace_path?: null | string
 }
@@ -217,6 +218,7 @@ export interface LoopRow {
   taskId: string
   tenant?: null | string
   title: string
+  workerActivity?: null | LoopWorkerActivity
   workspaceKind?: null | string
   workspacePath?: null | string
 }
@@ -227,6 +229,7 @@ export interface LoopPanelState {
   revision: number
   rootTaskId: string
   rows: LoopRow[]
+  sourceNow?: number
   status: LoopPanelStatus
 }
 
@@ -236,18 +239,7 @@ const ACTIVE_STATUSES = new Set(['ready', 'running', 'claimed', 'in_progress'])
 const RUNNABLE_STATUSES = new Set(['ready', 'running', 'claimed', 'in_progress', 'todo'])
 const WAITING_WORKER_STATUSES = new Set(['queued', 'ready', 'todo'])
 const SUCCESS_RUN_OUTCOMES = new Set(['success', 'succeeded', 'ok'])
-
-const FAILED_RUN_STATES = new Set([
-  'error',
-  'failed',
-  'crashed',
-  'timed_out',
-  'timeout',
-  'interrupted',
-  'spawn_failed',
-  'gave_up'
-])
-
+const FAILED_RUN_STATES = new Set(['error', 'failed', 'crashed', 'timed_out', 'timeout', 'interrupted', 'spawn_failed', 'gave_up'])
 const DEFAULT_STALE_HEARTBEAT_SECONDS = 10 * 60
 
 function isRecord(value: unknown): value is Record<string, unknown> {
@@ -315,11 +307,7 @@ function secondsBetween(later: number | null | undefined, earlier: number | null
   return Math.max(0, Math.round(later - earlier))
 }
 
-function loopWorkerState(
-  worker: LoopWorkerActivity,
-  nowSeconds: number,
-  staleHeartbeatSeconds: number
-): LoopWorkerState {
+function loopWorkerState(worker: LoopWorkerActivity, nowSeconds: number, staleHeartbeatSeconds: number): LoopWorkerState {
   const status = normalizedStatus(worker.status)
   const taskStatus = worker.task_status ? normalizedStatus(worker.task_status) : ''
   const outcome = normalizedStatus(worker.outcome)
@@ -346,80 +334,93 @@ function loopWorkerState(
     return 'waiting'
   }
 
-  return SUCCESS_RUN_OUTCOMES.has(outcome) || COMPLETE_STATUSES.has(status) ? 'done' : 'failed'
+  if (SUCCESS_RUN_OUTCOMES.has(outcome) || COMPLETE_STATUSES.has(status) || COMPLETE_STATUSES.has(taskStatus)) {
+    return 'done'
+  }
+
+  return worker.ended_at ? 'done' : 'waiting'
+}
+
+function latestWorkerText(worker: LoopWorkerActivity): string | undefined {
+  const latestEvent = (worker.recent_task_events || [])
+    .slice()
+    .reverse()
+    .find(event => typeof event.kind === 'string' && event.kind.trim())
+
+  return (
+    worker.summary?.trim() ||
+    worker.summary_preview?.trim() ||
+    worker.error?.trim() ||
+    worker.error_preview?.trim() ||
+    (latestEvent ? latestEvent.kind : '') ||
+    (worker.log_tail_available ? 'Worker log tail available' : '') ||
+    undefined
+  )
 }
 
 export function normalizeLoopWorkers(
   source: TenantLoopSource | null | undefined,
-  opts: { nowSeconds?: number; staleHeartbeatSeconds?: number } = {}
+  options: { nowSeconds?: number; staleHeartbeatSeconds?: number } = {}
 ): LoopWorkerRun[] {
-  const workers: LoopWorkerActivity[] = [
-    ...(source?.workers ?? []),
-    ...(source?.tasks ?? []).flatMap(task =>
-      task.worker_activity
-        ? [
-            {
-              ...task.worker_activity,
-              task_id: task.id,
-              task_status: task.status,
-              task_title: task.title
-            }
-          ]
-        : []
-    )
-  ]
+  const nowSeconds = options.nowSeconds ?? source?.now ?? Date.now() / 1000
+  const staleHeartbeatSeconds = options.staleHeartbeatSeconds ?? DEFAULT_STALE_HEARTBEAT_SECONDS
 
-  if (!workers.length) {
-    return []
-  }
+  return (source?.workers || [])
+    .filter(worker => worker.task_id && Number.isFinite(worker.run_id))
+    .map(worker => {
+      const state = loopWorkerState(worker, nowSeconds, staleHeartbeatSeconds)
+      const elapsedSeconds = secondsBetween(worker.ended_at ?? nowSeconds, worker.started_at)
+      const heartbeatAgeSeconds = secondsBetween(nowSeconds, worker.last_heartbeat_at)
+      const attention = state === 'blocked' || state === 'failed' || state === 'stale'
 
-  const nowSeconds = opts.nowSeconds ?? source?.now ?? Math.round(Date.now() / 1000)
-  const staleHeartbeatSeconds = opts.staleHeartbeatSeconds ?? DEFAULT_STALE_HEARTBEAT_SECONDS
+      return {
+        action: worker.worker_session_id ? ('open-session' as const) : ('inspect-run' as const),
+        attention,
+        claimExpires: worker.claim_expires,
+        elapsedSeconds,
+        endedAt: worker.ended_at,
+        error: worker.error || worker.error_preview,
+        finishedAgeSeconds: secondsBetween(nowSeconds, worker.ended_at),
+        heartbeatAgeSeconds,
+        latestText: latestWorkerText(worker),
+        logTail: worker.log_tail,
+        logTailAvailable: Boolean(worker.log_tail_available || worker.log_tail),
+        logTailTruncated: Boolean(worker.log_tail_truncated),
+        profile: worker.profile,
+        recentEvents: worker.recent_task_events || [],
+        runId: worker.run_id,
+        startedAt: worker.started_at,
+        state,
+        status: worker.status,
+        taskId: worker.task_id,
+        taskStatus: worker.task_status,
+        taskTitle: worker.task_title || worker.task_id,
+        workerPid: worker.worker_pid,
+        workerSessionId: worker.worker_session_id
+      }
+    })
+    .sort((a, b) => {
+      const activeA = a.state === 'running' || a.state === 'waiting' || a.state === 'stale'
+      const activeB = b.state === 'running' || b.state === 'waiting' || b.state === 'stale'
 
-  return workers.map(worker => {
-    const state = loopWorkerState(worker, nowSeconds, staleHeartbeatSeconds)
-    const active = state === 'running' || state === 'stale'
-    const failed = state === 'failed' || state === 'blocked' || state === 'stale'
-    const latestText = worker.error || worker.error_preview || worker.summary || worker.summary_preview || worker.log_tail || undefined
+      if (activeA !== activeB) {
+        return activeA ? -1 : 1
+      }
 
-    return {
-      action: worker.worker_session_id ? 'open-session' : 'inspect-run',
-      attention: failed,
-      claimExpires: worker.claim_expires,
-      elapsedSeconds: secondsBetween(worker.ended_at ?? nowSeconds, worker.started_at),
-      endedAt: worker.ended_at,
-      error: worker.error,
-      finishedAgeSeconds: worker.ended_at ? secondsBetween(nowSeconds, worker.ended_at) : undefined,
-      heartbeatAgeSeconds: secondsBetween(nowSeconds, worker.last_heartbeat_at),
-      latestText,
-      logTail: worker.log_tail,
-      logTailAvailable: worker.log_tail_available === true || Boolean(worker.log_tail),
-      logTailTruncated: worker.log_tail_truncated === true,
-      profile: worker.profile,
-      recentEvents: worker.recent_task_events || [],
-      runId: worker.run_id,
-      startedAt: worker.started_at,
-      state,
-      status: worker.status,
-      taskId: worker.task_id,
-      taskStatus: worker.task_status,
-      taskTitle: worker.task_title || worker.task_id,
-      workerPid: worker.worker_pid,
-      workerSessionId: worker.worker_session_id,
-      ...(active ? {} : { claimExpires: worker.claim_expires })
-    }
-  })
+      if (activeA) {
+        return (a.startedAt || 0) - (b.startedAt || 0)
+      }
+
+      return (b.endedAt || b.startedAt || 0) - (a.endedAt || a.startedAt || 0)
+    })
 }
 
 export function loopWorkerCounts(workers: readonly LoopWorkerRun[]): LoopWorkerCounts {
-  return workers.reduce(
-    (acc, worker) => ({
-      attention: acc.attention + (worker.attention ? 1 : 0),
-      running: acc.running + (worker.state === 'running' ? 1 : 0),
-      total: acc.total + 1
-    }),
-    { attention: 0, running: 0, total: 0 }
-  )
+  return {
+    attention: workers.filter(worker => worker.attention).length,
+    running: workers.filter(worker => worker.state === 'running' || worker.state === 'waiting').length,
+    total: workers.length
+  }
 }
 
 function taskParents(task: TenantLoopTask): string[] {
@@ -466,16 +467,46 @@ function depthByTaskId(tasks: readonly TenantLoopTask[]): Map<string, number> {
   return depths
 }
 
-function tenantRowFromTask(task: TenantLoopTask, depths: Map<string, number>): LoopRow {
+function latestWorkerForTask(task: TenantLoopTask, workers: readonly LoopWorkerActivity[]): LoopWorkerActivity | null {
+  const taskWorkers = workers.filter(worker => worker.task_id === task.id)
+
+  if (taskWorkers.length === 0) {
+    return null
+  }
+
+  const currentRunId = task.current_run_id || task.latest_run?.id || null
+
+  return [...taskWorkers].sort((a, b) => {
+    const aCurrent = currentRunId && a.run_id === currentRunId ? 1 : 0
+    const bCurrent = currentRunId && b.run_id === currentRunId ? 1 : 0
+
+    if (aCurrent !== bCurrent) {
+      return bCurrent - aCurrent
+    }
+
+    const aActive = ACTIVE_STATUSES.has(normalizedStatus(a.status)) ? 1 : 0
+    const bActive = ACTIVE_STATUSES.has(normalizedStatus(b.status)) ? 1 : 0
+
+    if (aActive !== bActive) {
+      return bActive - aActive
+    }
+
+    return (b.started_at || b.ended_at || b.run_id || 0) - (a.started_at || a.ended_at || a.run_id || 0)
+  })[0]!
+}
+
+function tenantRowFromTask(task: TenantLoopTask, depths: Map<string, number>, workers: readonly LoopWorkerActivity[] = []): LoopRow {
   const parents = taskParents(task)
   const children = taskChildren(task)
   const status = normalizedStatus(task.status)
   const latestRun = task.latest_run || null
+  const workerActivity = latestWorkerForTask(task, workers)
   const latestRunActive = ACTIVE_STATUSES.has(normalizedStatus(latestRun?.status))
+  const latestWorkerActive = ACTIVE_STATUSES.has(normalizedStatus(workerActivity?.status))
   const unfinishedRunnable = RUNNABLE_STATUSES.has(status) && !COMPLETE_STATUSES.has(status)
 
   return {
-    active: ACTIVE_STATUSES.has(status) || latestRunActive || Boolean(task.current_run_id),
+    active: ACTIVE_STATUSES.has(status) || latestRunActive || latestWorkerActive || Boolean(task.current_run_id),
     assignee: task.assignee,
     body: task.body,
     childCount: children.length || task.child_count || task.children_count || 0,
@@ -486,7 +517,7 @@ function tenantRowFromTask(task: TenantLoopTask, depths: Map<string, number>): L
     externalParentTasks: task.external_parent_tasks || [],
     frontier: unfinishedRunnable,
     latestRun,
-    latestSummary: task.latest_summary || latestRun?.summary || null,
+    latestSummary: task.latest_summary || workerActivity?.summary || workerActivity?.summary_preview || latestRun?.summary || null,
     parentCount: parents.length || task.parent_count || task.parents_count || 0,
     parents,
     priority: task.priority,
@@ -497,6 +528,7 @@ function tenantRowFromTask(task: TenantLoopTask, depths: Map<string, number>): L
     taskId: task.id,
     tenant: task.tenant,
     title: task.title || task.id,
+    workerActivity,
     workspaceKind: task.workspace_kind,
     workspacePath: task.workspace_path
   }
@@ -512,7 +544,7 @@ export function deriveLoopPanelStateFromTenantSource(source: TenantLoopSource | 
   )
 
   const depths = depthByTaskId(tasks)
-  const rows = tasks.map(task => tenantRowFromTask(task, depths))
+  const rows = tasks.map(task => tenantRowFromTask(task, depths, source.workers || []))
   const rootTaskId = source.tenant || source.session_id || source.lineage_session_ids?.[0] || ''
 
   return {
@@ -521,6 +553,7 @@ export function deriveLoopPanelStateFromTenantSource(source: TenantLoopSource | 
     revision: source.latest_event_id || 0,
     rootTaskId,
     rows,
+    sourceNow: source.now,
     status: 'ready'
   }
 }
@@ -607,7 +640,6 @@ export function deriveLoopPanelState(messages: readonly ChatMessage[]): LoopPane
     }
 
     const status = statusFrom(result)
-
     const previousState = state
     const rootTaskId: string = rootTaskIdFrom(part.args, result) || previousState?.rootTaskId || ''
 

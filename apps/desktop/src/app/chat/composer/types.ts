@@ -41,6 +41,7 @@ export interface ChatBarProps {
   statusStackLead?: ReactNode
   cwd?: string | null
   onCancel: () => Promise<void> | void
+  onOpenKanbanTask?: (taskId: string) => void
   onAddContextRef?: (refText: string, label?: string, detail?: string) => void
   onAddUrl?: (url: string) => void
   onAttachImageBlob?: (blob: Blob) => Promise<boolean | void> | boolean | void

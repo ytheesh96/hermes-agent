@@ -14,7 +14,9 @@ const source: TenantLoopSource = {
       started_at: 100,
       last_heartbeat_at: 980,
       summary: 'halfway there',
-      worker_session_id: 'worker-session-1'
+      worker_session_id: 'worker-session-1',
+      log_tail_available: true,
+      log_tail: 'worker log line'
     },
     {
       run_id: 2,
@@ -51,7 +53,7 @@ const source: TenantLoopSource = {
 }
 
 describe('normalizeLoopWorkers', () => {
-  it('maps active/recent Loop worker runs without using subagent state', () => {
+  it('maps active and recent Loop worker runs separately from delegate subagent state', () => {
     const workers = normalizeLoopWorkers(source, { nowSeconds: 1_000, staleHeartbeatSeconds: 600 })
 
     expect(workers.map(worker => [worker.taskId, worker.state])).toEqual([
@@ -65,49 +67,17 @@ describe('normalizeLoopWorkers', () => {
       elapsedSeconds: 900,
       heartbeatAgeSeconds: 20,
       latestText: 'halfway there',
+      logTail: 'worker log line',
+      logTailAvailable: true,
       workerSessionId: 'worker-session-1'
     })
     expect(workers[1]).toMatchObject({ action: 'inspect-run', heartbeatAgeSeconds: 900 })
     expect(workers[2]).toMatchObject({ attention: true, latestText: 'boom' })
   })
 
-  it('counts running and attention Loop workers for the status surface', () => {
+  it('counts running and attention Loop workers for the statusbar', () => {
     const workers = normalizeLoopWorkers(source, { nowSeconds: 1_000, staleHeartbeatSeconds: 600 })
 
     expect(loopWorkerCounts(workers)).toEqual({ attention: 2, running: 1, total: 4 })
-  })
-
-  it('derives worker runs from the session-source task worker_activity contract', () => {
-    const workers = normalizeLoopWorkers(
-      {
-        now: 1_000,
-        tasks: [
-          {
-            id: 't_contract',
-            status: 'running',
-            title: 'Contract task',
-            worker_activity: {
-              run_id: 9,
-              status: 'running',
-              profile: 'peacock',
-              started_at: 900,
-              last_heartbeat_at: 995,
-              summary_preview: 'from task activity'
-            }
-          }
-        ]
-      },
-      { nowSeconds: 1_000, staleHeartbeatSeconds: 600 }
-    )
-
-    expect(workers).toHaveLength(1)
-    expect(workers[0]).toMatchObject({
-      latestText: 'from task activity',
-      profile: 'peacock',
-      runId: 9,
-      state: 'running',
-      taskId: 't_contract',
-      taskTitle: 'Contract task'
-    })
   })
 })

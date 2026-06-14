@@ -548,7 +548,15 @@ def test_session_source_recovers_missed_worker_activity_with_scoped_revision(cli
 
         assert kb.claim_task(conn, task_id, claimer="worker-host:123") is not None
         assert kb.heartbeat_worker(conn, task_id, note="halfway")
-        assert kb.complete_task(conn, task_id, summary="finished safely")
+        log_path = kb.worker_log_path(task_id)
+        log_path.parent.mkdir(parents=True, exist_ok=True)
+        log_path.write_text("worker booted\nfinished safely\n", encoding="utf-8")
+        assert kb.complete_task(
+            conn,
+            task_id,
+            summary="finished safely",
+            metadata={"worker_session_id": "worker-session-live"},
+        )
     finally:
         conn.close()
 
@@ -566,12 +574,21 @@ def test_session_source_recovers_missed_worker_activity_with_scoped_revision(cli
     assert data["source_revision"] == data["latest_event_id"]
     assert data["source_revision"] > initial_revision
     assert data["changed_since"] == initial_revision
+    [worker] = data["workers"]
+    assert worker["task_id"] == task_id
+    assert worker["task_title"] == "durable worker activity"
+    assert isinstance(worker["run_id"], int)
+    assert worker["worker_session_id"] == "worker-session-live"
+    assert worker["log_tail_available"] is True
+    assert "finished safely" in worker["log_tail"]
+    assert worker["recent_task_events"][-1]["kind"] == "completed"
     [task] = data["tasks"]
     assert task["id"] == task_id
     assert task["status"] == "done"
     assert task["latest_run"]["status"] == "done"
+    assert worker["run_id"] == task["latest_run"]["id"]
     assert task["latest_run"]["outcome"] == "completed"
-    assert task["worker_activity"] == {
+    assert task["worker_activity"] | {
         "run_id": task["latest_run"]["id"],
         "status": "done",
         "outcome": "completed",
@@ -579,11 +596,13 @@ def test_session_source_recovers_missed_worker_activity_with_scoped_revision(cli
         "started_at": task["latest_run"]["started_at"],
         "ended_at": task["latest_run"]["ended_at"],
         "last_heartbeat_at": task["latest_run"]["last_heartbeat_at"],
+        "worker_session_id": "worker-session-live",
+        "log_tail_available": True,
         "latest_event_id": data["latest_event_id"],
         "latest_event_kind": "completed",
         "summary_preview": "finished safely",
         "error_preview": None,
-    }
+    } == task["worker_activity"]
 
 
 def test_session_source_can_infer_tenant_from_lineage_tasks(client):

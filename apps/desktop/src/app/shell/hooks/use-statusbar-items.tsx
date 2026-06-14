@@ -1,10 +1,13 @@
 import { useStore } from '@nanostores/react'
+import { useQuery } from '@tanstack/react-query'
 import type { ReactNode } from 'react'
 import { useCallback, useMemo } from 'react'
 
+import { loopWorkerCounts, normalizeLoopWorkers } from '@/app/chat/loop-state'
 import type { CommandCenterSection } from '@/app/command-center'
 import { $terminalTakeover, setTerminalTakeover } from '@/app/right-sidebar/store'
 import { GatewayMenuPanel } from '@/app/shell/gateway-menu-panel'
+import { getLoopSessionSource } from '@/hermes'
 import { useI18n } from '@/i18n'
 import {
   Activity,
@@ -26,6 +29,7 @@ import { cn } from '@/lib/utils'
 import { setGlobalYolo, setSessionYolo } from '@/lib/yolo-session'
 import { $desktopActionTasks } from '@/store/activity'
 import { $previewServerRestartStatus } from '@/store/preview'
+import { $activeGatewayProfile } from '@/store/profile'
 import {
   $activeSessionId,
   $busy,
@@ -94,6 +98,7 @@ export function useStatusbarItems({
   const { t } = useI18n()
   const copy = t.shell.statusbar
   const activeSessionId = useStore($activeSessionId)
+  const activeGatewayProfile = useStore($activeGatewayProfile)
   const terminalTakeover = useStore($terminalTakeover)
   const yoloActive = useStore($yoloActive)
   const busy = useStore($busy)
@@ -114,6 +119,15 @@ export function useStatusbarItems({
   const backendUpdateApply = useStore($backendUpdateApply)
   const desktopVersion = useStore($desktopVersion)
   const connection = useStore($connection)
+
+  const loopSource = useQuery({
+    enabled: gatewayState === 'open' && Boolean(activeSessionId),
+    queryFn: () => getLoopSessionSource(activeSessionId!, activeGatewayProfile),
+    queryKey: ['loop-session-source', activeGatewayProfile, activeSessionId],
+    refetchInterval: 5_000
+  })
+
+  const loopCounts = useMemo(() => loopWorkerCounts(normalizeLoopWorkers(loopSource.data)), [loopSource.data])
 
   const contextUsage = useMemo(() => usageContextLabel(currentUsage), [currentUsage])
   const contextBar = useMemo(() => contextBarLabel(currentUsage), [currentUsage])
@@ -188,6 +202,19 @@ export function useStatusbarItems({
       subagentsRunning
     }
   }, [desktopActionTasks, previewServerRestartStatus, subagentsBySession, workingSessionIds])
+
+  const agentsAttention = bgFailed + loopCounts.attention
+  const agentsRunning = bgRunning + subagentsRunning + loopCounts.running
+
+  const agentsDetail = [
+    subagentsRunning > 0 ? copy.subagents(subagentsRunning) : '',
+    loopCounts.attention > 0
+      ? `${loopCounts.attention} Loop ${loopCounts.attention === 1 ? 'worker' : 'workers'} need attention`
+      : '',
+    loopCounts.running > 0 ? `${loopCounts.running} Loop ${loopCounts.running === 1 ? 'worker' : 'workers'} running` : '',
+    bgFailed > 0 ? copy.failed(bgFailed) : '',
+    bgRunning > 0 ? copy.running(bgRunning) : ''
+  ].filter(Boolean)
 
   const gatewayOpen = gatewayState === 'open'
   const gatewayConnecting = gatewayState === 'connecting'
@@ -326,20 +353,13 @@ export function useStatusbarItems({
       {
         className: cn(
           agentsOpen && 'bg-accent/55 text-foreground',
-          bgFailed > 0 && 'text-destructive hover:text-destructive'
+          agentsAttention > 0 && 'text-destructive hover:text-destructive'
         ),
-        detail:
-          subagentsRunning > 0
-            ? copy.subagents(subagentsRunning)
-            : bgFailed > 0
-              ? copy.failed(bgFailed)
-              : bgRunning > 0
-                ? copy.running(bgRunning)
-                : undefined,
+        detail: agentsDetail.length ? agentsDetail.join(' · ') : undefined,
         icon:
-          bgFailed > 0 ? (
+          agentsAttention > 0 ? (
             <AlertCircle className="size-3" />
-          ) : bgRunning > 0 || subagentsRunning > 0 ? (
+          ) : agentsRunning > 0 ? (
             <Loader2 className="size-3 animate-spin" />
           ) : (
             <Sparkles className="size-3" />
@@ -361,8 +381,9 @@ export function useStatusbarItems({
     ],
     [
       agentsOpen,
-      bgFailed,
-      bgRunning,
+      agentsAttention,
+      agentsDetail,
+      agentsRunning,
       commandCenterOpen,
       copy,
       gatewayMenuContent,
@@ -371,7 +392,6 @@ export function useStatusbarItems({
       inferenceReady,
       inferenceStatus?.reason,
       openAgents,
-      subagentsRunning,
       toggleCommandCenter
     ]
   )
