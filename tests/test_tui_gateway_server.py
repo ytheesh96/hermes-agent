@@ -4226,6 +4226,133 @@ def test_prompt_submit_history_version_match_persists_normally(monkeypatch):
         server._sessions.pop("sid", None)
 
 
+def test_prompt_submit_backstops_missing_db_transcript_rows(monkeypatch):
+    class _Agent:
+        session_id = "key"
+
+        def run_conversation(
+            self, prompt, conversation_history=None, stream_callback=None
+        ):
+            return {
+                "final_response": "reply",
+                "messages": [
+                    {"role": "user", "content": "hi"},
+                    {"role": "assistant", "content": "reply"},
+                ],
+            }
+
+    class _DB:
+        def __init__(self):
+            self.messages = []
+
+        def get_messages_as_conversation(self, session_key):
+            assert session_key == "key"
+            return list(self.messages)
+
+        def append_message(self, **kwargs):
+            self.messages.append(
+                {
+                    "role": kwargs["role"],
+                    "content": kwargs.get("content"),
+                    "tool_calls": kwargs.get("tool_calls"),
+                    "tool_call_id": kwargs.get("tool_call_id"),
+                    "tool_name": kwargs.get("tool_name"),
+                }
+            )
+
+    class _ImmediateThread:
+        def __init__(self, target=None, daemon=None):
+            self._target = target
+
+        def start(self):
+            self._target()
+
+    db = _DB()
+    server._sessions["sid"] = _session(agent=_Agent(), session_key="key")
+    try:
+        monkeypatch.setattr(server.threading, "Thread", _ImmediateThread)
+        monkeypatch.setattr(server, "_get_db", lambda: db)
+        monkeypatch.setattr(server, "_get_usage", lambda _a: {})
+        monkeypatch.setattr(server, "render_message", lambda _t, _c: "")
+        monkeypatch.setattr(server, "_emit", lambda *a: None)
+
+        resp = server.handle_request(
+            {
+                "id": "1",
+                "method": "prompt.submit",
+                "params": {"session_id": "sid", "text": "hi"},
+            }
+        )
+
+        assert resp.get("result")
+        assert db.messages == [
+            {"role": "user", "content": "hi", "tool_calls": None, "tool_call_id": None, "tool_name": None},
+            {"role": "assistant", "content": "reply", "tool_calls": None, "tool_call_id": None, "tool_name": None},
+        ]
+    finally:
+        server._sessions.pop("sid", None)
+
+
+def test_prompt_submit_does_not_duplicate_agent_flushed_db_rows(monkeypatch):
+    class _Agent:
+        session_id = "key"
+
+        def run_conversation(
+            self, prompt, conversation_history=None, stream_callback=None
+        ):
+            return {
+                "final_response": "reply",
+                "messages": [
+                    {"role": "user", "content": "hi"},
+                    {"role": "assistant", "content": "reply"},
+                ],
+            }
+
+    class _DB:
+        def __init__(self):
+            self.messages = [
+                {"role": "user", "content": "hi"},
+                {"role": "assistant", "content": "reply"},
+            ]
+            self.appended = []
+
+        def get_messages_as_conversation(self, session_key):
+            assert session_key == "key"
+            return list(self.messages)
+
+        def append_message(self, **kwargs):
+            self.appended.append(kwargs)
+
+    class _ImmediateThread:
+        def __init__(self, target=None, daemon=None):
+            self._target = target
+
+        def start(self):
+            self._target()
+
+    db = _DB()
+    server._sessions["sid"] = _session(agent=_Agent(), session_key="key")
+    try:
+        monkeypatch.setattr(server.threading, "Thread", _ImmediateThread)
+        monkeypatch.setattr(server, "_get_db", lambda: db)
+        monkeypatch.setattr(server, "_get_usage", lambda _a: {})
+        monkeypatch.setattr(server, "render_message", lambda _t, _c: "")
+        monkeypatch.setattr(server, "_emit", lambda *a: None)
+
+        resp = server.handle_request(
+            {
+                "id": "1",
+                "method": "prompt.submit",
+                "params": {"session_id": "sid", "text": "hi"},
+            }
+        )
+
+        assert resp.get("result")
+        assert db.appended == []
+    finally:
+        server._sessions.pop("sid", None)
+
+
 def test_prompt_submit_can_truncate_before_user_ordinal(monkeypatch):
     """Desktop user-message edits should restart the turn from the edited user."""
 

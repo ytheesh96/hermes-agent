@@ -1214,6 +1214,141 @@ def _session_db(session: dict):
                 db.close()
 
 
+_TUI_TURN_PERSISTENCE_COMPARE_KEYS = (
+    "role",
+    "content",
+    "tool_call_id",
+    "tool_calls",
+    "tool_name",
+    "finish_reason",
+    "reasoning",
+    "reasoning_content",
+    "reasoning_details",
+    "codex_reasoning_items",
+    "codex_message_items",
+    "observed",
+)
+
+
+def _json_fingerprint(value: Any) -> str:
+    try:
+        return json.dumps(value, sort_keys=True, separators=(",", ":"), default=str)
+    except Exception:
+        return repr(value)
+
+
+def _tui_turn_persistence_fingerprint(message: Dict[str, Any]) -> tuple:
+    role = message.get("role")
+    items = []
+    for key in _TUI_TURN_PERSISTENCE_COMPARE_KEYS:
+        value = message.get(key)
+        if key == "content" and role in {"user", "assistant"} and isinstance(value, str):
+            try:
+                from agent.memory_manager import sanitize_context
+                value = sanitize_context(value).strip()
+            except Exception:
+                value = value.strip()
+        elif key in {
+            "tool_calls",
+            "reasoning_details",
+            "codex_reasoning_items",
+            "codex_message_items",
+        }:
+            value = _json_fingerprint(value) if value not in (None, "") else None
+        elif key == "observed":
+            value = bool(value)
+        items.append((key, value))
+    return tuple(items)
+
+
+def _tui_persisted_turn_prefix_len(
+    db: Any,
+    session_key: str,
+    history_len: int,
+    turn_entries: List[Dict[str, Any]],
+) -> int:
+    if db is None or not turn_entries:
+        return 0
+    try:
+        db_messages = db.get_messages_as_conversation(session_key)
+    except Exception:
+        logger.debug("desktop transcript DB de-dupe lookup failed", exc_info=True)
+        return 0
+    if not isinstance(db_messages, list):
+        return 0
+    try:
+        start = max(0, int(history_len or 0))
+    except Exception:
+        start = 0
+    if len(db_messages) <= start:
+        return 0
+    matched = 0
+    for expected, actual in zip(turn_entries, db_messages[start:]):
+        if (
+            _tui_turn_persistence_fingerprint(expected)
+            != _tui_turn_persistence_fingerprint(actual)
+        ):
+            break
+        matched += 1
+    return matched
+
+
+def _persist_tui_turn_entries(
+    session: dict,
+    session_key: str,
+    history_len: int,
+    turn_entries: List[Dict[str, Any]],
+) -> int:
+    """Backstop agent SessionDB flushing for desktop/TUI turns."""
+    entries = [
+        dict(msg)
+        for msg in turn_entries
+        if isinstance(msg, dict) and msg.get("role") != "system"
+    ]
+    if not entries:
+        return 0
+    with _session_db(session) as db:
+        if db is None:
+            return 0
+        skip_count = _tui_persisted_turn_prefix_len(
+            db, session_key, history_len, entries
+        )
+        appended = 0
+        for msg in entries[skip_count:]:
+            role = msg.get("role", "unknown")
+            db.append_message(
+                session_id=session_key,
+                role=role,
+                content=msg.get("content"),
+                tool_name=msg.get("tool_name"),
+                tool_calls=msg.get("tool_calls"),
+                tool_call_id=msg.get("tool_call_id"),
+                finish_reason=msg.get("finish_reason"),
+                reasoning=msg.get("reasoning") if role == "assistant" else None,
+                reasoning_content=(
+                    msg.get("reasoning_content") if role == "assistant" else None
+                ),
+                reasoning_details=(
+                    msg.get("reasoning_details") if role == "assistant" else None
+                ),
+                codex_reasoning_items=(
+                    msg.get("codex_reasoning_items") if role == "assistant" else None
+                ),
+                codex_message_items=(
+                    msg.get("codex_message_items") if role == "assistant" else None
+                ),
+                observed=bool(msg.get("observed")),
+            )
+            appended += 1
+    if appended:
+        logger.info(
+            "desktop transcript DB backstop appended %d missing row(s) for %s",
+            appended,
+            session_key,
+        )
+    return appended
+
+
 def _set_session_cwd(session: dict, cwd: str) -> str:
     resolved = os.path.abspath(os.path.expanduser(str(cwd)))
     if not os.path.isdir(resolved):
@@ -5864,11 +5999,20 @@ def _run_prompt_submit(rid, sid: str, session: dict, text: Any) -> None:
             status_note = None
             if isinstance(result, dict):
                 if isinstance(result.get("messages"), list):
+                    result_messages = result["messages"]
+                    persist_history_len = len(history)
+                    persist_session_key = session.get("session_key")
+                    agent_session_key = getattr(agent, "session_id", None)
+                    if agent_session_key and agent_session_key != persist_session_key:
+                        persist_session_key = agent_session_key
+                        persist_history_len = 0
+                    should_backstop_db = False
                     with session["history_lock"]:
                         current_version = int(session.get("history_version", 0))
                         if current_version == history_version:
-                            session["history"] = result["messages"]
+                            session["history"] = result_messages
                             session["history_version"] = history_version + 1
+                            should_backstop_db = True
                         else:
                             # History mutated externally during the turn
                             # (undo/compress/retry/rollback now guard on
@@ -5887,6 +6031,24 @@ def _run_prompt_submit(rid, sid: str, session: dict, text: Any) -> None:
                             status_note = (
                                 "History changed during this turn — the response above is visible "
                                 "but was not saved to session history."
+                            )
+                    if should_backstop_db and persist_session_key:
+                        turn_entries = (
+                            result_messages[persist_history_len:]
+                            if len(result_messages) > persist_history_len
+                            else []
+                        )
+                        try:
+                            _persist_tui_turn_entries(
+                                session,
+                                persist_session_key,
+                                persist_history_len,
+                                turn_entries,
+                            )
+                        except Exception:
+                            logger.debug(
+                                "desktop transcript DB backstop failed",
+                                exc_info=True,
                             )
 
                 # If auto-compression fired inside run_conversation(), agent.session_id

@@ -850,6 +850,87 @@ def _collect_auto_append_media_tags(
 
     return media_tags, has_voice_directive
 
+
+_TURN_PERSISTENCE_COMPARE_KEYS = (
+    "role",
+    "content",
+    "tool_call_id",
+    "tool_calls",
+    "tool_name",
+    "finish_reason",
+    "reasoning",
+    "reasoning_content",
+    "reasoning_details",
+    "codex_reasoning_items",
+    "codex_message_items",
+    "observed",
+)
+
+
+def _json_fingerprint(value: Any) -> str:
+    try:
+        return json.dumps(value, sort_keys=True, separators=(",", ":"), default=str)
+    except Exception:
+        return repr(value)
+
+
+def _turn_persistence_fingerprint(message: Dict[str, Any]) -> tuple:
+    """Return a stable DB-facing fingerprint for transcript de-dupe."""
+    role = message.get("role")
+    items = []
+    for key in _TURN_PERSISTENCE_COMPARE_KEYS:
+        value = message.get(key)
+        if key == "content" and role in {"user", "assistant"} and isinstance(value, str):
+            try:
+                from agent.memory_manager import sanitize_context
+                value = sanitize_context(value).strip()
+            except Exception:
+                value = value.strip()
+        elif key in {
+            "tool_calls",
+            "reasoning_details",
+            "codex_reasoning_items",
+            "codex_message_items",
+        }:
+            value = _json_fingerprint(value) if value not in (None, "") else None
+        elif key == "observed":
+            value = bool(value)
+        items.append((key, value))
+    return tuple(items)
+
+
+def _persisted_turn_prefix_len(
+    session_db: Any,
+    session_id: str,
+    history_len: int,
+    turn_entries: List[Dict[str, Any]],
+) -> int:
+    """Count current-turn entries already present in SQLite after history_len."""
+    if not session_db or not turn_entries:
+        return 0
+    try:
+        db_messages = session_db.get_messages_as_conversation(session_id)
+    except Exception:
+        logger.debug("Could not inspect DB transcript for persistence de-dupe", exc_info=True)
+        return 0
+    if not isinstance(db_messages, list):
+        return 0
+
+    try:
+        start = max(0, int(history_len or 0))
+    except Exception:
+        start = 0
+    if len(db_messages) <= start:
+        return 0
+
+    persisted_tail = db_messages[start:]
+    matched = 0
+    for expected, actual in zip(turn_entries, persisted_tail):
+        if _turn_persistence_fingerprint(expected) != _turn_persistence_fingerprint(actual):
+            break
+        matched += 1
+    return matched
+
 # ---------------------------------------------------------------------------
 # SSL certificate auto-detection for NixOS and other non-standard systems.
 # Must run BEFORE any HTTP library (discord, aiohttp, etc.) is imported.
@@ -8898,15 +8979,12 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     }
                 )
             
-            # The agent already persisted these messages to SQLite via
-            # _flush_messages_to_session_db(), so skip the DB write here
-            # to prevent the duplicate-write bug (#860 / #42039).
-            agent_persisted = self._session_db is not None
-
             # Find only the NEW messages from this turn (skip history we loaded).
             # Use the filtered history length (history_offset) that was actually
             # passed to the agent, not len(history) which includes session_meta
             # entries that were stripped before the agent saw them.
+            turn_entries: List[Dict[str, Any]] = []
+            history_len = agent_result.get("history_offset", len(history))
             if is_context_overflow_failure:
                 pass  # handled above — skip all transcript writes
             elif agent_failed_early:
@@ -8917,13 +8995,8 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 _user_entry = {"role": "user", "content": message_text, "timestamp": ts}
                 if event.message_id:
                     _user_entry["message_id"] = str(event.message_id)
-                self.session_store.append_to_transcript(
-                    session_entry.session_id,
-                    _user_entry,
-                    skip_db=agent_persisted,
-                )
+                turn_entries.append(_user_entry)
             else:
-                history_len = agent_result.get("history_offset", len(history))
                 new_messages = agent_messages[history_len:] if len(agent_messages) > history_len else []
 
                 # If no new messages found (edge case), fall back to simple user/assistant
@@ -8931,17 +9004,9 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     _user_entry = {"role": "user", "content": message_text, "timestamp": ts}
                     if event.message_id:
                         _user_entry["message_id"] = str(event.message_id)
-                    self.session_store.append_to_transcript(
-                        session_entry.session_id,
-                        _user_entry,
-                        skip_db=agent_persisted,
-                    )
+                    turn_entries.append(_user_entry)
                     if response:
-                        self.session_store.append_to_transcript(
-                            session_entry.session_id,
-                            {"role": "assistant", "content": response, "timestamp": ts},
-                            skip_db=agent_persisted,
-                        )
+                        turn_entries.append({"role": "assistant", "content": response, "timestamp": ts})
                 else:
                     # Attach the inbound platform message_id to the first user
                     # entry written this turn so platform-level quote-resolution
@@ -8962,10 +9027,27 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                         ):
                             entry["message_id"] = str(event.message_id)
                             _user_msg_id_attached = True
-                        self.session_store.append_to_transcript(
-                            session_entry.session_id, entry,
-                            skip_db=agent_persisted,
-                        )
+                        turn_entries.append(entry)
+
+            persisted_prefix = _persisted_turn_prefix_len(
+                self._session_db,
+                session_entry.session_id,
+                history_len,
+                turn_entries,
+            )
+            if turn_entries and persisted_prefix:
+                logger.debug(
+                    "Gateway transcript DB de-dupe: skipping %d/%d already persisted row(s) for %s",
+                    persisted_prefix,
+                    len(turn_entries),
+                    session_entry.session_id,
+                )
+            for idx, entry in enumerate(turn_entries):
+                self.session_store.append_to_transcript(
+                    session_entry.session_id,
+                    entry,
+                    skip_db=idx < persisted_prefix,
+                )
             
             # Token counts and model are now persisted by the agent directly.
             # Keep only last_prompt_tokens here for context-window tracking and

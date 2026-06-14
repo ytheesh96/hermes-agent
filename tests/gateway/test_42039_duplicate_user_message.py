@@ -1,17 +1,12 @@
-"""Tests for #42039 — user messages stored twice in state.db.
+"""Tests for #42039 and the gateway DB persistence fallback.
 
-When the agent has its own SessionDB reference (``_session_db is not None``),
-``_flush_messages_to_session_db()`` persists messages to SQLite during the
-agent run.  The gateway's ``append_to_transcript()`` must then use
-``skip_db=True`` on all fallback paths to prevent writing a second copy
-to the same SQLite file.
+The agent normally writes turn rows through ``_flush_messages_to_session_db``.
+The gateway also has enough context to write those rows, but must only skip its
+backup write after proving the rows are already present after the pre-turn
+history anchor. A database handle alone is not proof.
 
-This test covers the two fallback paths that previously lacked
-``skip_db=agent_persisted``:
-
-1. ``agent_failed_early`` path — transient 429/timeout failures
-2. ``not new_messages`` path — edge case where ``history_offset`` exceeds
-   the actual message count
+This covers the duplicate-prevention paths from #42039 and the missing-
+transcript fallback that writes rows when the agent did not flush them.
 """
 
 import sys
@@ -44,6 +39,7 @@ def _bootstrap(monkeypatch, tmp_path):
     runner._set_session_env = lambda _context: None
     runner._handle_active_session_busy_message = AsyncMock(return_value=False)
     runner._session_db = MagicMock()
+    runner._session_db.get_messages_as_conversation.return_value = []
     runner._recover_telegram_topic_thread_id = lambda _source: None
     runner._cache_session_source = lambda _key, _source: None
     runner._is_session_run_current = lambda _key, _gen: True
@@ -120,7 +116,15 @@ def _assert_user_call_has_skip_db(calls, expected_skip_db: bool):
         )
 
 
-# ── Test 1: agent_failed_early path uses skip_db=True ─────────────────
+def _skip_flags(calls):
+    return [
+        call.kwargs.get("skip_db", False)
+        for call in calls
+        if len(call.args) >= 2 and isinstance(call.args[1], dict)
+    ]
+
+
+# ── Test 1: agent_failed_early skips DB only when row already exists ───
 
 
 @pytest.mark.asyncio
@@ -128,6 +132,9 @@ async def test_agent_failed_early_skip_db_when_agent_has_session_db(
     monkeypatch, tmp_path
 ):
     runner = _bootstrap(monkeypatch, tmp_path)
+    runner._session_db.get_messages_as_conversation.return_value = [
+        {"role": "user", "content": "hello world"},
+    ]
 
     # Agent fails with transient 429
     runner._run_agent = AsyncMock(
@@ -150,7 +157,7 @@ async def test_agent_failed_early_skip_db_when_agent_has_session_db(
     )
 
 
-# ── Test 2: agent_failed_early with no _session_db → skip_db not True ─
+# ── Test 2: agent_failed_early with no _session_db -> skip_db not True ─
 
 
 @pytest.mark.asyncio
@@ -180,7 +187,7 @@ async def test_agent_failed_early_no_skip_db_when_no_session_db(
     )
 
 
-# ── Test 3: not-new-messages path uses skip_db=True ───────────────────
+# ── Test 3: not-new-messages path skips rows already flushed ──────────
 
 
 @pytest.mark.asyncio
@@ -188,6 +195,14 @@ async def test_not_new_messages_skip_db_when_agent_has_session_db(
     monkeypatch, tmp_path
 ):
     runner = _bootstrap(monkeypatch, tmp_path)
+    runner.session_store.load_transcript.return_value = [
+        {"role": "assistant", "content": "old"},
+    ]
+    runner._session_db.get_messages_as_conversation.return_value = [
+        {"role": "assistant", "content": "old"},
+        {"role": "user", "content": "hello world"},
+        {"role": "assistant", "content": "Hello!"},
+    ]
 
     # Agent succeeds but history_offset equals messages length → no new messages
     runner._run_agent = AsyncMock(
@@ -207,9 +222,10 @@ async def test_not_new_messages_skip_db_when_agent_has_session_db(
     _assert_user_call_has_skip_db(
         runner.session_store.append_to_transcript.call_args_list, True
     )
+    assert _skip_flags(runner.session_store.append_to_transcript.call_args_list)[-2:] == [True, True]
 
 
-# ── Test 4: normal path (new_messages found) uses skip_db=True ────────
+# ── Test 4: normal path skips when current turn rows are already in DB ─
 
 
 @pytest.mark.asyncio
@@ -217,6 +233,10 @@ async def test_normal_path_skip_db_when_agent_has_session_db(
     monkeypatch, tmp_path
 ):
     runner = _bootstrap(monkeypatch, tmp_path)
+    runner._session_db.get_messages_as_conversation.return_value = [
+        {"role": "user", "content": "hi"},
+        {"role": "assistant", "content": "Hello!"},
+    ]
 
     # Agent succeeds with new messages
     runner._run_agent = AsyncMock(
@@ -239,3 +259,61 @@ async def test_normal_path_skip_db_when_agent_has_session_db(
     _assert_user_call_has_skip_db(
         runner.session_store.append_to_transcript.call_args_list, True
     )
+
+
+@pytest.mark.asyncio
+async def test_normal_path_writes_when_agent_db_has_no_current_turn_rows(
+    monkeypatch, tmp_path
+):
+    runner = _bootstrap(monkeypatch, tmp_path)
+
+    runner._run_agent = AsyncMock(
+        return_value={
+            "final_response": "Hello!",
+            "messages": [
+                {"role": "user", "content": "hi"},
+                {"role": "assistant", "content": "Hello!"},
+            ],
+            "tools": [],
+            "history_offset": 0,
+            "last_prompt_tokens": 0,
+        }
+    )
+
+    await runner._handle_message_with_agent(
+        _event(), _source(), "agent:main:telegram:group:-1001:12345", 1
+    )
+
+    assert _skip_flags(runner.session_store.append_to_transcript.call_args_list)[-2:] == [False, False]
+
+
+@pytest.mark.asyncio
+async def test_repeated_user_text_before_turn_does_not_skip_current_write(
+    monkeypatch, tmp_path
+):
+    runner = _bootstrap(monkeypatch, tmp_path)
+    history = [
+        {"role": "user", "content": "hello world"},
+        {"role": "assistant", "content": "older answer"},
+    ]
+    runner.session_store.load_transcript.return_value = history
+    runner._session_db.get_messages_as_conversation.return_value = history
+
+    runner._run_agent = AsyncMock(
+        return_value={
+            "final_response": "fresh answer",
+            "messages": history + [
+                {"role": "user", "content": "hello world"},
+                {"role": "assistant", "content": "fresh answer"},
+            ],
+            "tools": [],
+            "history_offset": len(history),
+            "last_prompt_tokens": 0,
+        }
+    )
+
+    await runner._handle_message_with_agent(
+        _event(), _source(), "agent:main:telegram:group:-1001:12345", 1
+    )
+
+    assert _skip_flags(runner.session_store.append_to_transcript.call_args_list)[-2:] == [False, False]
