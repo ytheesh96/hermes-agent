@@ -32,6 +32,7 @@ import { parseTodos } from '@/lib/todos'
 import { setClarifyRequest } from '@/store/clarify'
 import { refreshBackgroundProcesses } from '@/store/composer-status'
 import { $gateway } from '@/store/gateway'
+import { loopagentSessionKeys, upsertLoopagent } from '@/store/loopagents'
 import { notify } from '@/store/notifications'
 import { requestDesktopOnboarding } from '@/store/onboarding'
 import { $activeGatewayProfile, normalizeProfileKey } from '@/store/profile'
@@ -165,6 +166,8 @@ const SUBAGENT_EVENT_TYPES = new Set([
   'subagent.progress',
   'subagent.complete'
 ])
+
+const isLoopagentEventType = (eventType: string | undefined): boolean => Boolean(eventType?.startsWith('loopagent.'))
 
 // Anonymous progress events that carry todos but no name still belong to the
 // todo stream; named todo events are obviously routed there too.
@@ -709,6 +712,8 @@ export function useMessageStream({
       const payloadRecord = asRecord(payload)
 
       const payloadSessionId = firstString(
+        payloadRecord.current_session_id,
+        payloadRecord.logical_session_id,
         payloadRecord.source_session_id,
         payloadRecord.root_session_id,
         payloadRecord.parent_session_id,
@@ -917,10 +922,7 @@ export function useMessageStream({
 
           // terminal/process tool calls are the only things that spawn or reap
           // background processes — sync the composer status stack right after.
-          if (
-            !sessionInterrupted(sessionId) &&
-            (payload?.name === 'terminal' || payload?.name === 'process')
-          ) {
+          if (!sessionInterrupted(sessionId) && (payload?.name === 'terminal' || payload?.name === 'process')) {
             void refreshBackgroundProcesses(sessionId)
           }
         }
@@ -942,6 +944,19 @@ export function useMessageStream({
             event.type
           )
         }
+      } else if (isLoopagentEventType(event.type)) {
+        const sessionKeys = loopagentSessionKeys(payloadRecord, explicitSid || payloadSessionId)
+
+        if (sessionKeys.length > 0 && payload && !sessionKeys.some(id => sessionInterrupted(id))) {
+          upsertLoopagent(sessionKeys, payloadRecord, event.type)
+        }
+
+        void invalidateLoopSourceFromEvent(queryClient, {
+          activeProfile: normalizeProfileKey($activeGatewayProfile.get()),
+          activeSessionIds: [activeSessionIdRef.current, sessionId, ...sessionKeys],
+          event: payloadRecord as LoopSourceChangedEvent,
+          selectedTaskId: typeof payloadRecord.task_id === 'string' ? payloadRecord.task_id : undefined
+        })
       } else if (isLoopSourceInvalidationEvent(event.type, payload)) {
         void invalidateLoopSourceFromEvent(queryClient, {
           activeProfile: normalizeProfileKey($activeGatewayProfile.get()),

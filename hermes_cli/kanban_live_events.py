@@ -75,6 +75,15 @@ _WORKER_EVENT_BY_TASK_EVENT = {
 }
 
 
+def _event_revision(event_id: Optional[int]) -> Optional[int]:
+    if event_id is None:
+        return None
+    try:
+        return int(event_id)
+    except Exception:
+        return None
+
+
 def _iso(ts: Optional[int | float] = None) -> str:
     if ts is None:
         ts = time.time()
@@ -185,6 +194,311 @@ def _metadata_from_run(run: Any) -> dict:
         return {}
 
 
+def _run_value(run: Any, key: str) -> Any:
+    if not run:
+        return None
+    try:
+        return run[key]
+    except Exception:
+        return getattr(run, key, None)
+
+
+def _worker_session_id(payload: Optional[dict], run: Any = None) -> Optional[str]:
+    value = None
+    if isinstance(payload, dict):
+        value = payload.get("worker_session_id")
+    if not value:
+        value = _metadata_from_run(run).get("worker_session_id")
+    if not value:
+        value = os.environ.get("HERMES_SESSION_ID")
+    if isinstance(value, str) and value.strip():
+        return value.strip()
+    return None
+
+
+def _session_lineage_ids(session_id: Optional[str]) -> list[str]:
+    sid = str(session_id or "").strip()
+    if not sid:
+        return []
+    try:
+        from hermes_state import DEFAULT_DB_PATH, SessionDB
+    except Exception:
+        return [sid]
+    try:
+        if not DEFAULT_DB_PATH.exists():
+            return [sid]
+        db = SessionDB(read_only=True)
+    except Exception:
+        return [sid]
+    try:
+        lineage = db.get_compression_lineage_root_to_tip(sid)
+        return lineage or [sid]
+    except Exception:
+        return [sid]
+    finally:
+        try:
+            db.close()
+        except Exception:
+            pass
+
+
+def _session_identity_payload(source_session_id: Optional[str]) -> dict:
+    lineage = _session_lineage_ids(source_session_id)
+    out: dict[str, Any] = {}
+    if source_session_id:
+        out["source_session_id"] = str(source_session_id)
+    if lineage:
+        out["lineage_session_ids"] = lineage
+        out["logical_session_id"] = lineage[0]
+        out["root_session_id"] = lineage[0]
+        out["current_session_id"] = lineage[-1]
+    return out
+
+
+def _task_session_payload(task: Any) -> dict:
+    source_session_id = getattr(task, "session_id", None) or getattr(task, "tenant", None)
+    return _session_identity_payload(source_session_id)
+
+
+def _publish_session_id(payload: dict) -> Optional[str]:
+    for key in ("current_session_id", "source_session_id", "logical_session_id", "worker_session_id"):
+        value = payload.get(key)
+        if isinstance(value, str) and value.strip():
+            return value.strip()
+    return None
+
+
+def _task_link_payload(conn: Any, task_id: str) -> dict:
+    try:
+        parents = [
+            str(r["parent_id"])
+            for r in conn.execute(
+                "SELECT parent_id FROM task_links WHERE child_id = ? ORDER BY parent_id",
+                (task_id,),
+            )
+        ]
+        children = [
+            str(r["child_id"])
+            for r in conn.execute(
+                "SELECT child_id FROM task_links WHERE parent_id = ? ORDER BY child_id",
+                (task_id,),
+            )
+        ]
+    except Exception:
+        parents = []
+        children = []
+    return {
+        "child_task_ids": children,
+        "is_root_task": len(parents) == 0,
+        "parent_task_ids": parents,
+    }
+
+
+def _task_row_payload(task: Any, *, board: Optional[str]) -> dict:
+    row = {
+        "id": getattr(task, "id", ""),
+        "task_id": getattr(task, "id", ""),
+        "title": getattr(task, "title", ""),
+        "status": getattr(task, "status", ""),
+        "priority": getattr(task, "priority", None),
+        "assignee": getattr(task, "assignee", None),
+        "tenant": getattr(task, "tenant", None),
+        "board": _board_slug(board),
+        "workspace_kind": getattr(task, "workspace_kind", None),
+        "current_run_id": getattr(task, "current_run_id", None),
+        "source_session_id": getattr(task, "session_id", None),
+    }
+    for attr in ("created_at", "started_at", "completed_at", "last_heartbeat_at", "claim_expires"):
+        value = getattr(task, attr, None)
+        if value:
+            row[attr] = _iso(value)
+    if getattr(task, "workspace_path", None):
+        row["workspace_path_preview"] = _cap_text(str(getattr(task, "workspace_path")))
+    if getattr(task, "last_failure_error", None):
+        row["last_failure_error_preview"] = _cap_text(getattr(task, "last_failure_error"), 1000)
+    row.update(_task_session_payload(task))
+    return row
+
+
+def _task_event_payload(
+    *,
+    task_id: str,
+    kind: str,
+    run_id: Optional[int],
+    event_id: Optional[int],
+    created_at: Optional[int],
+) -> dict:
+    out = {
+        "id": _event_revision(event_id),
+        "revision": _event_revision(event_id),
+        "task_id": task_id,
+        "kind": kind,
+        "run_id": int(run_id) if run_id is not None else None,
+        "created_at": _iso(created_at),
+    }
+    return out
+
+
+def _loopagent_task_upsert_payload(
+    conn: Any,
+    task: Any,
+    *,
+    kind: str,
+    payload: Optional[dict],
+    event_id: Optional[int],
+    run_id: Optional[int],
+    board: Optional[str],
+    created_at: Optional[int],
+) -> dict:
+    task_id = getattr(task, "id", "")
+    revision = _event_revision(event_id)
+    # Fetching the run is handled by worker upserts; task upserts stay cheap and
+    # useful for optimistic row updates from any task_events append.
+    out = {
+        "schema_version": _SCHEMA_VERSION,
+        "event": "loopagent.task.upsert",
+        "board": _board_slug(board),
+        "tenant": getattr(task, "tenant", None),
+        "task_id": task_id,
+        "run_id": int(run_id) if run_id is not None else None,
+        "source_session_id": getattr(task, "session_id", None),
+        "worker_session_id": _worker_session_id(payload),
+        "task_title": getattr(task, "title", ""),
+        "task_status": getattr(task, "status", ""),
+        "latest_task_event_id": revision,
+        "latest_task_event_revision": revision,
+        "latest_task_event_kind": kind,
+        "created_at": _iso(created_at),
+        "task": _task_row_payload(task, board=board),
+        "latest_task_event": _task_event_payload(
+            task_id=task_id,
+            kind=kind,
+            run_id=run_id,
+            event_id=event_id,
+            created_at=created_at,
+        ),
+    }
+    out.update(_task_link_payload(conn, task_id))
+    out.update(_task_session_payload(task))
+    return out
+
+
+def _worker_row_payload(
+    task: Any,
+    run: Any,
+    worker_payload: dict,
+    *,
+    board: Optional[str],
+    kind: str,
+    event_id: Optional[int],
+    created_at: Optional[int],
+) -> dict:
+    row = {
+        "task_id": getattr(task, "id", ""),
+        "run_id": worker_payload.get("run_id"),
+        "status": worker_payload.get("run_status") or _run_value(run, "status"),
+        "outcome": worker_payload.get("outcome") or _run_value(run, "outcome"),
+        "profile": worker_payload.get("profile") or _run_value(run, "profile"),
+        "worker_session_id": worker_payload.get("worker_session_id"),
+        "worker_pid": _run_value(run, "worker_pid") or getattr(task, "worker_pid", None),
+        "latest_event_id": _event_revision(event_id),
+        "latest_event_kind": kind,
+        "recent_task_events": [
+            _task_event_payload(
+                task_id=getattr(task, "id", ""),
+                kind=kind,
+                run_id=worker_payload.get("run_id"),
+                event_id=event_id,
+                created_at=created_at,
+            )
+        ],
+    }
+    for src, dest in (
+        ("started_at", "started_at"),
+        ("ended_at", "ended_at"),
+        ("last_heartbeat_at", "last_heartbeat_at"),
+        ("claim_expires", "claim_expires"),
+    ):
+        value = _run_value(run, src)
+        if value:
+            row[dest] = _iso(value)
+    if worker_payload.get("safe_summary"):
+        row["summary_preview"] = worker_payload["safe_summary"]
+    if worker_payload.get("error_preview"):
+        row["error_preview"] = worker_payload["error_preview"]
+    if worker_payload.get("block_reason"):
+        row["block_reason"] = worker_payload["block_reason"]
+    if worker_payload.get("heartbeat_note"):
+        row["heartbeat_note"] = worker_payload["heartbeat_note"]
+    if worker_payload.get("workspace_kind"):
+        row["workspace_kind"] = worker_payload["workspace_kind"]
+    if worker_payload.get("workspace_path_preview"):
+        row["workspace_path_preview"] = worker_payload["workspace_path_preview"]
+    row["board"] = _board_slug(board)
+    return row
+
+
+def _loopagent_worker_upsert_payload(
+    conn: Any,
+    task: Any,
+    *,
+    worker_payload: dict,
+    kind: str,
+    payload: Optional[dict],
+    event_id: Optional[int],
+    run_id: Optional[int],
+    board: Optional[str],
+    created_at: Optional[int],
+) -> dict:
+    revision = _event_revision(event_id)
+    run = _run_for_task(conn, run_id, task)
+    worker_session_id = worker_payload.get("worker_session_id") or _worker_session_id(payload, run)
+    out = {
+        "schema_version": _SCHEMA_VERSION,
+        "event": "loopagent.worker.upsert",
+        "board": _board_slug(board),
+        "tenant": getattr(task, "tenant", None),
+        "task_id": getattr(task, "id", ""),
+        "run_id": int(run_id) if run_id is not None else worker_payload.get("run_id"),
+        "source_session_id": getattr(task, "session_id", None),
+        "worker_session_id": worker_session_id,
+        "task_title": getattr(task, "title", ""),
+        "task_status": getattr(task, "status", ""),
+        "run_status": worker_payload.get("run_status"),
+        "outcome": worker_payload.get("outcome"),
+        "latest_task_event_id": revision,
+        "latest_task_event_revision": revision,
+        "latest_task_event_kind": kind,
+        "created_at": _iso(created_at),
+        "task": _task_row_payload(task, board=board),
+        "worker": _worker_row_payload(
+            task,
+            run,
+            {**worker_payload, "worker_session_id": worker_session_id},
+            board=board,
+            kind=kind,
+            event_id=event_id,
+            created_at=created_at,
+        ),
+    }
+    for key in (
+        "safe_summary",
+        "safe_preview",
+        "error_preview",
+        "block_reason",
+        "heartbeat_note",
+        "review_required",
+        "tests_run",
+        "tests_passed",
+        "changed_files_preview",
+        "artifacts_preview",
+    ):
+        if key in worker_payload:
+            out[key] = worker_payload[key]
+    out.update(_task_session_payload(task))
+    return out
+
+
 def _worker_base_payload(
     conn: Any,
     task: Any,
@@ -274,6 +588,7 @@ def _source_payload(
     session_id = getattr(task, "session_id", None)
     if session_id:
         out["source_session_id"] = session_id
+    out.update(_task_session_payload(task))
     if event_id is not None:
         out["latest_task_event_id"] = int(event_id)
     if run_id is not None:
@@ -392,6 +707,17 @@ def emit_for_task_event(
         source = _source_payload(task_obj, kind=kind, payload=payload, event_id=event_row_id, run_id=run_id, board=board, created_at=created_at)
         if source:
             publish_live_event("loop.source_changed", source, session_id=source.get("source_session_id"))
+            task_upsert = _loopagent_task_upsert_payload(
+                conn,
+                task_obj,
+                kind=kind,
+                payload=payload,
+                event_id=event_row_id,
+                run_id=run_id,
+                board=board,
+                created_at=created_at,
+            )
+            publish_live_event("loopagent.task.upsert", task_upsert, session_id=_publish_session_id(task_upsert))
         worker_event = _WORKER_EVENT_BY_TASK_EVENT.get(kind)
         if worker_event and run_id is not None:
             worker_payload = _terminal_worker_payload(
@@ -406,6 +732,18 @@ def emit_for_task_event(
             )
             if worker_payload.get("run_id") is not None:
                 publish_live_event(worker_event, worker_payload, session_id=worker_payload.get("worker_session_id"))
+                worker_upsert = _loopagent_worker_upsert_payload(
+                    conn,
+                    task_obj,
+                    worker_payload=worker_payload,
+                    kind=kind,
+                    payload=payload,
+                    event_id=event_row_id,
+                    run_id=run_id,
+                    board=board,
+                    created_at=created_at,
+                )
+                publish_live_event("loopagent.worker.upsert", worker_upsert, session_id=_publish_session_id(worker_upsert))
     except Exception:
         return
 
@@ -472,12 +810,23 @@ class KanbanWorkerEventBridge:
             out["worker_session_id"] = self.worker_session_id
         if self.source_session_id:
             out["source_session_id"] = self.source_session_id
+        out.update(_session_identity_payload(self.source_session_id or self.tenant))
         return out
 
     def emit(self, event: str, fields: dict) -> bool:
         payload = self._base(event)
         payload.update(fields)
-        return publish_live_event(event, payload, session_id=self.worker_session_id)
+        delivered = publish_live_event(event, payload, session_id=self.worker_session_id)
+        loopagent_payload = dict(payload)
+        loopagent_payload["event"] = "loopagent.worker.upsert"
+        if loopagent_payload.get("tool_name") and not loopagent_payload.get("current_tool"):
+            loopagent_payload["current_tool"] = loopagent_payload["tool_name"]
+        if loopagent_payload.get("tool_preview") and not loopagent_payload.get("summary_preview"):
+            loopagent_payload["summary_preview"] = loopagent_payload["tool_preview"]
+        if loopagent_payload.get("progress_text") and not loopagent_payload.get("summary_preview"):
+            loopagent_payload["summary_preview"] = loopagent_payload["progress_text"]
+        publish_live_event("loopagent.worker.upsert", loopagent_payload, session_id=_publish_session_id(loopagent_payload))
+        return delivered
 
     def tool_start(self, tool_call_id: str, name: str, args: Optional[dict]) -> bool:
         self._tool_started_at[str(tool_call_id)] = time.monotonic()

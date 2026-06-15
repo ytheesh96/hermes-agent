@@ -3,9 +3,11 @@ import { describe, expect, it } from 'vitest'
 import { gatewayEventRequiresSessionId } from './gateway-events'
 
 describe('gateway event routing', () => {
-  it('drops only unscoped subagent events (genuinely background work)', () => {
+  it('drops only unscoped background agent events', () => {
     expect(gatewayEventRequiresSessionId('subagent.progress')).toBe(true)
     expect(gatewayEventRequiresSessionId('subagent.start')).toBe(true)
+    expect(gatewayEventRequiresSessionId('loopagent.worker.upsert')).toBe(true)
+    expect(gatewayEventRequiresSessionId('loopagent.task.upsert')).toBe(true)
   })
 
   it('attributes unscoped foreground turn events to the active chat', () => {

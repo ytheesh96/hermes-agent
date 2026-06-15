@@ -3,12 +3,14 @@ import { beforeEach, describe, expect, it } from 'vitest'
 import {
   $backgroundStatusBySession,
   $kanbanStatusBySession,
+  $statusItemsBySession,
   dismissBackgroundProcess,
   groupStatusItems,
   reconcileBackgroundProcesses,
   reconcileKanbanSessionSourceForComposer,
   reconcileKanbanSessionSource
 } from './composer-status'
+import { $loopagentsBySession, upsertLoopagent } from './loopagents'
 
 const SID = 'sess-1'
 
@@ -109,16 +111,48 @@ describe('reconcileBackgroundProcesses', () => {
 describe('reconcileKanbanSessionSource', () => {
   beforeEach(() => {
     $kanbanStatusBySession.set({})
+    $loopagentsBySession.set({})
   })
 
   it('shows only the root Kanban task in Tasks and only active/attention children in Subagents', () => {
     reconcileKanbanSessionSource(SID, {
       tasks: [
-        { id: 't_root', status: 'running', title: 'Root Kanban task', included_parent_ids: [], included_child_ids: ['t_running', 't_queued', 't_review', 't_done'] },
-        { id: 't_running', status: 'running', title: 'Running child', included_parent_ids: ['t_root'], included_child_ids: [] },
-        { id: 't_queued', status: 'ready', title: 'Queued child', included_parent_ids: ['t_root'], included_child_ids: [] },
-        { id: 't_review', status: 'blocked', title: 'Review child', latest_summary: 'review-required: needs eyes', included_parent_ids: ['t_root'], included_child_ids: [] },
-        { id: 't_done', status: 'done', title: 'Completed child', included_parent_ids: ['t_root'], included_child_ids: [] }
+        {
+          id: 't_root',
+          status: 'running',
+          title: 'Root Kanban task',
+          included_parent_ids: [],
+          included_child_ids: ['t_running', 't_queued', 't_review', 't_done']
+        },
+        {
+          id: 't_running',
+          status: 'running',
+          title: 'Running child',
+          included_parent_ids: ['t_root'],
+          included_child_ids: []
+        },
+        {
+          id: 't_queued',
+          status: 'ready',
+          title: 'Queued child',
+          included_parent_ids: ['t_root'],
+          included_child_ids: []
+        },
+        {
+          id: 't_review',
+          status: 'blocked',
+          title: 'Review child',
+          latest_summary: 'review-required: needs eyes',
+          included_parent_ids: ['t_root'],
+          included_child_ids: []
+        },
+        {
+          id: 't_done',
+          status: 'done',
+          title: 'Completed child',
+          included_parent_ids: ['t_root'],
+          included_child_ids: []
+        }
       ],
       workers: [
         {
@@ -187,8 +221,72 @@ describe('reconcileKanbanSessionSource', () => {
 
     const bySession = $kanbanStatusBySession.get()
     expect(bySession['compression-root']).toBeUndefined()
-    expect(bySession['runtime-tip']?.map(item => [item.id, item.kanbanTaskId, item.todoStatus, item.currentTool])).toEqual([
-      ['kanban-task:t_root', 't_root', 'completed', 'Loop']
-    ])
+    expect(
+      bySession['runtime-tip']?.map(item => [item.id, item.kanbanTaskId, item.todoStatus, item.currentTool])
+    ).toEqual([['kanban-task:t_root', 't_root', 'completed', 'Loop']])
+  })
+
+  it('projects loopagent events into composer status and dedupes against session-source workers', () => {
+    upsertLoopagent(
+      ['runtime-tip'],
+      {
+        current_tool: 'terminal',
+        event: 'loopagent.worker.upsert',
+        profile: 'peacock',
+        run_id: 7,
+        run_status: 'running',
+        summary_preview: 'patch in progress',
+        task_id: 't_running',
+        task_title: 'Running child',
+        worker_session_id: 'worker-session-7'
+      },
+      'loopagent.worker.upsert'
+    )
+
+    expect(
+      $statusItemsBySession.get()['runtime-tip']?.map(item => [item.id, item.state, item.sessionId, item.currentTool])
+    ).toEqual([['kanban-agent:t_running:7', 'running', 'worker-session-7', 'peacock · Terminal']])
+
+    reconcileKanbanSessionSource('runtime-tip', {
+      workers: [
+        {
+          current_tool: 'terminal',
+          profile: 'peacock',
+          run_id: 7,
+          status: 'running',
+          task_id: 't_running',
+          task_status: 'running',
+          task_title: 'Running child',
+          worker_session_id: 'worker-session-7'
+        }
+      ]
+    })
+
+    expect(
+      $statusItemsBySession.get()['runtime-tip']?.filter(item => item.id === 'kanban-agent:t_running:7')
+    ).toHaveLength(1)
+  })
+
+  it('lets a live loopagent task row override a stale session-source task row', () => {
+    reconcileKanbanSessionSource('runtime-tip', {
+      tasks: [{ id: 't_root', status: 'ready', title: 'Snapshot title', included_parent_ids: [], included_child_ids: [] }]
+    })
+
+    upsertLoopagent(
+      ['runtime-tip'],
+      {
+        event: 'loopagent.task.upsert',
+        is_root_task: true,
+        revision: 3,
+        task_id: 't_root',
+        task_status: 'running',
+        task_title: 'Live title'
+      },
+      'loopagent.task.upsert'
+    )
+
+    expect(
+      $statusItemsBySession.get()['runtime-tip']?.map(item => [item.id, item.title, item.todoStatus, item.currentTool])
+    ).toEqual([['kanban-task:t_root', 'Live title', 'in_progress', 'Loop']])
   })
 })

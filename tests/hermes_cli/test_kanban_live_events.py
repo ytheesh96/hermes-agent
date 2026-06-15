@@ -59,6 +59,40 @@ def test_task_event_append_emits_loop_source_changed_with_identity(kanban_home, 
     assert isinstance(payload["latest_task_event_id"], int)
     assert "body" not in payload
 
+    loopagent_frames = [f for f in frames if f["params"]["type"] == "loopagent.task.upsert"]
+    assert loopagent_frames, "task creation should also push a renderable Loopagent row"
+    loopagent_payload = _event_payload(loopagent_frames[-1])
+    assert loopagent_payload["event"] == "loopagent.task.upsert"
+    assert loopagent_payload["task_id"] == tid
+    assert loopagent_payload["task_title"] == "Loop row"
+    assert loopagent_payload["task_status"] == "ready"
+    assert loopagent_payload["source_session_id"] == "source-session-1"
+    assert loopagent_payload["logical_session_id"] == "source-session-1"
+    assert loopagent_payload["current_session_id"] == "source-session-1"
+    assert loopagent_payload["lineage_session_ids"] == ["source-session-1"]
+    assert loopagent_payload["is_root_task"] is True
+    assert loopagent_payload["parent_task_ids"] == []
+    assert loopagent_payload["latest_task_event_id"] == payload["latest_task_event_id"]
+    assert loopagent_payload["task"]["id"] == tid
+
+    upsert_frames = [f for f in frames if f["params"]["type"] == "loopagent.task.upsert"]
+    assert upsert_frames, "task creation should also publish a row upsert event"
+    upsert = _event_payload(upsert_frames[-1])
+    assert upsert["event"] == "loopagent.task.upsert"
+    assert upsert["tenant"] == "tenant-a"
+    assert upsert["task_id"] == tid
+    assert upsert["source_session_id"] == "source-session-1"
+    assert upsert["task_title"] == "Loop row"
+    assert upsert["task_status"] == "ready"
+    assert upsert["latest_task_event_id"] == payload["latest_task_event_id"]
+    assert upsert["latest_task_event_revision"] == payload["latest_task_event_id"]
+    assert upsert["latest_task_event_kind"] == "created"
+    assert upsert["task"]["id"] == tid
+    assert upsert["task"]["title"] == "Loop row"
+    assert upsert["task"]["status"] == "ready"
+    assert upsert["latest_task_event"]["kind"] == "created"
+    assert "body" not in upsert["task"]
+
 
 def test_worker_terminal_event_emits_namespaced_completion(kanban_home, monkeypatch, all_assignees_spawnable):
     frames = _capture_publishes(monkeypatch)
@@ -94,6 +128,41 @@ def test_worker_terminal_event_emits_namespaced_completion(kanban_home, monkeypa
     assert payload["tests_run"] == 3
     assert payload["tests_passed"] == 3
     assert "metadata" not in payload
+
+    loopagent_frames = [f for f in frames if f["params"]["type"] == "loopagent.worker.upsert"]
+    assert loopagent_frames, "completion should also push a renderable Loopagent worker row"
+    loopagent_payload = _event_payload(loopagent_frames[-1])
+    assert loopagent_payload["event"] == "loopagent.worker.upsert"
+    assert loopagent_payload["task_id"] == tid
+    assert loopagent_payload["run_id"] == run_id
+    assert loopagent_payload["task_title"] == "Ship thing"
+    assert loopagent_payload["task_status"] == "done"
+    assert loopagent_payload["run_status"] == "completed"
+    assert loopagent_payload["worker_session_id"] == "worker-sess-1"
+    assert loopagent_payload["worker"]["task_id"] == tid
+    assert loopagent_payload["worker"]["run_id"] == run_id
+    assert loopagent_payload["worker"]["summary_preview"] == "implemented backend events"
+
+    upsert_frames = [f for f in frames if f["params"]["type"] == "loopagent.worker.upsert"]
+    assert upsert_frames, "completion should also publish a worker row upsert event"
+    upsert = _event_payload(upsert_frames[-1])
+    assert upsert["event"] == "loopagent.worker.upsert"
+    assert upsert["task_id"] == tid
+    assert upsert["run_id"] == run_id
+    assert upsert["worker_session_id"] == "worker-sess-1"
+    assert upsert["task_title"] == "Ship thing"
+    assert upsert["task_status"] == "done"
+    assert upsert["run_status"] == "completed"
+    assert upsert["outcome"] == "completed"
+    assert upsert["latest_task_event_kind"] == "completed"
+    assert upsert["safe_summary"] == "implemented backend events"
+    assert upsert["worker"]["task_id"] == tid
+    assert upsert["worker"]["run_id"] == run_id
+    assert upsert["worker"]["status"] == "completed"
+    assert upsert["worker"]["outcome"] == "completed"
+    assert upsert["worker"]["summary_preview"] == "implemented backend events"
+    assert upsert["worker"]["recent_task_events"][-1]["kind"] == "completed"
+    assert upsert["task"]["status"] == "done"
 
 
 def test_auto_give_up_emits_source_invalidation_and_safe_worker_terminal_event(
@@ -156,6 +225,22 @@ def test_auto_give_up_emits_source_invalidation_and_safe_worker_terminal_event(
     assert raw_sensitive not in worker_payload["error_preview"]
     assert raw_sensitive not in json.dumps(frames)
 
+    task_upsert = _event_payload([f for f in frames if f["params"]["type"] == "loopagent.task.upsert"][-1])
+    assert task_upsert["task_id"] == tid
+    assert task_upsert["run_id"] == run_id
+    assert task_upsert["source_session_id"] == "source-session-1"
+    assert task_upsert["task_status"] == "blocked"
+    assert task_upsert["latest_task_event_kind"] == "gave_up"
+
+    worker_upsert = _event_payload([f for f in frames if f["params"]["type"] == "loopagent.worker.upsert"][-1])
+    assert worker_upsert["task_id"] == tid
+    assert worker_upsert["run_id"] == run_id
+    assert worker_upsert["task_status"] == "blocked"
+    assert worker_upsert["run_status"] == "failed"
+    assert worker_upsert["outcome"] == "gave_up"
+    assert worker_upsert["worker"]["error_preview"]
+    assert raw_sensitive not in json.dumps(worker_upsert)
+
 
 def test_worker_callback_bridge_emits_structured_tool_events(kanban_home, monkeypatch, all_assignees_spawnable):
     frames = _capture_publishes(monkeypatch)
@@ -185,9 +270,18 @@ def test_worker_callback_bridge_emits_structured_tool_events(kanban_home, monkey
     assert "kanban.worker.tool_start" in types
     assert "kanban.worker.tool_progress" in types
     assert "kanban.worker.tool_complete" in types
+    assert "loopagent.worker.upsert" in types
     complete_payload = _event_payload([f for f in frames if f["params"]["type"] == "kanban.worker.tool_complete"][-1])
     assert complete_payload["tool_call_id"] == "call-1"
     assert complete_payload["tool_name"] == "terminal"
     assert complete_payload["exit_code"] == 0
     assert complete_payload["success"] is True
     assert "secret raw output" not in json.dumps(complete_payload)
+
+    loopagent_payload = _event_payload([f for f in frames if f["params"]["type"] == "loopagent.worker.upsert"][-1])
+    assert loopagent_payload["event"] == "loopagent.worker.upsert"
+    assert loopagent_payload["task_id"] == tid
+    assert loopagent_payload["run_id"] == run_id
+    assert loopagent_payload["worker_session_id"] == "worker-sess-1"
+    assert loopagent_payload["current_tool"] == "terminal"
+    assert loopagent_payload["summary_preview"] == "terminal exited 0"

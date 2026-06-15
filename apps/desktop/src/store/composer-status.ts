@@ -4,6 +4,7 @@ import type { LoopWorkerActivity, TenantLoopSource, TenantLoopTask } from '@/app
 import type { TodoItem, TodoStatus } from '@/lib/todos'
 
 import { $gateway } from './gateway'
+import { $loopagentsBySession, type LoopagentActivity } from './loopagents'
 import { $subagentsBySession, type SubagentProgress } from './subagents'
 import { $todosBySession } from './todos'
 
@@ -68,10 +69,21 @@ const todoToItem = (t: TodoItem): ComposerStatusItem => ({
 const ACTIVE_KANBAN_TASK_STATUSES = new Set(['claimed', 'in_progress', 'running'])
 const PENDING_KANBAN_TASK_STATUSES = new Set(['queued', 'ready', 'scheduled', 'todo', 'triage'])
 const DONE_KANBAN_TASK_STATUSES = new Set(['archived', 'cancelled', 'complete', 'completed', 'done'])
-const FAILED_KANBAN_RUN_STATES = new Set(['crashed', 'error', 'failed', 'gave_up', 'interrupted', 'spawn_failed', 'timed_out', 'timeout'])
+const FAILED_KANBAN_RUN_STATES = new Set([
+  'crashed',
+  'error',
+  'failed',
+  'gave_up',
+  'interrupted',
+  'spawn_failed',
+  'timed_out',
+  'timeout'
+])
 
-const normalized = (value: unknown): string => (typeof value === 'string' && value.trim() ? value.trim().toLowerCase().replaceAll('-', '_') : '')
-const textValue = (value: unknown): string | undefined => (typeof value === 'string' && value.trim() ? value.trim() : undefined)
+const normalized = (value: unknown): string =>
+  typeof value === 'string' && value.trim() ? value.trim().toLowerCase().replaceAll('-', '_') : ''
+const textValue = (value: unknown): string | undefined =>
+  typeof value === 'string' && value.trim() ? value.trim() : undefined
 
 const humanToolLabel = (name: string): string =>
   name
@@ -113,7 +125,15 @@ const kanbanTaskToItem = (task: TenantLoopTask): ComposerStatusItem => {
 }
 
 const workerAttentionText = (worker: LoopWorkerActivity): string =>
-  [worker.summary, worker.summary_preview, worker.error, worker.error_preview, worker.outcome, worker.status, worker.task_status]
+  [
+    worker.summary,
+    worker.summary_preview,
+    worker.error,
+    worker.error_preview,
+    worker.outcome,
+    worker.status,
+    worker.task_status
+  ]
     .filter((value): value is string => Boolean(value))
     .join(' ')
     .toLowerCase()
@@ -197,20 +217,133 @@ const kanbanWorkerActivityLabel = (worker: LoopWorkerActivity): string | undefin
   const profile = textValue(worker.profile)
   const currentTool = kanbanWorkerCurrentTool(worker)
 
-  return [profile, currentTool].filter(Boolean).join(' · ') || profile || currentTool || textValue(worker.status) || textValue(worker.outcome)
+  return (
+    [profile, currentTool].filter(Boolean).join(' · ') ||
+    profile ||
+    currentTool ||
+    textValue(worker.status) ||
+    textValue(worker.outcome)
+  )
 }
 
 const kanbanWorkerToItem = (worker: LoopWorkerActivity): ComposerStatusItem => ({
   currentTool: kanbanWorkerActivityLabel(worker),
   id: `kanban-agent:${worker.task_id}:${worker.run_id}`,
   kanbanTaskId: worker.task_id,
-  output: worker.log_tail || worker.summary || worker.summary_preview || worker.error || worker.error_preview || undefined,
+  output:
+    worker.log_tail || worker.summary || worker.summary_preview || worker.error || worker.error_preview || undefined,
   runId: worker.run_id,
   sessionId: worker.worker_session_id || undefined,
   state: kanbanWorkerState(worker),
   title: worker.task_title || worker.task_id,
   type: 'kanban-agent'
 })
+
+const loopagentNeedsForegroundAttention = (agent: LoopagentActivity): boolean => {
+  const status = normalized(agent.status)
+  const taskStatus = normalized(agent.taskStatus)
+  const text = [agent.errorPreview, agent.summaryPreview, agent.sourceEvent, agent.taskStatus]
+    .filter(Boolean)
+    .join(' ')
+    .toLowerCase()
+
+  return (
+    status === 'blocked' ||
+    taskStatus === 'blocked' ||
+    FAILED_KANBAN_RUN_STATES.has(status) ||
+    text.includes('review-required') ||
+    text.includes('review required') ||
+    text.includes('human approval') ||
+    text.includes('needs approval')
+  )
+}
+
+const loopagentIsActive = (agent: LoopagentActivity): boolean => {
+  const status = normalized(agent.status)
+  const taskStatus = normalized(agent.taskStatus)
+
+  return (
+    agent.status === 'queued' ||
+    agent.status === 'running' ||
+    ACTIVE_KANBAN_TASK_STATUSES.has(status) ||
+    ACTIVE_KANBAN_TASK_STATUSES.has(taskStatus)
+  )
+}
+
+const loopagentState = (agent: LoopagentActivity): StatusItemState => {
+  if (loopagentNeedsForegroundAttention(agent)) {
+    return 'failed'
+  }
+
+  if (loopagentIsActive(agent)) {
+    return 'running'
+  }
+
+  return 'done'
+}
+
+const loopagentActivityLabel = (agent: LoopagentActivity): string | undefined => {
+  const profile = textValue(agent.profile)
+  const currentTool = agent.currentTool ? humanToolLabel(agent.currentTool) : undefined
+
+  return (
+    [profile, currentTool].filter(Boolean).join(' · ') ||
+    profile ||
+    currentTool ||
+    textValue(agent.taskStatus) ||
+    agent.status
+  )
+}
+
+const loopagentTaskTodoStatus = (agent: LoopagentActivity): TodoStatus => {
+  const status = normalized(agent.taskStatus || agent.status)
+
+  if (DONE_KANBAN_TASK_STATUSES.has(status)) {
+    return 'completed'
+  }
+
+  if (PENDING_KANBAN_TASK_STATUSES.has(status)) {
+    return 'pending'
+  }
+
+  return 'in_progress'
+}
+
+const loopagentToItem = (agent: LoopagentActivity): ComposerStatusItem => {
+  if (agent.kind === 'task') {
+    const todoStatus = loopagentTaskTodoStatus(agent)
+
+    return {
+      currentTool: 'Loop',
+      id: `kanban-task:${agent.taskId}`,
+      kanbanTaskId: agent.taskId,
+      state: todoStatus === 'completed' ? 'done' : 'running',
+      title: agent.title || agent.taskId,
+      todoStatus,
+      type: 'todo'
+    }
+  }
+
+  return {
+    currentTool: loopagentActivityLabel(agent),
+    id: `kanban-agent:${agent.taskId}:${agent.runId ?? agent.workerSessionId ?? 'activity'}`,
+    kanbanTaskId: agent.taskId,
+    output: agent.errorPreview || agent.summaryPreview,
+    runId: agent.runId,
+    sessionId: agent.workerSessionId,
+    state: loopagentState(agent),
+    title: agent.title || agent.taskId,
+    type: 'kanban-agent'
+  }
+}
+
+const loopagentVisibleInComposer = (agent: LoopagentActivity): boolean => {
+  if (agent.kind === 'task') {
+    return agent.isRootTask !== false
+  }
+
+  return loopagentIsActive(agent) || loopagentNeedsForegroundAttention(agent)
+}
 
 function writeKanbanStatus(sid: string, items: ComposerStatusItem[]) {
   const current = $kanbanStatusBySession.get()
@@ -274,8 +407,8 @@ export function reconcileKanbanSessionSourceForComposer({
 
 // The single thing the stack reads: a typed, merged item list per session.
 export const $statusItemsBySession = computed(
-  [$subagentsBySession, $backgroundStatusBySession, $todosBySession, $kanbanStatusBySession],
-  (subs, background, todos, kanban) => {
+  [$subagentsBySession, $backgroundStatusBySession, $todosBySession, $kanbanStatusBySession, $loopagentsBySession],
+  (subs, background, todos, kanban, loopagents) => {
     const out: Record<string, ComposerStatusItem[]> = {}
 
     const push = (sid: string, items: ComposerStatusItem[]) => {
@@ -288,8 +421,12 @@ export const $statusItemsBySession = computed(
       push(sid, list.map(todoToItem))
     }
 
-    for (const [sid, list] of Object.entries(kanban)) {
-      push(sid, list)
+    for (const sid of new Set([...Object.keys(kanban), ...Object.keys(loopagents)])) {
+      const liveItems = (loopagents[sid] ?? []).filter(loopagentVisibleInComposer).map(loopagentToItem)
+      const liveIds = new Set(liveItems.map(item => item.id))
+      const snapshotItems = (kanban[sid] ?? []).filter(item => !liveIds.has(item.id))
+
+      push(sid, [...snapshotItems, ...liveItems])
     }
 
     for (const [sid, list] of Object.entries(subs)) {
