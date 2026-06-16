@@ -680,7 +680,8 @@ describe('LoopPanel', () => {
     expect(agentTitleSpans.length).toBeGreaterThanOrEqual(agentRows.length)
     for (const titleSpan of agentTitleSpans) {
       expect(titleSpan.className).toContain('w-[18rem]')
-      expect(titleSpan.className).toContain('shrink-0')
+      expect(titleSpan.className).toMatch(/(?:^|\s)shrink(?:\s|$)/)
+      expect(titleSpan.className).not.toContain('shrink-0')
       expect(titleSpan.className).toContain('max-w-[18rem]')
     }
     expect(within(agentsList).getByRole('button', { name: /Active child/i })).toBeTruthy()

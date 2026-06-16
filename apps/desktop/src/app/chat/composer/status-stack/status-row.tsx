@@ -127,7 +127,7 @@ export const StatusItemRow = memo(function StatusItemRow({ item, onDismiss, onOp
       >
         <span
           className={cn(
-            'min-w-0 w-[18rem] shrink-0 max-w-[18rem] truncate text-[0.73rem] leading-4',
+            'min-w-0 w-[18rem] shrink max-w-[18rem] truncate text-[0.73rem] leading-4',
             failed
               ? 'text-destructive/90'
               : item.todoStatus && item.todoStatus !== 'in_progress'
@@ -138,7 +138,7 @@ export const StatusItemRow = memo(function StatusItemRow({ item, onDismiss, onOp
           {item.title}
         </span>
         {(item.type === 'todo' || item.type === 'subagent' || item.type === 'kanban-agent') && item.currentTool && (
-          <span className="shrink-0 truncate text-[0.62rem] leading-4 text-muted-foreground/70">
+          <span className="max-w-[10rem] shrink-0 truncate text-[0.62rem] leading-4 text-muted-foreground/70">
             {toolLabel(item.currentTool)}
           </span>
         )}

@@ -77,4 +77,32 @@ describe('StatusItemRow worker visuals', () => {
 
     expect(screen.queryByText('Loop')).toBeNull()
   })
+
+  it('shrinks long titles before clipping secondary labels', () => {
+    render(
+      <I18nProvider configClient={null}>
+        <StatusItemRow
+          item={{
+            currentTool: 'Reviewer',
+            id: 'kanban-agent:t_loop:9',
+            kanbanTaskId: 't_loop',
+            state: 'done',
+            title: 'Review and verify the Loop draft-root-first implementation handoff behavior',
+            type: 'kanban-agent'
+          }}
+          onOpen={() => undefined}
+        />
+      </I18nProvider>
+    )
+
+    const titleClasses = screen.getByText(
+      'Review and verify the Loop draft-root-first implementation handoff behavior'
+    ).className
+    const secondaryClasses = screen.getByText('Reviewer').className
+
+    expect(titleClasses).toMatch(/(?:^|\s)w-\[18rem\](?:\s|$)/)
+    expect(titleClasses).toMatch(/(?:^|\s)shrink(?:\s|$)/)
+    expect(titleClasses).not.toMatch(/(?:^|\s)shrink-0(?:\s|$)/)
+    expect(secondaryClasses).toMatch(/(?:^|\s)max-w-\[[^\s]+\](?:\s|$)/)
+  })
 })

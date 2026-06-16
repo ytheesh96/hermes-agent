@@ -33,7 +33,7 @@ export function StatusRow({
   return (
     <div
       className={cn(
-        'group/status-row flex min-h-6 items-center gap-2 rounded-md px-1.5 py-1 hover:bg-(--ui-row-hover-background)',
+        'group/status-row flex min-h-6 min-w-0 max-w-full items-center gap-2 overflow-hidden rounded-md px-1.5 py-1 hover:bg-(--ui-row-hover-background)',
         onActivate && 'cursor-pointer',
         className
       )}
