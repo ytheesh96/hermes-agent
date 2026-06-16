@@ -151,6 +151,237 @@ def test_routine_child_completion_records_run_but_no_foreground_handoff(kanban_h
     assert runs[-1].summary == "routine child evidence is stored on the run"
     assert runs[-1].metadata["changed_files"] == ["worker.py"]
 
+
+def test_loop_child_gave_up_creates_one_foreground_attention_handoff(kanban_home, monkeypatch):
+    monkeypatch.setenv("HERMES_KANBAN_BOARD", "default")
+    with kb.connect() as conn:
+        root_id = _loop_node(
+            conn,
+            root_task_id="t_looproot",
+            title="loop root",
+            tenant="tenant-a",
+            session_id="foreground-session",
+        )
+        child_id = _loop_node(
+            conn,
+            root_task_id="t_looproot",
+            title="startup-failing child",
+            parents=(root_id,),
+            tenant="tenant-a",
+        )
+        assert kb.claim_task(conn, root_id, claimer="worker-host:root") is not None
+        assert kb.complete_task(conn, root_id, summary="root released child work")
+        with kb.write_txn(conn):
+            conn.execute("UPDATE tasks SET status = 'ready' WHERE id = ?", (child_id,))
+        assert kb.claim_task(conn, child_id, claimer="worker-host:child") is not None
+
+        tripped = kb._record_task_failure(
+            conn,
+            child_id,
+            "worker exited before lifecycle tool call",
+            outcome="spawn_failed",
+            failure_limit=1,
+            release_claim=True,
+            end_run=True,
+        )
+        duplicate_tick = kb._record_task_failure(
+            conn,
+            child_id,
+            "worker exited before lifecycle tool call",
+            outcome="spawn_failed",
+            failure_limit=1,
+            release_claim=True,
+            end_run=True,
+        )
+
+        handoffs = kb.list_loop_handoffs(conn, task_id=child_id)
+        events = _handoff_events(conn, child_id)
+        task = kb.get_task(conn, child_id)
+
+    assert tripped is True
+    assert duplicate_tick is True
+    assert task is not None
+    assert task.status == "blocked"
+    assert len(handoffs) == 1
+    handoff = handoffs[0]
+    assert handoff["handoff_kind"] == "worker_gave_up"
+    assert handoff["state"] == "queued"
+    assert handoff["root_task_id"] == "t_looproot"
+    assert handoff["task_id"] == child_id
+    assert handoff["tenant"] == "tenant-a"
+    assert handoff["originating_session_id"] == "foreground-session"
+    assert handoff["reason"] == "Loop child task gave up after spawn_failed before completing or blocking."
+    assert handoff["worker_metadata"]["failed_task_id"] == child_id
+    assert handoff["worker_metadata"]["loop_root_task_id"] == "t_looproot"
+    assert handoff["worker_metadata"]["board"] == "default"
+    assert handoff["worker_metadata"]["tenant"] == "tenant-a"
+    assert handoff["worker_metadata"]["originating_session_id"] == "foreground-session"
+    assert handoff["worker_metadata"]["latest_failure"]["trigger_outcome"] == "spawn_failed"
+    assert handoff["worker_metadata"]["latest_failure"]["failures"] == 1
+    assert len(events) == 1
+    assert events[0].payload["handoff_kind"] == "worker_gave_up"
+
+
+def test_loop_child_protocol_violation_retry_then_gave_up_records_one_attention_handoff(
+    kanban_home,
+    monkeypatch,
+):
+    monkeypatch.setenv("HERMES_KANBAN_BOARD", "default")
+    with kb.connect() as conn:
+        root_id = _loop_node(
+            conn,
+            root_task_id="t_looproot",
+            title="loop root",
+            tenant="tenant-a",
+            session_id="foreground-session",
+        )
+        child_id = _loop_node(
+            conn,
+            root_task_id="t_looproot",
+            title="protocol-violating child",
+            parents=(root_id,),
+            tenant="tenant-a",
+        )
+        assert kb.claim_task(conn, root_id, claimer="worker-host:root") is not None
+        assert kb.complete_task(conn, root_id, summary="root released child work")
+        with kb.write_txn(conn):
+            conn.execute("UPDATE tasks SET status = 'ready' WHERE id = ?", (child_id,))
+
+        assert kb.claim_task(conn, child_id, claimer="worker-host:child-1") is not None
+        first_tripped = kb._record_task_failure(
+            conn,
+            child_id,
+            "worker exited before kanban_complete/kanban_block",
+            outcome="protocol_violation",
+            failure_limit=2,
+            release_claim=True,
+            end_run=True,
+            event_payload_extra={"failure_evidence": "missing lifecycle tool call"},
+        )
+        after_first = kb.get_task(conn, child_id)
+        first_events = [event.kind for event in kb.list_events(conn, child_id)]
+
+        assert after_first is not None and after_first.status == "ready"
+        assert first_tripped is False
+        assert "protocol_violation" in first_events
+        assert "gave_up" not in first_events
+        assert kb.list_loop_handoffs(conn, task_id=child_id) == []
+
+        assert kb.claim_task(conn, child_id, claimer="worker-host:child-2") is not None
+        second_tripped = kb._record_task_failure(
+            conn,
+            child_id,
+            "worker exited before kanban_complete/kanban_block",
+            outcome="protocol_violation",
+            failure_limit=2,
+            release_claim=True,
+            end_run=True,
+            event_payload_extra={"failure_evidence": "missing lifecycle tool call"},
+        )
+        duplicate_tick = kb._record_task_failure(
+            conn,
+            child_id,
+            "worker exited before kanban_complete/kanban_block",
+            outcome="protocol_violation",
+            failure_limit=2,
+            release_claim=True,
+            end_run=True,
+            event_payload_extra={"failure_evidence": "missing lifecycle tool call"},
+        )
+
+        runs = kb.list_runs(conn, child_id)
+        gave_up_events = [event for event in kb.list_events(conn, child_id) if event.kind == "gave_up"]
+        handoffs = kb.list_loop_handoffs(conn, task_id=child_id)
+        task = kb.get_task(conn, child_id)
+        proof_packet = kb.build_loop_handoff_proof_packet(conn, handoffs[0]["id"])
+
+    assert second_tripped is True
+    assert duplicate_tick is True
+    assert task is not None and task.status == "blocked"
+    assert [run.outcome for run in runs] == ["protocol_violation", "gave_up"]
+    assert len(gave_up_events) == 2
+    assert len(handoffs) == 1
+    handoff = handoffs[0]
+    assert handoff["handoff_kind"] == "worker_gave_up"
+    assert handoff["root_task_id"] == "t_looproot"
+    assert handoff["task_id"] == child_id
+    assert handoff["tenant"] == "tenant-a"
+    assert handoff["originating_session_id"] == "foreground-session"
+    assert handoff["reason"] == (
+        "Loop child task gave up after protocol_violation before completing or blocking."
+    )
+    metadata = handoff["worker_metadata"]
+    assert metadata["failed_task_id"] == child_id
+    assert metadata["loop_root_task_id"] == "t_looproot"
+    assert metadata["board"] == "default"
+    assert metadata["tenant"] == "tenant-a"
+    assert metadata["originating_session_id"] == "foreground-session"
+    assert metadata["latest_failure"] == {
+        "failures": 2,
+        "effective_limit": 2,
+        "limit_source": "dispatcher",
+        "error": "worker exited before kanban_complete/kanban_block",
+        "trigger_outcome": "protocol_violation",
+        "failure_evidence": "missing lifecycle tool call",
+    }
+    assert proof_packet["worker"]["reason"] == handoff["reason"]
+    assert proof_packet["worker"]["metadata"] == metadata
+    assert proof_packet["evidence"]["verification_state"] == "needs-orchestrator"
+    assert proof_packet["audit_ids"]["source_event_kind"] == "gave_up"
+
+
+def test_non_loop_gave_up_does_not_create_foreground_handoff(kanban_home):
+    with kb.connect() as conn:
+        task_id = kb.create_task(conn, title="plain failing task", assignee="worker")
+        assert kb.claim_task(conn, task_id, claimer="plain:1") is not None
+
+        assert kb._record_task_failure(
+            conn,
+            task_id,
+            "plain worker failed to start",
+            outcome="spawn_failed",
+            failure_limit=1,
+            release_claim=True,
+            end_run=True,
+        )
+
+        assert kb.list_loop_handoffs(conn, task_id=task_id) == []
+        assert _handoff_events(conn, task_id) == []
+
+
+def test_decomposed_loop_children_inherit_root_routing_for_failure_handoff(kanban_home):
+    with kb.connect() as conn:
+        root_id = kb.create_task(
+            conn,
+            title="loop triage root",
+            assignee="decomposer",
+            created_by="loop:t_looproot",
+            tenant="tenant-a",
+            triage=True,
+            session_id="foreground-session",
+        )
+        child_ids = kb.decompose_triage_task(
+            conn,
+            root_id,
+            root_assignee="orchestrator",
+            children=[{"title": "implementation child", "assignee": "worker"}],
+            author="decomposer",
+        )
+        assert isinstance(child_ids, list)
+        child_id = child_ids[0]
+        child = kb.get_task(conn, child_id)
+        created_events = [event for event in kb.list_events(conn, child_id) if event.kind == "created"]
+        assert created_events
+        created_event = created_events[-1]
+        assert created_event.payload is not None
+
+    assert child is not None
+    assert child.created_by == "loop:t_looproot"
+    assert child.session_id == "foreground-session"
+    assert created_event.payload["from_decompose_of"] == root_id
+    assert created_event.payload["loop_root_task_id"] == "t_looproot"
+
+
 def test_blocking_loop_node_emits_pending_foreground_handoff_reason(kanban_home):
     with kb.connect() as conn:
         task_id = _loop_node(conn, title="loop blocker")
