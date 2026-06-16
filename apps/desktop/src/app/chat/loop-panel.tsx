@@ -765,50 +765,10 @@ function LoopRootSpec({ root }: { root: LoopRow }) {
   )
 }
 
-function lineageItems(row: LoopRow): string[] {
-  return [
-    row.sourceSessionId ? `Session: ${row.sourceSessionId}` : '',
-    row.tenant ? `Tenant: ${row.tenant}` : '',
-    row.assignee ? `Assignee: ${row.assignee}` : '',
-    row.workspaceKind ? `Workspace: ${row.workspaceKind}` : '',
-    row.workspacePath || ''
-  ].filter(Boolean)
-}
-
 function workerStatusLine(worker: LoopWorkerActivity): string {
   return [worker.status, worker.profile, worker.worker_pid ? `pid ${worker.worker_pid}` : '']
     .filter(Boolean)
     .join(' · ')
-}
-
-function metadataLines(metadata: unknown): string[] {
-  if (!metadata || typeof metadata !== 'object' || Array.isArray(metadata)) {
-    return []
-  }
-
-  const record = metadata as Record<string, unknown>
-  const lines: string[] = []
-  const changedFiles = Array.isArray(record.changed_files) ? record.changed_files.map(String).filter(Boolean) : []
-  const artifacts = Array.isArray(record.artifacts) ? record.artifacts.map(String).filter(Boolean) : []
-  const verification = Array.isArray(record.verification) ? record.verification : []
-
-  if (changedFiles.length) {
-    lines.push(
-      `Changed files: ${changedFiles.slice(0, 4).join(', ')}${changedFiles.length > 4 ? ` +${changedFiles.length - 4} more` : ''}`
-    )
-  }
-
-  if (artifacts.length) {
-    lines.push(
-      `Artifacts: ${artifacts.slice(0, 3).join(', ')}${artifacts.length > 3 ? ` +${artifacts.length - 3} more` : ''}`
-    )
-  }
-
-  if (verification.length) {
-    lines.push(`Verification: ${verification.length} recorded check${verification.length === 1 ? '' : 's'}`)
-  }
-
-  return lines
 }
 
 const ARTIFACT_SOURCE_FIELDS: {
@@ -1312,67 +1272,6 @@ function LoopArtifactSourceTab({
   )
 }
 
-function EvidenceDetails({ detail, row }: { detail?: LoopTaskDetail | null; row: LoopRow }) {
-  const runs = detail?.runs || []
-  const latestRun = runs.at(-1) || row.latestRun || null
-  const comments = detail?.comments || []
-  const metadata = latestRun?.metadata
-  const metadataSummary = metadataLines(metadata)
-
-  const summary = (() => {
-    const candidate = row.latestSummary || latestRun?.summary
-
-    if (!candidate || candidate === row.workerActivity?.summary || candidate === row.workerActivity?.summary_preview) {
-      return undefined
-    }
-
-    return candidate
-  })()
-
-  const result = row.result || latestRun?.outcome || row.workerActivity?.outcome
-  const error = latestRun?.error || row.workerActivity?.error || row.workerActivity?.error_preview
-
-  if (!summary && !result && !error && metadataSummary.length === 0 && comments.length === 0 && runs.length === 0) {
-    return <EmptyDetail>No structured evidence recorded yet.</EmptyDetail>
-  }
-
-  return (
-    <div className="grid gap-2 text-(--ui-text-secondary)">
-      {summary && <p className="m-0 whitespace-pre-wrap text-[0.72rem] leading-relaxed">{summary}</p>}
-      {result && (
-        <p className="m-0 text-[0.7rem]">
-          <span className="font-medium text-(--ui-text-primary)">Result:</span> {result}
-        </p>
-      )}
-      {error && <p className="m-0 whitespace-pre-wrap text-[0.7rem] text-destructive/90">{error}</p>}
-      {metadataSummary.length > 0 && (
-        <ul className="m-0 grid list-none gap-1 p-0 text-[0.68rem] text-(--ui-text-tertiary)">
-          {metadataSummary.map(line => (
-            <li key={line}>{line}</li>
-          ))}
-        </ul>
-      )}
-      {runs.length > 0 && (
-        <p className="m-0 text-[0.66rem] text-(--ui-text-tertiary)">
-          Run history: {runs.length} recorded run{runs.length === 1 ? '' : 's'}
-        </p>
-      )}
-      {comments.length > 0 && (
-        <div className="grid gap-1">
-          <p className="m-0 text-[0.62rem] font-medium uppercase tracking-wide text-(--ui-text-tertiary)">
-            Recent comments
-          </p>
-          {comments.slice(-3).map((comment, index) => (
-            <p className="m-0 whitespace-pre-wrap text-[0.68rem] text-(--ui-text-secondary)" key={comment.id || index}>
-              {comment.body || 'Empty comment'}
-            </p>
-          ))}
-        </div>
-      )}
-    </div>
-  )
-}
-
 function ReviewDecisionControls({ onTaskAction, row }: { onTaskAction?: (action: LoopTaskAction, row: LoopRow) => void; row: LoopRow }) {
   const unavailable = !onTaskAction
 
@@ -1827,7 +1726,6 @@ function LoopTaskDetails({
   row: LoopRow
   rowById: Map<string, LoopRow>
 }) {
-  const lineage = lineageItems(row)
   const reviewMode = isReviewDecisionRow(row)
 
   return (
@@ -1868,24 +1766,6 @@ function LoopTaskDetails({
 
       <DetailSection title="Description">
         {row.body?.trim() ? <TaskDescription text={row.body} /> : <EmptyDetail>No description provided.</EmptyDetail>}
-      </DetailSection>
-
-      <DetailSection title="Evidence / proof">
-        <EvidenceDetails detail={detail} row={row} />
-      </DetailSection>
-
-      <DetailSection title="Lineage/source">
-        {lineage.length ? (
-          <dl className="m-0 grid gap-1 text-(--ui-text-secondary)">
-            {lineage.map(item => (
-              <div className="break-all" key={item}>
-                {item}
-              </div>
-            ))}
-          </dl>
-        ) : (
-          <EmptyDetail>No lineage or source details available.</EmptyDetail>
-        )}
       </DetailSection>
 
       <LoopTaskAgentsCard onSelectTaskId={onSelectTaskId} row={row} rowById={rowById} />
