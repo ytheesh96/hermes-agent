@@ -143,11 +143,13 @@ export interface TenantLoopTask {
 export interface TenantLoopSource {
   board?: null | string
   external_links?: { child_id?: string; parent_id?: string }[]
+  has_changes_since?: null | boolean
   include_archived?: boolean
   latest_event_id?: number
   lineage_session_ids?: string[]
   links?: { child_id?: string; parent_id?: string }[]
   now?: number
+  root_task_id?: null | string
   session_id?: string
   tasks?: TenantLoopTask[]
   tenant?: null | string
@@ -246,7 +248,16 @@ const ACTIVE_STATUSES = new Set(['ready', 'running', 'claimed', 'in_progress'])
 const RUNNABLE_STATUSES = new Set(['ready', 'running', 'claimed', 'in_progress', 'todo'])
 const WAITING_WORKER_STATUSES = new Set(['queued', 'ready', 'todo'])
 const SUCCESS_RUN_OUTCOMES = new Set(['success', 'succeeded', 'ok'])
-const FAILED_RUN_STATES = new Set(['error', 'failed', 'crashed', 'timed_out', 'timeout', 'interrupted', 'spawn_failed', 'gave_up'])
+const FAILED_RUN_STATES = new Set([
+  'error',
+  'failed',
+  'crashed',
+  'timed_out',
+  'timeout',
+  'interrupted',
+  'spawn_failed',
+  'gave_up'
+])
 const DEFAULT_STALE_HEARTBEAT_SECONDS = 10 * 60
 
 function isRecord(value: unknown): value is Record<string, unknown> {
@@ -314,7 +325,11 @@ function secondsBetween(later: number | null | undefined, earlier: number | null
   return Math.max(0, Math.round(later - earlier))
 }
 
-function loopWorkerState(worker: LoopWorkerActivity, nowSeconds: number, staleHeartbeatSeconds: number): LoopWorkerState {
+function loopWorkerState(
+  worker: LoopWorkerActivity,
+  nowSeconds: number,
+  staleHeartbeatSeconds: number
+): LoopWorkerState {
   const status = normalizedStatus(worker.status)
   const taskStatus = worker.task_status ? normalizedStatus(worker.task_status) : ''
   const outcome = normalizedStatus(worker.outcome)
@@ -444,6 +459,34 @@ function taskChildren(task: TenantLoopTask): string[] {
   return Array.from(new Set([...explicit, ...external]))
 }
 
+function orderedSessionLineageIds(source: TenantLoopSource): string[] {
+  return Array.from(
+    new Set([...(source.lineage_session_ids || []), source.session_id].filter((id): id is string => Boolean(id)))
+  )
+}
+
+export function inferLoopRootTaskIdFromTenantSource(source: TenantLoopSource, tasks: readonly TenantLoopTask[] = source.tasks || []): string {
+  if (source.root_task_id && tasks.some(task => task.id === source.root_task_id)) {
+    return source.root_task_id
+  }
+
+  for (const lineageId of orderedSessionLineageIds(source)) {
+    const anchoredRows = tasks
+      .filter(task => task.id && task.session_id === lineageId)
+      .sort((a, b) => (a.created_at || 0) - (b.created_at || 0))
+
+    if (anchoredRows[0]?.id) {
+      return anchoredRows[0].id
+    }
+  }
+
+  if (source.tenant && tasks.some(task => task.id === source.tenant)) {
+    return source.tenant
+  }
+
+  return source.tenant || source.session_id || source.lineage_session_ids?.[0] || ''
+}
+
 function depthByTaskId(tasks: readonly TenantLoopTask[]): Map<string, number> {
   const depths = new Map<string, number>()
   const taskIds = new Set(tasks.map(task => task.id))
@@ -502,7 +545,11 @@ function latestWorkerForTask(task: TenantLoopTask, workers: readonly LoopWorkerA
   })[0]!
 }
 
-function tenantRowFromTask(task: TenantLoopTask, depths: Map<string, number>, workers: readonly LoopWorkerActivity[] = []): LoopRow {
+function tenantRowFromTask(
+  task: TenantLoopTask,
+  depths: Map<string, number>,
+  workers: readonly LoopWorkerActivity[] = []
+): LoopRow {
   const parents = taskParents(task)
   const children = taskChildren(task)
   const status = normalizedStatus(task.status)
@@ -524,7 +571,8 @@ function tenantRowFromTask(task: TenantLoopTask, depths: Map<string, number>, wo
     externalParentTasks: task.external_parent_tasks || [],
     frontier: unfinishedRunnable,
     latestRun,
-    latestSummary: task.latest_summary || workerActivity?.summary || workerActivity?.summary_preview || latestRun?.summary || null,
+    latestSummary:
+      task.latest_summary || workerActivity?.summary || workerActivity?.summary_preview || latestRun?.summary || null,
     parentCount: parents.length || task.parent_count || task.parents_count || 0,
     parents,
     priority: task.priority,
@@ -541,7 +589,9 @@ function tenantRowFromTask(task: TenantLoopTask, depths: Map<string, number>, wo
   }
 }
 
-export function deriveLoopPanelStateFromTenantSource(source: TenantLoopSource | null | undefined): LoopPanelState | null {
+export function deriveLoopPanelStateFromTenantSource(
+  source: TenantLoopSource | null | undefined
+): LoopPanelState | null {
   if (!source) {
     return null
   }
@@ -552,7 +602,7 @@ export function deriveLoopPanelStateFromTenantSource(source: TenantLoopSource | 
 
   const depths = depthByTaskId(tasks)
   const rows = tasks.map(task => tenantRowFromTask(task, depths, source.workers || []))
-  const rootTaskId = source.tenant || source.session_id || source.lineage_session_ids?.[0] || ''
+  const rootTaskId = inferLoopRootTaskIdFromTenantSource(source, tasks)
 
   return {
     message: '',

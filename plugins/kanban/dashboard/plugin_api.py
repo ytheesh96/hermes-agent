@@ -576,6 +576,7 @@ def _topologically_order_tasks(
     return ordered
 
 
+
 def _latest_runs_for_tasks(
     conn: sqlite3.Connection,
     task_ids: list[str],
@@ -616,6 +617,56 @@ def _latest_event_id_for_tasks(
         tuple(task_ids),
     ).fetchone()
     return int(row["m"] if row else 0)
+
+
+def _session_source_root_task_id(
+    conn: sqlite3.Connection,
+    tasks: list[kanban_db.Task],
+    included_links: list[dict[str, str]],
+) -> Optional[str]:
+    """Infer the real draft root row for a flat session-source payload.
+
+    Decomposition intentionally rewrites the original triage task into a
+    dependency-gated closure row by linking children as parents of the root.
+    In that state topological order starts with a child, and parent absence no
+    longer identifies the root. The decomposed root's own event is the durable
+    source of truth; parentless/single-row fallbacks only cover pre-decompose
+    draft roots and legacy payloads.
+    """
+    if not tasks:
+        return None
+
+    task_ids = [task.id for task in tasks]
+    placeholders = ",".join("?" for _ in task_ids)
+    row = conn.execute(
+        f"""
+        SELECT task_id
+        FROM task_events
+        WHERE task_id IN ({placeholders})
+          AND kind = 'decomposed'
+        ORDER BY created_at DESC, id DESC
+        LIMIT 1
+        """,
+        tuple(task_ids),
+    ).fetchone()
+    if row and row["task_id"]:
+        return str(row["task_id"])
+
+    for task in tasks:
+        if task.created_by == f"loop:{task.id}":
+            return task.id
+
+    parent_counts = {task.id: 0 for task in tasks}
+    for link in included_links:
+        child_id = link.get("child_id")
+        if child_id in parent_counts:
+            parent_counts[child_id] += 1
+
+    parentless = [task.id for task in tasks if parent_counts.get(task.id, 0) == 0]
+    if len(parentless) == 1:
+        return parentless[0]
+
+    return tasks[0].id if len(tasks) == 1 else None
 
 
 def _preview_text(value: Any, *, max_chars: int = 200) -> Optional[str]:
@@ -910,6 +961,7 @@ def get_session_source(
             }
         diagnostics = _compute_task_diagnostics(conn, task_ids=task_ids) if task_ids else {}
 
+        root_task_id = _session_source_root_task_id(conn, tasks, included_links)
         ordered_tasks = _topologically_order_tasks(tasks, included_links)
         payload_tasks: list[dict[str, Any]] = []
         for task in ordered_tasks:
@@ -937,6 +989,7 @@ def get_session_source(
             "board": selected_board,
             "session_id": (session_id or os.environ.get("HERMES_SESSION_ID") or "").strip(),
             "lineage_session_ids": lineage_session_ids,
+            "root_task_id": root_task_id,
             "tenant": explicit_tenant or (inferred_tenants[0] if len(inferred_tenants) == 1 else None),
             "tenants": tenant_filters,
             "include_archived": include_archived,

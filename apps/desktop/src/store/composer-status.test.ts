@@ -7,8 +7,8 @@ import {
   dismissBackgroundProcess,
   groupStatusItems,
   reconcileBackgroundProcesses,
-  reconcileKanbanSessionSourceForComposer,
-  reconcileKanbanSessionSource
+  reconcileKanbanSessionSource,
+  reconcileKanbanSessionSourceForComposer
 } from './composer-status'
 import { $loopagentsBySession, upsertLoopagent } from './loopagents'
 
@@ -208,6 +208,98 @@ describe('reconcileKanbanSessionSource', () => {
     reconcileKanbanSessionSource(SID, null)
 
     expect($kanbanStatusBySession.get()).toEqual({})
+  })
+
+  it('uses the session-anchored root instead of a parentless child for decomposed Loop roots', () => {
+    reconcileKanbanSessionSource(SID, {
+      session_id: SID,
+      tenant: 'tenant-a',
+      tasks: [
+        {
+          id: 't_child',
+          status: 'ready',
+          title: 'Implementation child',
+          included_child_ids: ['t_root'],
+          included_parent_ids: []
+        },
+        {
+          id: 't_root',
+          session_id: SID,
+          status: 'todo',
+          title: 'Original Loop root',
+          included_child_ids: [],
+          included_parent_ids: ['t_child']
+        }
+      ]
+    })
+
+    expect($kanbanStatusBySession.get()[SID]?.map(item => [item.id, item.kanbanTaskId, item.title])).toEqual([
+      ['kanban-task:t_root', 't_root', 'Original Loop root']
+    ])
+  })
+
+  it('keeps explicit root_task_id as the composer root when a newer child has a lineage session', () => {
+    reconcileKanbanSessionSource(SID, {
+      session_id: 'sess-current',
+      lineage_session_ids: ['sess-root', 'sess-current'],
+      root_task_id: 't_root',
+      tenant: 'tenant-a',
+      tasks: [
+        {
+          id: 't_child',
+          session_id: 'sess-current',
+          created_at: 30,
+          status: 'ready',
+          title: 'Newer prerequisite child',
+          included_child_ids: [],
+          included_parent_ids: ['t_root']
+        },
+        {
+          id: 't_root',
+          session_id: 'sess-root',
+          created_at: 10,
+          status: 'todo',
+          title: 'Original Loop root',
+          included_child_ids: ['t_child'],
+          included_parent_ids: []
+        }
+      ]
+    })
+
+    expect($kanbanStatusBySession.get()[SID]?.map(item => [item.id, item.kanbanTaskId, item.title])).toEqual([
+      ['kanban-task:t_root', 't_root', 'Original Loop root']
+    ])
+  })
+
+  it('falls back to the oldest lineage row instead of the newest child for composer roots', () => {
+    reconcileKanbanSessionSource(SID, {
+      session_id: SID,
+      tenant: 'tenant-a',
+      tasks: [
+        {
+          id: 't_child',
+          session_id: SID,
+          created_at: 30,
+          status: 'ready',
+          title: 'Newer prerequisite child',
+          included_child_ids: [],
+          included_parent_ids: ['t_root']
+        },
+        {
+          id: 't_root',
+          session_id: SID,
+          created_at: 10,
+          status: 'todo',
+          title: 'Original Loop root',
+          included_child_ids: ['t_child'],
+          included_parent_ids: []
+        }
+      ]
+    })
+
+    expect($kanbanStatusBySession.get()[SID]?.map(item => [item.id, item.kanbanTaskId, item.title])).toEqual([
+      ['kanban-task:t_root', 't_root', 'Original Loop root']
+    ])
   })
 
   it('writes compressed lineage source under the active composer session key', () => {

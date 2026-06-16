@@ -1,6 +1,6 @@
 import { atom, computed } from 'nanostores'
 
-import type { LoopWorkerActivity, TenantLoopSource, TenantLoopTask } from '@/app/chat/loop-state'
+import { inferLoopRootTaskIdFromTenantSource, type LoopWorkerActivity, type TenantLoopSource, type TenantLoopTask } from '@/app/chat/loop-state'
 import type { TodoItem, TodoStatus } from '@/lib/todos'
 
 import { $gateway } from './gateway'
@@ -370,13 +370,14 @@ export function reconcileKanbanSessionSource(sid: string, source: TenantLoopSour
   }
 
   const visibleTasks = (source.tasks || []).filter(task => task.id && normalized(task.status) !== 'archived')
-  const rootTask = visibleTasks.find(isRootKanbanTask) || visibleTasks[0]
+  const rootTaskId = inferLoopRootTaskIdFromTenantSource(source, visibleTasks)
+  const rootTask = visibleTasks.find(task => task.id === rootTaskId) || visibleTasks.find(isRootKanbanTask) || visibleTasks[0]
   const tasks = rootTask ? [kanbanTaskToItem(rootTask)] : []
 
-  const rootTaskId = rootTask?.id
+  const visibleRootTaskId = rootTask?.id
 
   const agents = (source.workers || [])
-    .filter(worker => worker.task_id && Number.isFinite(worker.run_id) && worker.task_id !== rootTaskId)
+    .filter(worker => worker.task_id && Number.isFinite(worker.run_id) && worker.task_id !== visibleRootTaskId)
     .filter(worker => workerIsActive(worker) || workerNeedsForegroundAttention(worker))
     .map(kanbanWorkerToItem)
 

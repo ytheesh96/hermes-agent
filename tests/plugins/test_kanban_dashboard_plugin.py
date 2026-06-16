@@ -144,6 +144,41 @@ def test_create_task_appears_on_board(client):
     assert "researcher" in data["assignees"]
 
 
+def test_create_task_upserts_triage_draft_root_without_dispatch_run(client):
+    """Draft roots are real triage rows, not dummy containers or dispatched workers."""
+
+    payload = {
+        "title": "Draft Loop root",
+        "body": "Spec before decomposition",
+        "assignee": "orchestrator",
+        "tenant": "draft-root-tenant",
+        "triage": True,
+        "idempotency_key": "draft-root:first",
+    }
+
+    first = client.post("/api/plugins/kanban/tasks", json=payload)
+    second = client.post("/api/plugins/kanban/tasks", json={**payload, "title": "ignored duplicate"})
+
+    assert first.status_code == 200, first.text
+    assert second.status_code == 200, second.text
+    task = first.json()["task"]
+    assert second.json()["task"]["id"] == task["id"]
+    assert task["status"] == "triage"
+    assert task["tenant"] == "draft-root-tenant"
+    assert "warning" not in first.json()
+
+    conn = kb.connect()
+    try:
+        persisted = kb.get_task(conn, task["id"])
+        runs = kb.list_runs(conn, task["id"])
+    finally:
+        conn.close()
+
+    assert persisted is not None
+    assert persisted.status == "triage"
+    assert runs == []
+
+
 def test_scheduled_tasks_have_their_own_column_not_todo(client):
     """Scheduled/time-delay tasks must not be silently bucketed into todo."""
 
@@ -373,6 +408,7 @@ def test_session_source_returns_non_archived_tenant_tasks_across_compression_lin
     assert r.status_code == 200, r.text
     data = r.json()
     assert data["lineage_session_ids"] == ["root-session", "tip-session"]
+    assert data["root_task_id"] == root
     assert [task["id"] for task in data["tasks"]] == [root, child]
     assert {task["id"] for task in data["tasks"]}.isdisjoint({archived, other_tenant})
     assert all(task["is_container"] is False for task in data["tasks"])
@@ -451,6 +487,55 @@ def test_session_source_recovers_tasks_when_lineage_id_is_tenant_key(client, kan
         {scratch, wrong_tenant, archived},
     )
     assert data["links"] == [{"parent_id": parent, "child_id": child}]
+
+
+def test_session_source_reports_decomposed_original_root_task_id(client, kanban_home):
+    """The drawer overview must stay bound to the decomposed root row, not the first child."""
+    from hermes_state import SessionDB
+
+    tenant_root = "tenant-decomposed-root"
+    tip_session = "tenant-decomposed-tip"
+    session_db = SessionDB()
+    try:
+        session_db.create_session(tenant_root, "cli")
+        session_db.end_session(tenant_root, "compression")
+        session_db.create_session(tip_session, "cli", parent_session_id=tenant_root)
+    finally:
+        session_db.close()
+
+    conn = kb.connect()
+    try:
+        root = kb.create_task(
+            conn,
+            title="original draft root",
+            body="living spec body",
+            tenant=tenant_root,
+            triage=True,
+            session_id=None,
+        )
+        child_ids = kb.decompose_triage_task(
+            conn,
+            root,
+            root_assignee="orchestrator",
+            children=[{"title": "implementation child", "assignee": "peacock"}],
+            author="foreground",
+        )
+    finally:
+        conn.close()
+
+    assert child_ids
+
+    r = client.get(
+        "/api/plugins/kanban/session-source",
+        params={"session_id": tip_session},
+    )
+
+    assert r.status_code == 200, r.text
+    data = r.json()
+    assert data["tenant"] == tenant_root
+    assert data["root_task_id"] == root
+    assert [task["id"] for task in data["tasks"]] == [child_ids[0], root]
+    assert data["links"] == [{"parent_id": child_ids[0], "child_id": root}]
 
 
 def test_session_source_falls_back_to_board_containing_lineage_tenant(client, kanban_home):

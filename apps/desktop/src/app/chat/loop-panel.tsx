@@ -23,7 +23,14 @@ import { cn } from '@/lib/utils'
 import type { ComposerStatusItem, StatusItemState } from '@/store/composer-status'
 import type { PreviewTarget } from '@/store/preview'
 
-import type { CompactLoopTask, LoopPanelState, LoopRow, LoopTaskDetail, LoopWorkerActivity, TenantLoopTask } from './loop-state'
+import type {
+  CompactLoopTask,
+  LoopPanelState,
+  LoopRow,
+  LoopTaskDetail,
+  LoopWorkerActivity,
+  TenantLoopTask
+} from './loop-state'
 import { LocalFilePreview } from './right-rail/preview-file'
 
 export type LoopTaskAction =
@@ -66,7 +73,10 @@ const LOOP_PANEL_RESIZE_STEP = 16
 const LOOP_OVERVIEW_TAB_ID = 'loop-overview'
 
 function clampLoopPanelWidth(width: number): number {
-  const viewportMax = typeof window === 'undefined' ? LOOP_PANEL_MAX_WIDTH : Math.max(LOOP_PANEL_MIN_WIDTH, Math.min(LOOP_PANEL_MAX_WIDTH, window.innerWidth * 0.58))
+  const viewportMax =
+    typeof window === 'undefined'
+      ? LOOP_PANEL_MAX_WIDTH
+      : Math.max(LOOP_PANEL_MIN_WIDTH, Math.min(LOOP_PANEL_MAX_WIDTH, window.innerWidth * 0.58))
 
   return Math.min(viewportMax, Math.max(LOOP_PANEL_MIN_WIDTH, Math.round(width)))
 }
@@ -103,7 +113,10 @@ function LoopStatusIndicator({ row }: { row: LoopRow }) {
       role="img"
     >
       {draftStatus ? (
-        <span aria-hidden="true" className="box-border size-[0.7rem] rounded-full border border-dashed border-(--ui-text-tertiary)" />
+        <span
+          aria-hidden="true"
+          className="box-border size-[0.7rem] rounded-full border border-dashed border-(--ui-text-tertiary)"
+        />
       ) : (
         <span aria-hidden="true" className={cn('rounded-full', statusIndicatorClass(row.status))} />
       )}
@@ -186,7 +199,11 @@ function attentionScore(row: LoopRow): number {
 
   if (status === 'blocked') {
     score = 90
-  } else if (FAILED_LOOP_STATUSES.has(status) || FAILED_LOOP_STATUSES.has(runStatus) || FAILED_LOOP_STATUSES.has(runOutcome)) {
+  } else if (
+    FAILED_LOOP_STATUSES.has(status) ||
+    FAILED_LOOP_STATUSES.has(runStatus) ||
+    FAILED_LOOP_STATUSES.has(runOutcome)
+  ) {
     score = 88
   } else if (text.includes('review-required') || text.includes('review required')) {
     score = 82
@@ -215,8 +232,8 @@ function isRootLoopRow(row: LoopRow): boolean {
   return row.parents.length === 0 && row.parentCount === 0
 }
 
-function rootLoopRow(rows: LoopRow[]): LoopRow | null {
-  return rows.find(isRootLoopRow) || rows[0] || null
+function rootLoopRow(rows: LoopRow[], rootTaskId?: string): LoopRow | null {
+  return (rootTaskId ? rows.find(row => row.taskId === rootTaskId) : null) || rows.find(isRootLoopRow) || rows[0] || null
 }
 
 function isDoneLoopRow(row: LoopRow): boolean {
@@ -259,10 +276,10 @@ function rootDescendantRows(state: LoopPanelState, root: LoopRow): LoopRow[] {
   const seen = new Set<string>()
 
   const queue = [
+    ...root.parents,
     ...root.children,
-    ...state.rows
-      .filter(row => row.taskId !== root.taskId && row.parents.includes(root.taskId))
-      .map(row => row.taskId)
+    ...root.parents,
+    ...state.rows.filter(row => row.taskId !== root.taskId && row.parents.includes(root.taskId)).map(row => row.taskId)
   ]
 
   while (queue.length) {
@@ -464,7 +481,13 @@ function LoopAttentionRow({ onSelect, row }: { onSelect: (taskId: string) => voi
   )
 }
 
-function LoopCollapsedAttentionQueue({ onSelectTaskId, rows }: { onSelectTaskId: (taskId: string) => void; rows: LoopRow[] }) {
+function LoopCollapsedAttentionQueue({
+  onSelectTaskId,
+  rows
+}: {
+  onSelectTaskId: (taskId: string) => void
+  rows: LoopRow[]
+}) {
   if (rows.length === 0) {
     return null
   }
@@ -472,7 +495,10 @@ function LoopCollapsedAttentionQueue({ onSelectTaskId, rows }: { onSelectTaskId:
   const visibleRows = rows.slice(0, 3)
 
   return (
-    <div className="grid gap-0.5 rounded-lg border border-amber-500/25 bg-amber-500/8 px-1 py-1" data-testid="loop-attention-queue">
+    <div
+      className="grid gap-0.5 rounded-lg border border-amber-500/25 bg-amber-500/8 px-1 py-1"
+      data-testid="loop-attention-queue"
+    >
       <div className="px-1.5 pb-0.5 text-[0.67rem] font-medium uppercase tracking-wide text-amber-700 dark:text-amber-300">
         {rows.length} need attention
       </div>
@@ -491,7 +517,13 @@ interface LoopTaskStackProps {
   state: LoopPanelState | null
 }
 
-export function LoopTaskStack({ onRefresh, onSelectTaskId, refreshing = false, selectedTaskId, state }: LoopTaskStackProps) {
+export function LoopTaskStack({
+  onRefresh,
+  onSelectTaskId,
+  refreshing = false,
+  selectedTaskId,
+  state
+}: LoopTaskStackProps) {
   const selected = useMemo(() => selectedRowFrom(state, selectedTaskId), [selectedTaskId, state])
   const collapsedAttentionRows = useMemo(() => attentionRows(state?.rows || []), [state])
 
@@ -522,12 +554,7 @@ export function LoopTaskStack({ onRefresh, onSelectTaskId, refreshing = false, s
       label={`Loop ${completedLoopRows(state.rows)}/${state.rows.length}`}
     >
       {state.rows.map(row => (
-        <LoopStackRow
-          key={row.taskId}
-          onSelect={onSelectTaskId}
-          row={row}
-          selected={selected?.taskId === row.taskId}
-        />
+        <LoopStackRow key={row.taskId} onSelect={onSelectTaskId} row={row} selected={selected?.taskId === row.taskId} />
       ))}
     </StatusSection>
   )
@@ -568,7 +595,8 @@ function relationTitle(taskId: string, rowById: Map<string, LoopRow>): string {
   return rowById.get(taskId)?.title || taskId
 }
 
-const INTERNAL_MARKDOWN_FIELD = /^(?:assignee|attachments|children|comments|completed_at|created_at|created_by|current_run_id|current_step_key|diagnostics|events|id|latest_run|latest_summary|links|metadata|parent_count|parents|priority|result|runs|session_id|started_at|status|tenant|warnings|workspace_kind|workspace_path)\s*:/i
+const INTERNAL_MARKDOWN_FIELD =
+  /^(?:assignee|attachments|children|comments|completed_at|created_at|created_by|current_run_id|current_step_key|diagnostics|events|id|latest_run|latest_summary|links|metadata|parent_count|parents|priority|result|runs|session_id|started_at|status|tenant|warnings|workspace_kind|workspace_path)\s*:/i
 
 function cleanTaskMarkdown(text: string): string {
   const lines = text.replaceAll('\r\n', '\n').split('\n')
@@ -709,7 +737,10 @@ function LoopRootActions({
 }
 
 function descriptionHasMarkdown(text: string): boolean {
-  return /(^|\n)\s{0,3}(#{1,6}\s|[-*+]\s|\d+\.\s|```|>\s|\[[^\]]+\]\([^)]+\)|- \[[ xX]\])/m.test(text) || /`[^`]+`/.test(text)
+  return (
+    /(^|\n)\s{0,3}(#{1,6}\s|[-*+]\s|\d+\.\s|```|>\s|\[[^\]]+\]\([^)]+\)|- \[[ xX]\])/m.test(text) ||
+    /`[^`]+`/.test(text)
+  )
 }
 
 function TaskDescription({ text }: { text: string }) {
@@ -745,9 +776,10 @@ function lineageItems(row: LoopRow): string[] {
 }
 
 function workerStatusLine(worker: LoopWorkerActivity): string {
-  return [worker.status, worker.profile, worker.worker_pid ? `pid ${worker.worker_pid}` : ''].filter(Boolean).join(' · ')
+  return [worker.status, worker.profile, worker.worker_pid ? `pid ${worker.worker_pid}` : '']
+    .filter(Boolean)
+    .join(' · ')
 }
-
 
 function metadataLines(metadata: unknown): string[] {
   if (!metadata || typeof metadata !== 'object' || Array.isArray(metadata)) {
@@ -761,11 +793,15 @@ function metadataLines(metadata: unknown): string[] {
   const verification = Array.isArray(record.verification) ? record.verification : []
 
   if (changedFiles.length) {
-    lines.push(`Changed files: ${changedFiles.slice(0, 4).join(', ')}${changedFiles.length > 4 ? ` +${changedFiles.length - 4} more` : ''}`)
+    lines.push(
+      `Changed files: ${changedFiles.slice(0, 4).join(', ')}${changedFiles.length > 4 ? ` +${changedFiles.length - 4} more` : ''}`
+    )
   }
 
   if (artifacts.length) {
-    lines.push(`Artifacts: ${artifacts.slice(0, 3).join(', ')}${artifacts.length > 3 ? ` +${artifacts.length - 3} more` : ''}`)
+    lines.push(
+      `Artifacts: ${artifacts.slice(0, 3).join(', ')}${artifacts.length > 3 ? ` +${artifacts.length - 3} more` : ''}`
+    )
   }
 
   if (verification.length) {
@@ -897,7 +933,7 @@ function artifactSourceMetadataForRow(row: LoopRow, detail?: LoopTaskDetail | nu
   const sources = [
     latestRun?.metadata,
     latestRun !== row.latestRun ? row.latestRun?.metadata : null,
-    ...((row.workerActivity?.recent_task_events || []).map(event => event.payload))
+    ...(row.workerActivity?.recent_task_events || []).map(event => event.payload)
   ]
 
   const nestedMetadata = sources.flatMap(source => {
@@ -1225,7 +1261,11 @@ function LoopArtifactSourceTab({
       >
         <div className="grid gap-2">
           <div className="flex items-center gap-2 font-medium text-(--ui-text-primary)">
-            <Codicon className="shrink-0 text-(--ui-text-tertiary)" name={artifactSourceIcon(tab.entry.kind)} size="0.82rem" />
+            <Codicon
+              className="shrink-0 text-(--ui-text-tertiary)"
+              name={artifactSourceIcon(tab.entry.kind)}
+              size="0.82rem"
+            />
             <h3 className="m-0 min-w-0 truncate text-sm font-semibold text-(--ui-text-primary)">{tab.entry.label}</h3>
           </div>
           <div className="grid gap-1 text-[0.68rem] text-(--ui-text-tertiary)">
@@ -1299,19 +1339,33 @@ function EvidenceDetails({ detail, row }: { detail?: LoopTaskDetail | null; row:
   return (
     <div className="grid gap-2 text-(--ui-text-secondary)">
       {summary && <p className="m-0 whitespace-pre-wrap text-[0.72rem] leading-relaxed">{summary}</p>}
-      {result && <p className="m-0 text-[0.7rem]"><span className="font-medium text-(--ui-text-primary)">Result:</span> {result}</p>}
+      {result && (
+        <p className="m-0 text-[0.7rem]">
+          <span className="font-medium text-(--ui-text-primary)">Result:</span> {result}
+        </p>
+      )}
       {error && <p className="m-0 whitespace-pre-wrap text-[0.7rem] text-destructive/90">{error}</p>}
       {metadataSummary.length > 0 && (
         <ul className="m-0 grid list-none gap-1 p-0 text-[0.68rem] text-(--ui-text-tertiary)">
-          {metadataSummary.map(line => <li key={line}>{line}</li>)}
+          {metadataSummary.map(line => (
+            <li key={line}>{line}</li>
+          ))}
         </ul>
       )}
-      {runs.length > 0 && <p className="m-0 text-[0.66rem] text-(--ui-text-tertiary)">Run history: {runs.length} recorded run{runs.length === 1 ? '' : 's'}</p>}
+      {runs.length > 0 && (
+        <p className="m-0 text-[0.66rem] text-(--ui-text-tertiary)">
+          Run history: {runs.length} recorded run{runs.length === 1 ? '' : 's'}
+        </p>
+      )}
       {comments.length > 0 && (
         <div className="grid gap-1">
-          <p className="m-0 text-[0.62rem] font-medium uppercase tracking-wide text-(--ui-text-tertiary)">Recent comments</p>
+          <p className="m-0 text-[0.62rem] font-medium uppercase tracking-wide text-(--ui-text-tertiary)">
+            Recent comments
+          </p>
           {comments.slice(-3).map((comment, index) => (
-            <p className="m-0 whitespace-pre-wrap text-[0.68rem] text-(--ui-text-secondary)" key={comment.id || index}>{comment.body || 'Empty comment'}</p>
+            <p className="m-0 whitespace-pre-wrap text-[0.68rem] text-(--ui-text-secondary)" key={comment.id || index}>
+              {comment.body || 'Empty comment'}
+            </p>
           ))}
         </div>
       )}
@@ -1325,9 +1379,36 @@ function ReviewDecisionControls({ onTaskAction, row }: { onTaskAction?: (action:
   return (
     <div className="grid gap-2">
       <div className="flex flex-wrap gap-1.5" data-testid="loop-review-decision-controls">
-        <Button aria-label="Accept review" className="h-7 px-2 text-xs" disabled={unavailable} onClick={() => onTaskAction?.('accept-review', row)} type="button" variant="default">Accept</Button>
-        <Button aria-label="Reject review" className="h-7 px-2 text-xs" disabled={unavailable} onClick={() => onTaskAction?.('reject-review', row)} type="button" variant="outline">Reject</Button>
-        <Button aria-label="Escalate review" className="h-7 px-2 text-xs" disabled={unavailable} onClick={() => onTaskAction?.('escalate-review', row)} type="button" variant="outline">Escalate</Button>
+        <Button
+          aria-label="Accept review"
+          className="h-7 px-2 text-xs"
+          disabled={unavailable}
+          onClick={() => onTaskAction?.('accept-review', row)}
+          type="button"
+          variant="default"
+        >
+          Accept
+        </Button>
+        <Button
+          aria-label="Reject review"
+          className="h-7 px-2 text-xs"
+          disabled={unavailable}
+          onClick={() => onTaskAction?.('reject-review', row)}
+          type="button"
+          variant="outline"
+        >
+          Reject
+        </Button>
+        <Button
+          aria-label="Escalate review"
+          className="h-7 px-2 text-xs"
+          disabled={unavailable}
+          onClick={() => onTaskAction?.('escalate-review', row)}
+          type="button"
+          variant="outline"
+        >
+          Escalate
+        </Button>
       </div>
       {unavailable && <EmptyDetail>Review decisions are unavailable until this view is connected to the gateway action handler.</EmptyDetail>}
     </div>
@@ -1354,7 +1435,9 @@ function WorkerActivityDetails({
       <div className="grid gap-1">
         <div className="flex flex-wrap items-center gap-1.5">
           <span className="font-mono text-[0.72rem] text-(--ui-text-primary)">Run #{worker.run_id}</span>
-          {workerStatusLine(worker) ? <span className="text-[0.68rem] text-(--ui-text-tertiary)">{workerStatusLine(worker)}</span> : null}
+          {workerStatusLine(worker) ? (
+            <span className="text-[0.68rem] text-(--ui-text-tertiary)">{workerStatusLine(worker)}</span>
+          ) : null}
         </div>
         {(worker.summary || worker.summary_preview || worker.error || worker.error_preview) && (
           <p className="m-0 whitespace-pre-wrap text-[0.72rem] leading-relaxed">
@@ -1365,7 +1448,11 @@ function WorkerActivityDetails({
 
       <div className="flex flex-wrap gap-1.5">
         <Button
-          aria-label={worker.worker_session_id ? `Open worker session ${worker.worker_session_id}` : `No worker session recorded for run #${worker.run_id}`}
+          aria-label={
+            worker.worker_session_id
+              ? `Open worker session ${worker.worker_session_id}`
+              : `No worker session recorded for run #${worker.run_id}`
+          }
           className="h-7 px-2 text-xs"
           disabled={!onTaskAction || !worker.worker_session_id}
           onClick={() => onTaskAction?.('worker-session', row)}
@@ -1397,16 +1484,21 @@ function WorkerActivityDetails({
       </div>
 
       {worker.log_tail ? (
-        <LogView className="max-h-32">{worker.log_tail}</LogView>
+        <LogView className="min-w-0 max-w-full max-h-32">{worker.log_tail}</LogView>
       ) : worker.log_tail_available ? (
         <EmptyDetail>Worker log exists; open logs to inspect it.</EmptyDetail>
       ) : null}
 
       {recentEvents.length > 0 ? (
         <div className="grid gap-0.5">
-          <p className="m-0 text-[0.62rem] font-medium uppercase tracking-wide text-(--ui-text-tertiary)">Recent events</p>
+          <p className="m-0 text-[0.62rem] font-medium uppercase tracking-wide text-(--ui-text-tertiary)">
+            Recent events
+          </p>
           {recentEvents.slice(-5).map((event, index) => (
-            <p className="m-0 font-mono text-[0.66rem] text-(--ui-text-tertiary)" key={`${event.id || index}:${event.kind}`}>
+            <p
+              className="m-0 font-mono text-[0.66rem] text-(--ui-text-tertiary)"
+              key={`${event.id || index}:${event.kind}`}
+            >
               {event.kind || 'event'}
             </p>
           ))}
@@ -1416,7 +1508,8 @@ function WorkerActivityDetails({
   )
 }
 
-const loopTextValue = (value: unknown): string | undefined => (typeof value === 'string' && value.trim() ? value.trim() : undefined)
+const loopTextValue = (value: unknown): string | undefined =>
+  typeof value === 'string' && value.trim() ? value.trim() : undefined
 
 const loopToolLabel = (name: string): string =>
   name
@@ -1464,7 +1557,8 @@ function loopWorkerCurrentTool(row: LoopRow): string | undefined {
 }
 
 function loopAgentActivityLabel(row: LoopRow): string | undefined {
-  const profile = loopTextValue(row.workerActivity?.profile) || loopTextValue(row.latestRun?.profile) || loopTextValue(row.assignee)
+  const profile =
+    loopTextValue(row.workerActivity?.profile) || loopTextValue(row.latestRun?.profile) || loopTextValue(row.assignee)
   const currentTool = loopWorkerCurrentTool(row)
 
   return [profile, currentTool].filter(Boolean).join(' · ') || profile || currentTool
@@ -1475,7 +1569,12 @@ function loopOverviewItemState(row: LoopRow): StatusItemState {
   const runStatus = normalizedLoopValue(row.latestRun?.status)
   const runOutcome = normalizedLoopValue(row.latestRun?.outcome)
 
-  if (attentionScore(row) > 0 || FAILED_LOOP_STATUSES.has(status) || FAILED_LOOP_STATUSES.has(runStatus) || FAILED_LOOP_STATUSES.has(runOutcome)) {
+  if (
+    attentionScore(row) > 0 ||
+    FAILED_LOOP_STATUSES.has(status) ||
+    FAILED_LOOP_STATUSES.has(runStatus) ||
+    FAILED_LOOP_STATUSES.has(runOutcome)
+  ) {
     return 'failed'
   }
 
@@ -1486,11 +1585,15 @@ function loopOverviewItemState(row: LoopRow): StatusItemState {
   return 'done'
 }
 
-function loopOverviewStatusItem(row: LoopRow): ComposerStatusItem {
+function loopOverviewStatusItem(
+  row: LoopRow,
+  options: { preferAssigneeForQueued?: boolean } = {}
+): ComposerStatusItem {
   const queued = isQueuedLoopRow(row)
+  const activityLabel = loopAgentActivityLabel(row)
 
   return {
-    currentTool: queued ? 'Loop' : loopAgentActivityLabel(row),
+    currentTool: queued && !options.preferAssigneeForQueued ? 'Loop' : activityLabel || (queued ? 'Loop' : undefined),
     id: `kanban-agent:${row.taskId}:${row.workerActivity?.run_id ?? row.latestRun?.id ?? 'overview'}`,
     kanbanTaskId: row.taskId,
     runId: row.workerActivity?.run_id ?? row.latestRun?.id,
@@ -1546,7 +1649,13 @@ function loopRelatedTaskAgentStatusItem(
   rowById: Map<string, LoopRow>
 ): ComposerStatusItem {
   const status = related?.status
-  const activity = loopTextValue(related?.assignee) || (normalizedLoopValue(status) === 'archived' ? 'Archived' : related ? loopTextValue(status) : 'Task details unavailable')
+  const activity =
+    loopTextValue(related?.assignee) ||
+    (normalizedLoopValue(status) === 'archived'
+      ? 'Archived'
+      : related
+        ? loopTextValue(status)
+        : 'Task details unavailable')
 
   return {
     currentTool: loopTaskAgentCurrentTool(relation, activity),
@@ -1558,8 +1667,16 @@ function loopRelatedTaskAgentStatusItem(
   }
 }
 
-function LoopRootAgentsCard({ groups, onOpenTaskTab }: { groups: RootOverviewGroups; onOpenTaskTab?: (row: LoopRow) => void }) {
-  const rows = [...groups.active, ...groups.attention, ...groups.queued, ...groups.completed]
+function LoopRootAgentsCard({
+  groups,
+  onOpenTaskTab,
+  root
+}: {
+  groups: RootOverviewGroups
+  onOpenTaskTab?: (row: LoopRow) => void
+  root: LoopRow
+}) {
+  const rows = [root, ...groups.active, ...groups.attention, ...groups.queued, ...groups.completed]
 
   return (
     <DetailSection testId="loop-root-agents-card" title="Agents">
@@ -1569,7 +1686,7 @@ function LoopRootAgentsCard({ groups, onOpenTaskTab }: { groups: RootOverviewGro
         <div className="flex flex-col gap-0.5" data-testid="loop-root-agents-list">
           {rows.map(row => (
             <StatusItemRow
-              item={loopOverviewStatusItem(row)}
+              item={loopOverviewStatusItem(row, { preferAssigneeForQueued: row.taskId === root.taskId })}
               key={row.taskId}
               onOpen={onOpenTaskTab ? () => onOpenTaskTab(row) : undefined}
             />
@@ -1605,17 +1722,19 @@ function LoopTaskAgentsCard({
 
     const relatedRow = rowById.get(taskId)
 
-    return [{
-      item: relatedRow
-        ? loopTaskAgentStatusItem(relatedRow, relation)
-        : loopRelatedTaskAgentStatusItem(
-            taskId,
-            relatedTaskById(taskId, row.externalChildTasks) || relatedTaskById(taskId, row.externalParentTasks),
-            relation,
-            rowById
-          ),
-      taskId
-    }]
+    return [
+      {
+        item: relatedRow
+          ? loopTaskAgentStatusItem(relatedRow, relation)
+          : loopRelatedTaskAgentStatusItem(
+              taskId,
+              relatedTaskById(taskId, row.externalChildTasks) || relatedTaskById(taskId, row.externalParentTasks),
+              relation,
+              rowById
+            ),
+        taskId
+      }
+    ]
   })
 
   return (
@@ -1680,9 +1799,7 @@ function LoopRootOverview({
 
       <LoopRootSpec root={root} />
 
-      {decomposed ? (
-        <LoopRootAgentsCard groups={groups} onOpenTaskTab={onOpenTaskTab} />
-      ) : null}
+      {decomposed ? <LoopRootAgentsCard groups={groups} onOpenTaskTab={onOpenTaskTab} root={root} /> : null}
 
       <LoopArtifactSourcesCard hideEmpty onOpenArtifactSource={onOpenArtifactTab} rows={artifactSourceRows} />
     </div>
@@ -1729,7 +1846,13 @@ function LoopTaskDetails({
       >
         <div className="grid gap-2">
           {backLabel && onBack && (
-            <Button aria-label={`Back to ${backLabel}`} className="h-7 justify-start px-2 text-xs" onClick={onBack} type="button" variant="ghost">
+            <Button
+              aria-label={`Back to ${backLabel}`}
+              className="h-7 justify-start px-2 text-xs"
+              onClick={onBack}
+              type="button"
+              variant="ghost"
+            >
               Back to {backLabel}
             </Button>
           )}
@@ -1755,7 +1878,9 @@ function LoopTaskDetails({
         {lineage.length ? (
           <dl className="m-0 grid gap-1 text-(--ui-text-secondary)">
             {lineage.map(item => (
-              <div className="break-all" key={item}>{item}</div>
+              <div className="break-all" key={item}>
+                {item}
+              </div>
             ))}
           </dl>
         ) : (
@@ -1770,7 +1895,6 @@ function LoopTaskDetails({
       <DetailSection title="Worker activity">
         <WorkerActivityDetails onTaskAction={onTaskAction} row={row} />
       </DetailSection>
-
     </div>
   )
 }
@@ -1825,7 +1949,12 @@ function LoopPanelTabBar({
 }: LoopPanelTabBarProps) {
   const tabs = [
     { artifactTabId: null, id: LOOP_OVERVIEW_TAB_ID, label: baseLabel, taskId: null },
-    ...taskTabs.map(tab => ({ artifactTabId: null, id: `loop-task:${tab.taskId}`, label: tab.title, taskId: tab.taskId })),
+    ...taskTabs.map(tab => ({
+      artifactTabId: null,
+      id: `loop-task:${tab.taskId}`,
+      label: tab.title,
+      taskId: tab.taskId
+    })),
     ...artifactTabs.map(tab => ({
       artifactTabId: tab.id,
       id: `loop-artifact:${tab.id}`,
@@ -1834,7 +1963,11 @@ function LoopPanelTabBar({
     }))
   ]
 
-  const activeTabId = activeArtifactTabId ? `loop-artifact:${activeArtifactTabId}` : activeTaskTabId ? `loop-task:${activeTaskTabId}` : LOOP_OVERVIEW_TAB_ID
+  const activeTabId = activeArtifactTabId
+    ? `loop-artifact:${activeArtifactTabId}`
+    : activeTaskTabId
+      ? `loop-task:${activeTaskTabId}`
+      : LOOP_OVERVIEW_TAB_ID
   const activeTabRef = useRef<HTMLDivElement | null>(null)
 
   useEffect(() => {
@@ -1869,7 +2002,13 @@ function LoopPanelTabBar({
                   ? 'bg-(--ui-editor-surface-background) text-foreground [--tab-bg:var(--ui-editor-surface-background)]'
                   : 'border-r border-(--ui-stroke-quaternary) text-(--ui-text-tertiary) [--tab-bg:var(--ui-sidebar-surface-background)] hover:bg-(--chrome-action-hover) hover:text-foreground'
               )}
-              data-testid={tab.artifactTabId ? 'loop-artifact-tab' : tab.taskId ? `loop-task-tab-${tab.taskId}` : 'loop-overview-tab'}
+              data-testid={
+                tab.artifactTabId
+                  ? 'loop-artifact-tab'
+                  : tab.taskId
+                    ? `loop-task-tab-${tab.taskId}`
+                    : 'loop-overview-tab'
+              }
               key={tab.id}
               onAuxClick={event => {
                 if (!closeTab || event.button !== 1) {
@@ -1903,7 +2042,9 @@ function LoopPanelTabBar({
                     aria-hidden="true"
                     className={cn(
                       'pointer-events-none absolute inset-y-0 right-0 w-9 bg-[linear-gradient(to_right,transparent,var(--tab-bg)_55%)] transition-opacity',
-                      active ? 'opacity-100' : 'opacity-0 group-hover/tab:opacity-100 group-focus-within/tab:opacity-100'
+                      active
+                        ? 'opacity-100'
+                        : 'opacity-0 group-hover/tab:opacity-100 group-focus-within/tab:opacity-100'
                     )}
                   />
                   <button
@@ -2019,7 +2160,7 @@ export function LoopPanel({
   )
 
   const activeTaskTabRow = useMemo(
-    () => activeTaskTabId ? selectedRowFrom(state, activeTaskTabId, selectedTaskDetail) : null,
+    () => (activeTaskTabId ? selectedRowFrom(state, activeTaskTabId, selectedTaskDetail) : null),
     [activeTaskTabId, selectedTaskDetail, state]
   )
 
@@ -2028,8 +2169,17 @@ export function LoopPanel({
     [activeArtifactTabId, artifactTabs]
   )
 
-  const rootRow = useMemo(() => rootLoopRow(state?.rows || []), [state])
-  const rootOverviewEligible = Boolean(rootRow && (rootRow.children.length > 0 || rootRow.childCount > 0 || normalizedLoopValue(rootRow.status) === 'triage'))
+  const rootRow = useMemo(() => rootLoopRow(state?.rows || [], stateRootTaskId), [state, stateRootTaskId])
+  const rootRowIsAnchored = Boolean(rootRow && stateRootTaskId && rootRow.taskId === stateRootTaskId)
+
+  const rootOverviewEligible = Boolean(
+    rootRow &&
+      (rootRow.children.length > 0 ||
+        rootRow.childCount > 0 ||
+        (rootRowIsAnchored && (rootRow.parents.length > 0 || rootRow.parentCount > 0)) ||
+        normalizedLoopValue(rootRow.status) === 'triage')
+  )
+
   const showingRootOverview = Boolean(rootOverviewEligible && rootRow && (!focusedTaskId || focusedTaskId === rootRow.taskId))
   const renderedTaskId = activeTaskTabId || focusedTaskId
 
@@ -2045,47 +2195,59 @@ export function LoopPanel({
     return map
   }, [renderedTaskId, selectedTaskDetail, state])
 
-  const focusDrawerTask = useCallback((taskId: string) => {
-    setFocusedTaskId(taskId)
-    internalFocusTaskIdRef.current = taskId
+  const focusDrawerTask = useCallback(
+    (taskId: string) => {
+      setFocusedTaskId(taskId)
+      internalFocusTaskIdRef.current = taskId
 
-    if (onFocusTaskId) {
-      onFocusTaskId(taskId)
-    } else {
-      onSelectTaskId?.(taskId)
-    }
-  }, [onFocusTaskId, onSelectTaskId])
+      if (onFocusTaskId) {
+        onFocusTaskId(taskId)
+      } else {
+        onSelectTaskId?.(taskId)
+      }
+    },
+    [onFocusTaskId, onSelectTaskId]
+  )
 
-  const selectRelatedTask = useCallback((taskId: string) => {
-    if (selected && selected.taskId !== taskId) {
-      setNavigationStack(stack => [...stack, selected].slice(-8))
-    }
-
-    focusDrawerTask(taskId)
-  }, [focusDrawerTask, selected])
-
-  const openTaskTab = useCallback((row: LoopRow) => {
-    setTaskTabs(tabs => {
-      const existingIndex = tabs.findIndex(tab => tab.taskId === row.taskId)
-
-      if (existingIndex >= 0) {
-        return tabs.map(tab => tab.taskId === row.taskId ? { ...tab, title: row.title || row.taskId } : tab)
+  const selectRelatedTask = useCallback(
+    (taskId: string) => {
+      if (selected && selected.taskId !== taskId) {
+        setNavigationStack(stack => [...stack, selected].slice(-8))
       }
 
-      return [...tabs, { taskId: row.taskId, title: row.title || row.taskId }]
-    })
-    setActiveTaskTabId(row.taskId)
-    setActiveArtifactTabId(null)
-    setNavigationStack([])
-    focusDrawerTask(row.taskId)
-  }, [focusDrawerTask])
+      focusDrawerTask(taskId)
+    },
+    [focusDrawerTask, selected]
+  )
 
-  const selectTaskTab = useCallback((taskId: string) => {
-    setActiveTaskTabId(taskId)
-    setActiveArtifactTabId(null)
-    setNavigationStack([])
-    focusDrawerTask(taskId)
-  }, [focusDrawerTask])
+  const openTaskTab = useCallback(
+    (row: LoopRow) => {
+      setTaskTabs(tabs => {
+        const existingIndex = tabs.findIndex(tab => tab.taskId === row.taskId)
+
+        if (existingIndex >= 0) {
+          return tabs.map(tab => (tab.taskId === row.taskId ? { ...tab, title: row.title || row.taskId } : tab))
+        }
+
+        return [...tabs, { taskId: row.taskId, title: row.title || row.taskId }]
+      })
+      setActiveTaskTabId(row.taskId)
+      setActiveArtifactTabId(null)
+      setNavigationStack([])
+      focusDrawerTask(row.taskId)
+    },
+    [focusDrawerTask]
+  )
+
+  const selectTaskTab = useCallback(
+    (taskId: string) => {
+      setActiveTaskTabId(taskId)
+      setActiveArtifactTabId(null)
+      setNavigationStack([])
+      focusDrawerTask(taskId)
+    },
+    [focusDrawerTask]
+  )
 
   const selectBaseTab = useCallback(() => {
     setActiveTaskTabId(null)
@@ -2209,38 +2371,41 @@ export function LoopPanel({
     setArtifactTabs(tabs => tabs.map(tab => tab.id === tabId ? { ...tab, view } : tab))
   }, [])
 
-  const closeTaskTab = useCallback((taskId: string) => {
-    const index = taskTabs.findIndex(tab => tab.taskId === taskId)
+  const closeTaskTab = useCallback(
+    (taskId: string) => {
+      const index = taskTabs.findIndex(tab => tab.taskId === taskId)
 
-    if (index < 0) {
-      return
-    }
+      if (index < 0) {
+        return
+      }
 
-    const nextTabs = taskTabs.filter(tab => tab.taskId !== taskId)
-    setTaskTabs(nextTabs)
+      const nextTabs = taskTabs.filter(tab => tab.taskId !== taskId)
+      setTaskTabs(nextTabs)
 
-    if (taskId !== activeTaskTabId) {
-      return
-    }
+      if (taskId !== activeTaskTabId) {
+        return
+      }
 
-    const nextTab = nextTabs[index] || nextTabs[index - 1] || null
-    setNavigationStack([])
+      const nextTab = nextTabs[index] || nextTabs[index - 1] || null
+      setNavigationStack([])
 
-    if (nextTab) {
-      setActiveTaskTabId(nextTab.taskId)
-      focusDrawerTask(nextTab.taskId)
+      if (nextTab) {
+        setActiveTaskTabId(nextTab.taskId)
+        focusDrawerTask(nextTab.taskId)
 
-      return
-    }
+        return
+      }
 
-    setActiveTaskTabId(null)
+      setActiveTaskTabId(null)
 
-    if (rootRow) {
-      focusDrawerTask(rootRow.taskId)
-    } else {
-      setFocusedTaskId(null)
-    }
-  }, [activeTaskTabId, focusDrawerTask, rootRow, taskTabs])
+      if (rootRow) {
+        focusDrawerTask(rootRow.taskId)
+      } else {
+        setFocusedTaskId(null)
+      }
+    },
+    [activeTaskTabId, focusDrawerTask, rootRow, taskTabs]
+  )
 
   const selectArtifactTab = useCallback((tabId: string) => {
     setActiveArtifactTabId(tabId)
@@ -2248,27 +2413,30 @@ export function LoopPanel({
     setNavigationStack([])
   }, [])
 
-  const closeArtifactTab = useCallback((tabId: string) => {
-    const index = artifactTabs.findIndex(tab => tab.id === tabId)
+  const closeArtifactTab = useCallback(
+    (tabId: string) => {
+      const index = artifactTabs.findIndex(tab => tab.id === tabId)
 
-    if (index < 0) {
-      return
-    }
+      if (index < 0) {
+        return
+      }
 
-    const nextTabs = artifactTabs.filter(tab => tab.id !== tabId)
-    setArtifactTabs(nextTabs)
+      const nextTabs = artifactTabs.filter(tab => tab.id !== tabId)
+      setArtifactTabs(nextTabs)
 
-    if (tabId !== activeArtifactTabId) {
-      return
-    }
+      if (tabId !== activeArtifactTabId) {
+        return
+      }
 
-    const nextTab = nextTabs[index] || nextTabs[index - 1] || null
-    setActiveArtifactTabId(nextTab?.id || null)
+      const nextTab = nextTabs[index] || nextTabs[index - 1] || null
+      setActiveArtifactTabId(nextTab?.id || null)
 
-    if (!nextTab && !focusedTaskId && rootRow) {
-      focusDrawerTask(rootRow.taskId)
-    }
-  }, [activeArtifactTabId, artifactTabs, focusDrawerTask, focusedTaskId, rootRow])
+      if (!nextTab && !focusedTaskId && rootRow) {
+        focusDrawerTask(rootRow.taskId)
+      }
+    },
+    [activeArtifactTabId, artifactTabs, focusDrawerTask, focusedTaskId, rootRow]
+  )
 
   const goBack = useCallback(() => {
     const previous = navigationStack.at(-1)
@@ -2284,34 +2452,44 @@ export function LoopPanel({
   const backTarget = navigationStack.at(-1)
 
   const detailBackLabel =
-    backTarget?.taskId === rootRow?.taskId ? 'root overview' : backTarget?.title || (rootRow && focusedTaskId !== rootRow.taskId ? 'root overview' : null)
+    backTarget?.taskId === rootRow?.taskId
+      ? 'root overview'
+      : backTarget?.title || (rootRow && focusedTaskId !== rootRow.taskId ? 'root overview' : null)
 
   const detailBack = detailBackLabel ? goBack : undefined
   const loopTabTitle = rootRow?.title || selected?.title || 'Loop'
-  const baseTabLabel = activeTaskTabId && rootOverviewEligible ? loopTabTitle : showingRootOverview ? loopTabTitle : selected?.title || loopTabTitle
+  const baseTabLabel =
+    activeTaskTabId && rootOverviewEligible
+      ? loopTabTitle
+      : showingRootOverview
+        ? loopTabTitle
+        : selected?.title || loopTabTitle
   const missingTaskId = activeTaskTabId || focusedTaskId
 
-  const startResize = useCallback((event: ReactPointerEvent<HTMLDivElement>) => {
-    if (event.button !== 0) {
-      return
-    }
+  const startResize = useCallback(
+    (event: ReactPointerEvent<HTMLDivElement>) => {
+      if (event.button !== 0) {
+        return
+      }
 
-    event.preventDefault()
-    const startX = event.clientX
-    const startWidth = panelWidth
+      event.preventDefault()
+      const startX = event.clientX
+      const startWidth = panelWidth
 
-    const onPointerMove = (moveEvent: PointerEvent) => {
-      setPanelWidth(clampLoopPanelWidth(startWidth - (moveEvent.clientX - startX)))
-    }
+      const onPointerMove = (moveEvent: PointerEvent) => {
+        setPanelWidth(clampLoopPanelWidth(startWidth - (moveEvent.clientX - startX)))
+      }
 
-    const onPointerUp = () => {
-      document.removeEventListener('pointermove', onPointerMove)
-      document.removeEventListener('pointerup', onPointerUp)
-    }
+      const onPointerUp = () => {
+        document.removeEventListener('pointermove', onPointerMove)
+        document.removeEventListener('pointerup', onPointerUp)
+      }
 
-    document.addEventListener('pointermove', onPointerMove)
-    document.addEventListener('pointerup', onPointerUp, { once: true })
-  }, [panelWidth])
+      document.addEventListener('pointermove', onPointerMove)
+      document.addEventListener('pointerup', onPointerUp, { once: true })
+    },
+    [panelWidth]
+  )
 
   const resizeByKeyboard = useCallback((event: ReactKeyboardEvent<HTMLDivElement>) => {
     if (event.key === 'ArrowLeft') {
@@ -2411,8 +2589,9 @@ export function LoopPanel({
                 <section className="rounded-lg border border-amber-500/30 bg-amber-500/10 p-3 text-xs text-amber-700 dark:text-amber-300">
                   <h3 className="m-0 mb-2 text-xs font-semibold uppercase tracking-wide">Selected task unavailable</h3>
                   <p className="m-0">
-                    Task <span className="font-mono">{activeTaskTabId}</span> is missing from the latest Loop source. It may have been archived,
-                    deleted, or refreshed out of this session lineage. Select another tab or close the panel.
+                    Task <span className="font-mono">{activeTaskTabId}</span> is missing from the latest Loop source. It
+                    may have been archived, deleted, or refreshed out of this session lineage. Select another tab or
+                    close the panel.
                   </p>
                 </section>
               )
@@ -2444,8 +2623,9 @@ export function LoopPanel({
               <section className="rounded-lg border border-amber-500/30 bg-amber-500/10 p-3 text-xs text-amber-700 dark:text-amber-300">
                 <h3 className="m-0 mb-2 text-xs font-semibold uppercase tracking-wide">Selected task unavailable</h3>
                 <p className="m-0">
-                  Task <span className="font-mono">{missingTaskId}</span> is missing from the latest Loop source. It may have been archived,
-                  deleted, or refreshed out of this session lineage. Select another row or close the panel.
+                  Task <span className="font-mono">{missingTaskId}</span> is missing from the latest Loop source. It may
+                  have been archived, deleted, or refreshed out of this session lineage. Select another row or close the
+                  panel.
                 </p>
               </section>
             ) : (
@@ -2457,7 +2637,12 @@ export function LoopPanel({
 
           {enableDebugJson && (
             <div className="mt-3 border-t border-(--ui-stroke-tertiary) pt-3">
-              <Button className="h-7 px-2 text-xs" onClick={() => setDebugOpen(value => !value)} type="button" variant="ghost">
+              <Button
+                className="h-7 px-2 text-xs"
+                onClick={() => setDebugOpen(value => !value)}
+                type="button"
+                variant="ghost"
+              >
                 {debugOpen ? 'Hide debug JSON' : 'Show debug JSON'}
               </Button>
               {debugOpen && (

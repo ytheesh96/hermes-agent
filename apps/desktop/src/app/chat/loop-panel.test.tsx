@@ -13,7 +13,10 @@ vi.mock('./right-rail/preview-file', () => ({
   )
 }))
 
-const toolMessage = (result: unknown, args: Record<string, unknown> = { action: 'read', root_task_id: 't_root' }): ChatMessage => ({
+const toolMessage = (
+  result: unknown,
+  args: Record<string, unknown> = { action: 'read', root_task_id: 't_root' }
+): ChatMessage => ({
   id: `msg-${Math.random()}`,
   role: 'assistant',
   parts: [
@@ -226,6 +229,7 @@ describe('deriveLoopPanelState', () => {
     const state = deriveLoopPanelStateFromTenantSource({
       session_id: 'sess-1',
       lineage_session_ids: ['sess-root', 'sess-1'],
+      root_task_id: 't_parent',
       tenant: 'tenant-a',
       tenants: ['tenant-a'],
       include_archived: false,
@@ -261,7 +265,7 @@ describe('deriveLoopPanelState', () => {
       ]
     })
 
-    expect(state?.rootTaskId).toBe('tenant-a')
+    expect(state?.rootTaskId).toBe('t_parent')
     expect(state?.revision).toBe(42)
     expect(state?.rawJson).toContain('"session_id": "sess-1"')
     expect(state?.rows.map(row => row.taskId)).toEqual(['t_child', 't_parent'])
@@ -278,6 +282,70 @@ describe('deriveLoopPanelState', () => {
       taskId: 't_child',
       title: 'Build child'
     })
+  })
+
+  it('prefers an explicit visible root_task_id over newer lineage session children', () => {
+    const state = deriveLoopPanelStateFromTenantSource({
+      session_id: 'sess-current',
+      lineage_session_ids: ['sess-root', 'sess-current'],
+      root_task_id: 't_root',
+      tenant: 'tenant-a',
+      tasks: [
+        {
+          id: 't_child',
+          session_id: 'sess-current',
+          created_at: 30,
+          title: 'Newer prerequisite child',
+          status: 'ready',
+          tenant: 'tenant-a',
+          included_parent_ids: ['t_root'],
+          included_child_ids: []
+        },
+        {
+          id: 't_root',
+          session_id: 'sess-root',
+          created_at: 10,
+          title: 'Original dependency-gated root',
+          status: 'todo',
+          tenant: 'tenant-a',
+          included_parent_ids: [],
+          included_child_ids: ['t_child']
+        }
+      ]
+    })
+
+    expect(state?.rootTaskId).toBe('t_root')
+  })
+
+  it('keeps legacy lineage fallback anchored to the earliest matching root row', () => {
+    const state = deriveLoopPanelStateFromTenantSource({
+      session_id: 'sess-current',
+      tenant: 'tenant-a',
+      tasks: [
+        {
+          id: 't_child',
+          session_id: 'sess-current',
+          created_at: 30,
+          title: 'Newer prerequisite child',
+          status: 'ready',
+          tenant: 'tenant-a',
+          included_parent_ids: ['t_root'],
+          included_child_ids: []
+        },
+        {
+          id: 't_root',
+          session_id: 'sess-current',
+          created_at: 10,
+          title: 'Original dependency-gated root',
+          status: 'todo',
+          tenant: 'tenant-a',
+          included_parent_ids: [],
+          included_child_ids: ['t_child']
+        }
+      ]
+    })
+
+    expect(state?.rootTaskId).toBe('t_root')
   })
 
   it('caps tenant depth derivation for malformed cyclic links', () => {
@@ -297,6 +365,36 @@ describe('deriveLoopPanelState', () => {
 
     expect(state?.rows[0]?.depth).toBeLessThanOrEqual(1)
     expect(state?.rows[0]?.parents).toEqual(['t_cycle'])
+  })
+
+  it('keeps the explicit real root task id separate from the conceptual tenant key', () => {
+    const state = deriveLoopPanelStateFromTenantSource({
+      session_id: 'sess-root-binding',
+      root_task_id: 't_original_root',
+      tenant: '20260615_170302_e05048',
+      latest_event_id: 9,
+      tasks: [
+        {
+          id: 't_child',
+          title: 'Implementation child',
+          status: 'running',
+          tenant: '20260615_170302_e05048',
+          included_child_ids: ['t_original_root'],
+          included_parent_ids: []
+        },
+        {
+          id: 't_original_root',
+          title: 'Original draft root',
+          body: 'Living root spec',
+          status: 'todo',
+          tenant: '20260615_170302_e05048',
+          included_child_ids: [],
+          included_parent_ids: ['t_child']
+        }
+      ]
+    })
+
+    expect(state?.rootTaskId).toBe('t_original_root')
   })
 
   it('renders the latest triage-backed graph rows in dependency-derived order', () => {
@@ -321,7 +419,12 @@ describe('deriveLoopPanelState', () => {
   it('keeps stale/error tool results visible without adopting giant JSON as rows', () => {
     const state = deriveLoopPanelState([
       toolMessage({ ok: true, root_task_id: 't_root', graph_revision: 7, nodes: [] }),
-      toolMessage({ ok: false, error: 'stale_revision', message: 'expected revision 7, current revision is 8', current_revision: 8 })
+      toolMessage({
+        ok: false,
+        error: 'stale_revision',
+        message: 'expected revision 7, current revision is 8',
+        current_revision: 8
+      })
     ])
 
     expect(state?.status).toBe('stale')
@@ -567,7 +670,19 @@ describe('LoopPanel', () => {
     expect(screen.queryByText('1 completed')).toBeNull()
     const agentsCard = screen.getByTestId('loop-root-agents-card')
     const agentsList = within(agentsCard).getByTestId('loop-root-agents-list')
-    expect(within(agentsCard).getByRole('heading', { name: /Agents/i })).toBeTruthy()
+    expect(within(agentsCard).getByRole('heading', { name: /^Agents$/i })).toBeTruthy()
+    const agentRows = within(agentsList).getAllByRole('button')
+    expect(agentRows[0]?.textContent).toContain('Root Task')
+    expect(agentRows[0]?.textContent).toContain('Foreground')
+    const agentTitleSpans = Array.from(agentsList.querySelectorAll('span')).filter(element =>
+      element.className.includes('text-[0.73rem]')
+    )
+    expect(agentTitleSpans.length).toBeGreaterThanOrEqual(agentRows.length)
+    for (const titleSpan of agentTitleSpans) {
+      expect(titleSpan.className).toContain('w-[18rem]')
+      expect(titleSpan.className).toContain('shrink-0')
+      expect(titleSpan.className).toContain('max-w-[18rem]')
+    }
     expect(within(agentsList).getByRole('button', { name: /Active child/i })).toBeTruthy()
     expect(within(agentsList).getByRole('button', { name: /Review child/i })).toBeTruthy()
     expect(within(agentsList).getByRole('button', { name: /Queued child/i })).toBeTruthy()
@@ -580,7 +695,9 @@ describe('LoopPanel', () => {
     expect(within(screen.getByTestId('loop-root-spec')).getByRole('heading', { name: /Description/i })).toBeTruthy()
     expect(screen.queryByRole('button', { name: /accept review/i })).toBeNull()
 
-    const reviewRow = screen.getAllByRole('button', { name: /Review child/i }).find(element => element.className.includes('group/status-row'))
+    const reviewRow = screen
+      .getAllByRole('button', { name: /Review child/i })
+      .find(element => element.className.includes('group/status-row'))
     expect(reviewRow).toBeTruthy()
     expect(reviewRow!.className).toContain('group/status-row')
 
@@ -604,7 +721,9 @@ describe('LoopPanel', () => {
     fireEvent.click(screen.getByRole('tab', { name: /Root Task/i }))
     expect(screen.getByRole('heading', { name: /Root Task/i })).toBeTruthy()
 
-    const reopenedReviewRow = screen.getAllByRole('button', { name: /Review child/i }).find(element => element.className.includes('group/status-row'))
+    const reopenedReviewRow = screen
+      .getAllByRole('button', { name: /Review child/i })
+      .find(element => element.className.includes('group/status-row'))
     expect(reopenedReviewRow).toBeTruthy()
     fireEvent.click(reopenedReviewRow!)
     fireEvent.click(screen.getByRole('button', { name: /Close Review child/i }))
@@ -650,6 +769,45 @@ describe('LoopPanel', () => {
     expect(onTaskAction).toHaveBeenNthCalledWith(3, 'escalate-review', expect.objectContaining({ taskId: 't_review' }))
   })
 
+  it('keeps a decomposed draft root anchored as the root overview even when children block the root', () => {
+    const state = deriveLoopPanelStateFromTenantSource({
+      session_id: 'sess-decomposed-root',
+      tenant: 'tenant-a',
+      latest_event_id: 406,
+      tasks: [
+        {
+          id: 't_child',
+          title: 'Implementation child',
+          status: 'ready',
+          tenant: 'tenant-a',
+          assignee: 'peacock',
+          included_child_ids: ['t_root'],
+          included_parent_ids: []
+        },
+        {
+          id: 't_root',
+          title: 'Original Loop root',
+          body: 'Approved draft spec',
+          status: 'todo',
+          tenant: 'tenant-a',
+          session_id: 'sess-decomposed-root',
+          assignee: 'orchestrator',
+          included_child_ids: [],
+          included_parent_ids: ['t_child']
+        }
+      ]
+    })
+
+    expect(state?.rootTaskId).toBe('t_root')
+
+    render(<LoopPanel open selectedTaskId="t_root" state={state} />)
+
+    expect(screen.getByRole('heading', { name: /Original Loop root/i })).toBeTruthy()
+    expect(screen.getByTestId('loop-root-agents-card')).toBeTruthy()
+    expect(within(screen.getByTestId('loop-root-agents-card')).getByRole('button', { name: /Implementation child/i })).toBeTruthy()
+    expect(screen.getByTestId('loop-root-spec')).toBeTruthy()
+  })
+
   it('keeps completed roots in overview mode and does not show review controls for non-review blockers', () => {
     const state = deriveLoopPanelStateFromTenantSource({
       session_id: 'sess-option-a-done-root',
@@ -689,6 +847,119 @@ describe('LoopPanel', () => {
     expect(screen.queryByRole('button', { name: /accept review/i })).toBeNull()
     expect(screen.queryByRole('button', { name: /reject review/i })).toBeNull()
     expect(screen.queryByRole('button', { name: /escalate review/i })).toBeNull()
+  })
+
+  it('renders a single draft root as the overview and gates submit through decompose', () => {
+    const state = deriveLoopPanelStateFromTenantSource({
+      session_id: 'sess-draft-root',
+      root_task_id: 't_draft_root',
+      tenant: 'tenant-a',
+      latest_event_id: 500,
+      tasks: [
+        {
+          id: 't_draft_root',
+          title: 'Draft root with no children',
+          body: 'Spec waiting for submit',
+          status: 'triage',
+          tenant: 'tenant-a',
+          included_child_ids: [],
+          included_parent_ids: []
+        }
+      ]
+    })
+    const onTaskAction = vi.fn()
+
+    render(<LoopPanel onTaskAction={onTaskAction} open state={state} />)
+
+    expect(screen.getByRole('heading', { name: /Draft root with no children/i })).toBeTruthy()
+    expect(within(screen.getByTestId('loop-root-spec')).getByText('Spec waiting for submit')).toBeTruthy()
+    expect(screen.queryByTestId('loop-root-agents-card')).toBeNull()
+    expect(screen.queryByTestId('loop-task-card')).toBeNull()
+
+    const submit = screen.getByRole('button', { name: /Submit t_draft_root/i }) as HTMLButtonElement
+    expect(submit.disabled).toBe(false)
+    fireEvent.click(submit)
+    expect(onTaskAction).toHaveBeenCalledWith('decompose', expect.objectContaining({ taskId: 't_draft_root' }))
+  })
+
+  it('defaults the overview to the original root even after decomposition links children before the root', () => {
+    const state = deriveLoopPanelStateFromTenantSource({
+      session_id: 'sess-decomposed-default-root',
+      root_task_id: 't_original_root',
+      tenant: 'tenant-a',
+      latest_event_id: 501,
+      tasks: [
+        {
+          id: 't_child',
+          title: 'Implementation child',
+          status: 'running',
+          tenant: 'tenant-a',
+          included_child_ids: ['t_original_root'],
+          included_parent_ids: []
+        },
+        {
+          id: 't_original_root',
+          title: 'Original draft root',
+          body: 'Living spec after approval',
+          status: 'todo',
+          tenant: 'tenant-a',
+          included_child_ids: [],
+          included_parent_ids: ['t_child']
+        }
+      ]
+    })
+
+    render(<LoopPanel open state={state} />)
+
+    expect(screen.getByRole('heading', { name: /Original draft root/i })).toBeTruthy()
+    expect(within(screen.getByTestId('loop-root-spec')).getByText('Living spec after approval')).toBeTruthy()
+    expect(
+      within(screen.getByTestId('loop-root-agents-card')).getByRole('button', { name: /Implementation child/i })
+    ).toBeTruthy()
+    expect((screen.getByRole('button', { name: /Submit t_original_root/i }) as HTMLButtonElement).disabled).toBe(true)
+    expect(screen.queryByTestId('loop-task-card')).toBeNull()
+  })
+
+  it('anchors the overview to the original root even after decomposition links children before the root', () => {
+    const state = deriveLoopPanelStateFromTenantSource({
+      session_id: 'sess-decomposed-root',
+      root_task_id: 't_original_root',
+      tenant: 'tenant-a',
+      latest_event_id: 502,
+      tasks: [
+        {
+          id: 't_child',
+          title: 'Implementation child',
+          status: 'running',
+          tenant: 'tenant-a',
+          included_child_ids: ['t_original_root'],
+          included_parent_ids: []
+        },
+        {
+          id: 't_original_root',
+          title: 'Original draft root',
+          body: 'Living spec after approval',
+          status: 'todo',
+          tenant: 'tenant-a',
+          included_child_ids: [],
+          included_parent_ids: ['t_child']
+        }
+      ]
+    })
+
+    render(<LoopPanel open selectedTaskId="t_original_root" state={state} />)
+
+    expect(screen.getByRole('heading', { name: /Original draft root/i })).toBeTruthy()
+    expect(within(screen.getByTestId('loop-root-spec')).getByText('Living spec after approval')).toBeTruthy()
+    expect(screen.getByRole('button', { name: /Submit t_original_root/i })).toBeTruthy()
+    expect(screen.queryByTestId('loop-task-card')).toBeNull()
+    expect(
+      within(screen.getByTestId('loop-root-agents-card')).getByRole('button', { name: /Implementation child/i })
+    ).toBeTruthy()
+
+    fireEvent.click(screen.getByRole('button', { name: /Implementation child/i }))
+    expect(screen.getByRole('heading', { name: /Implementation child/i })).toBeTruthy()
+    expect(screen.getByTestId('loop-task-card')).toBeTruthy()
   })
 
   it('renders worker activity links, run details, and log tails in the task drawer', () => {
@@ -830,7 +1101,9 @@ describe('LoopPanel', () => {
 
     fireEvent.click(screen.getByRole('tab', { name: /Build artifact drawer/i }))
     const reopenedCard = screen.getByTestId('loop-artifact-sources-card')
-    fireEvent.click(within(reopenedCard).getByRole('button', { name: /open changed file src\/app\/chat\/loop-panel\.tsx/i }))
+    fireEvent.click(
+      within(reopenedCard).getByRole('button', { name: /open changed file src\/app\/chat\/loop-panel\.tsx/i })
+    )
     expect((await screen.findByRole('tab', { name: /loop-panel\.tsx/i })).getAttribute('aria-selected')).toBe('true')
     artifactTab = screen.getByTestId('loop-artifact-source-tab')
     expect(within(artifactTab).getByText('loop-panel.tsx')).toBeTruthy()
@@ -1070,7 +1343,13 @@ describe('LoopPanel', () => {
         <>
           <LoopTaskStack onSelectTaskId={selectTask} selectedTaskId={selectedTaskId} state={state} />
           {panelOpen && (
-            <LoopPanel onSelectTaskId={selectTask} onTaskAction={onTaskAction} open={panelOpen} selectedTaskId={selectedTaskId} state={state} />
+            <LoopPanel
+              onSelectTaskId={selectTask}
+              onTaskAction={onTaskAction}
+              open={panelOpen}
+              selectedTaskId={selectedTaskId}
+              state={state}
+            />
           )}
         </>
       )
@@ -1195,7 +1474,9 @@ describe('LoopPanel', () => {
     fireEvent.click(within(screen.getByTestId('loop-task-agents-card')).getByRole('button', { name: /Review child/i }))
     expect(screen.getByRole('heading', { name: /Review child/i })).toBeTruthy()
     expect(screen.getByText('No description provided.')).toBeTruthy()
-    expect(within(screen.getByTestId('loop-task-agents-card')).getByRole('button', { name: /Build child/i })).toBeTruthy()
+    expect(
+      within(screen.getByTestId('loop-task-agents-card')).getByRole('button', { name: /Build child/i })
+    ).toBeTruthy()
 
     fireEvent.click(screen.getByRole('button', { name: /Status: ready Loose task/i }))
     expect(screen.getByRole('heading', { name: /Loose task/i })).toBeTruthy()
@@ -1231,14 +1512,18 @@ describe('LoopPanel', () => {
     render(<DetailFetchHarness state={state} />)
 
     expect(screen.getByRole('heading', { name: /Build child/i })).toBeTruthy()
-    expect(within(screen.getByTestId('loop-task-agents-card')).getByText('Blocked by · Task details unavailable')).toBeTruthy()
+    expect(
+      within(screen.getByTestId('loop-task-agents-card')).getByText('Blocked by · Task details unavailable')
+    ).toBeTruthy()
 
     fireEvent.click(within(screen.getByTestId('loop-task-agents-card')).getByRole('button', { name: /t_external/i }))
 
     expect(screen.getByRole('heading', { name: /External parent/i })).toBeTruthy()
     expect(screen.getByText('Fetched external body')).toBeTruthy()
     expect(screen.getAllByText('t_external').length).toBeGreaterThan(0)
-    expect(within(screen.getByTestId('loop-task-agents-card')).getByRole('button', { name: /Build child/i })).toBeTruthy()
+    expect(
+      within(screen.getByTestId('loop-task-agents-card')).getByRole('button', { name: /Build child/i })
+    ).toBeTruthy()
     expect(screen.queryByText(/Run #2 · running · new-worker/)).toBeNull()
     expect(screen.queryByText('oldest run')).toBeNull()
   })
@@ -1321,11 +1606,17 @@ describe('LoopPanel', () => {
 
     fireEvent.click(screen.getByRole('button', { name: /Status: blocked Blocked implementation/i }))
     expect(screen.getByRole('heading', { name: /Blocked implementation/i })).toBeTruthy()
-    expect(within(screen.getByTestId('loop-task-agents-card')).getByText('Blocked by · Task details unavailable')).toBeTruthy()
+    expect(
+      within(screen.getByTestId('loop-task-agents-card')).getByText('Blocked by · Task details unavailable')
+    ).toBeTruthy()
     expect(within(screen.getByTestId('loop-task-agents-card')).getByText('Blocked by · Archived')).toBeTruthy()
-    expect(within(screen.getByTestId('loop-task-agents-card')).getByRole('button', { name: /Archived blocker/i })).toBeTruthy()
+    expect(
+      within(screen.getByTestId('loop-task-agents-card')).getByRole('button', { name: /Archived blocker/i })
+    ).toBeTruthy()
 
-    fireEvent.click(within(screen.getByTestId('loop-task-agents-card')).getByRole('button', { name: /Available prerequisite/i }))
+    fireEvent.click(
+      within(screen.getByTestId('loop-task-agents-card')).getByRole('button', { name: /Available prerequisite/i })
+    )
     expect(screen.getByRole('heading', { name: /Available prerequisite/i })).toBeTruthy()
     const blockedRows = screen.getAllByRole('button', { name: /Blocked implementation/i })
     expect(blockedRows.length).toBeGreaterThan(0)
@@ -1341,7 +1632,9 @@ describe('LoopPanel', () => {
     const state = actionState()
     const onTaskAction = vi.fn()
     const onRefresh = vi.fn()
-    const { rerender } = render(<LoopPanel onRefresh={onRefresh} onTaskAction={onTaskAction} open selectedTaskId="t_triage" state={state} />)
+    const { rerender } = render(
+      <LoopPanel onRefresh={onRefresh} onTaskAction={onTaskAction} open selectedTaskId="t_triage" state={state} />
+    )
 
     expect(onTaskAction).not.toHaveBeenCalled()
     const rootCard = screen.getByTestId('loop-root-card')
@@ -1373,7 +1666,9 @@ describe('LoopPanel', () => {
     fireEvent.click(within(rootActions).getByRole('button', { name: /ask hermes about t_triage/i }))
     expect(onTaskAction).toHaveBeenCalledWith('ask-hermes', expect.objectContaining({ taskId: 't_triage' }))
 
-    rerender(<LoopPanel onRefresh={onRefresh} onTaskAction={onTaskAction} open selectedTaskId="t_blocked" state={state} />)
+    rerender(
+      <LoopPanel onRefresh={onRefresh} onTaskAction={onTaskAction} open selectedTaskId="t_blocked" state={state} />
+    )
     expect(screen.queryByTestId('loop-root-actions')).toBeNull()
     expect(screen.queryByRole('button', { name: /unblock t_blocked/i })).toBeNull()
     expect(screen.queryByRole('button', { name: /park t_blocked/i })).toBeNull()
