@@ -351,11 +351,11 @@ export function updateLoopTaskStatus(
   taskId: string,
   status: string,
   profile?: string | null,
-  options?: { blockReason?: string }
+  options?: { blockReason?: string; board?: null | string }
 ): Promise<{ task: TenantLoopSource['tasks'] extends (infer T)[] | undefined ? T | null : unknown }> {
   return window.hermesDesktop.api({
     ...(profile ? { profile } : profileScoped()),
-    path: `/api/plugins/kanban/tasks/${encodeURIComponent(taskId)}`,
+    path: `/api/plugins/kanban/tasks/${encodeURIComponent(taskId)}${kanbanBoardQuery(options?.board)}`,
     method: 'PATCH',
     body: {
       status,
@@ -485,11 +485,11 @@ export interface LoopTaskDecomposeResult {
 export function decomposeLoopTask(
   taskId: string,
   profile?: string | null,
-  options: { approveIntake?: boolean } = {}
+  options: { approveIntake?: boolean; board?: null | string } = {}
 ): Promise<LoopTaskDecomposeResult> {
   return window.hermesDesktop.api<LoopTaskDecomposeResult>({
     ...(profile ? { profile } : profileScoped()),
-    path: `/api/plugins/kanban/tasks/${encodeURIComponent(taskId)}/decompose`,
+    path: `/api/plugins/kanban/tasks/${encodeURIComponent(taskId)}/decompose${kanbanBoardQuery(options.board)}`,
     method: 'POST',
     body: options.approveIntake ? { approve_intake: true } : {},
     timeoutMs: 10 * 60_000

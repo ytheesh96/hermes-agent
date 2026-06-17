@@ -123,7 +123,10 @@ describe('Hermes REST session helpers', () => {
   it('patches Loop task status actions through the profile-scoped kanban API', async () => {
     api.mockResolvedValue({ task: null })
 
-    await updateLoopTaskStatus('t_blocked', 'blocked', 'peacock', { blockReason: 'Blocked from Loop side panel' })
+    await updateLoopTaskStatus('t_blocked', 'blocked', 'peacock', {
+      blockReason: 'Blocked from Loop side panel',
+      board: 'developer'
+    })
 
     expect(api).toHaveBeenCalledWith({
       body: {
@@ -131,7 +134,7 @@ describe('Hermes REST session helpers', () => {
         status: 'blocked'
       },
       method: 'PATCH',
-      path: '/api/plugins/kanban/tasks/t_blocked',
+      path: '/api/plugins/kanban/tasks/t_blocked?board=developer',
       profile: 'peacock'
     })
   })
@@ -139,12 +142,12 @@ describe('Hermes REST session helpers', () => {
   it('decomposes Loop root tasks through the profile-scoped kanban API', async () => {
     api.mockResolvedValue({ child_ids: [], fanout: false, ok: true, task_id: 't_root' })
 
-    await decomposeLoopTask('t_root', 'peacock')
+    await decomposeLoopTask('t_root', 'peacock', { board: 'developer' })
 
     expect(api).toHaveBeenCalledWith({
       body: {},
       method: 'POST',
-      path: '/api/plugins/kanban/tasks/t_root/decompose',
+      path: '/api/plugins/kanban/tasks/t_root/decompose?board=developer',
       profile: 'peacock',
       timeoutMs: 600_000
     })
@@ -153,12 +156,12 @@ describe('Hermes REST session helpers', () => {
   it('marks Loop intake approval when Submit decomposes a clarified draft', async () => {
     api.mockResolvedValue({ child_ids: [], fanout: false, ok: true, task_id: 't_root' })
 
-    await decomposeLoopTask('t_root', 'peacock', { approveIntake: true })
+    await decomposeLoopTask('t_root', 'peacock', { approveIntake: true, board: 'developer' })
 
     expect(api).toHaveBeenCalledWith({
       body: { approve_intake: true },
       method: 'POST',
-      path: '/api/plugins/kanban/tasks/t_root/decompose',
+      path: '/api/plugins/kanban/tasks/t_root/decompose?board=developer',
       profile: 'peacock',
       timeoutMs: 600_000
     })

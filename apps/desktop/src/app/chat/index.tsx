@@ -20,7 +20,6 @@ import {
   decomposeLoopTask,
   getGlobalModelOptions,
   getLoopSessionSource,
-  getLoopTaskComments,
   getLoopTaskDetail,
   type HermesGateway,
   reviewLoopHandoffForTask,
@@ -474,19 +473,6 @@ export function ChatView({
     staleTime: 2_000
   })
 
-  const selectedLoopTaskCommentsQuery = useQuery({
-    queryKey: [
-      'loop-task-comments',
-      activeGatewayProfile,
-      loopSourceBoard,
-      focusedLoopTaskId,
-      loopPanelState?.revision || 0
-    ],
-    queryFn: () => getLoopTaskComments(focusedLoopTaskId!, activeGatewayProfile, loopSourceBoard),
-    enabled: gatewayOpen && loopPanelOpen && Boolean(focusedLoopTaskId) && Boolean(tenantLoopPanelState?.rows.length),
-    staleTime: 2_000
-  })
-
   const selectedLoopTaskDetailError = selectedLoopTaskDetailQuery.error
     ? selectedLoopTaskDetailQuery.error instanceof Error
       ? selectedLoopTaskDetailQuery.error.message
@@ -501,14 +487,14 @@ export function ChatView({
         queryKey: ['loop-session-source', activeGatewayProfile, loopSourceSessionId]
       })
       await queryClient.invalidateQueries({ queryKey: ['loop-task-detail', activeGatewayProfile] })
-      await queryClient.invalidateQueries({ queryKey: ['loop-task-comments', activeGatewayProfile] })
     }
   })
 
   const loopTaskStatusMutation = useMutation({
     mutationFn: ({ status, taskId }: { status: string; taskId: string }) =>
       updateLoopTaskStatus(taskId, status, activeGatewayProfile, {
-        blockReason: status === 'blocked' ? 'Blocked from Loop side panel' : undefined
+        blockReason: status === 'blocked' ? 'Blocked from Loop side panel' : undefined,
+        board: loopSourceBoard
       }),
     onSuccess: async () => {
       await queryClient.invalidateQueries({
@@ -520,7 +506,7 @@ export function ChatView({
 
   const loopTaskDecomposeMutation = useMutation({
     mutationFn: ({ approveIntake, taskId }: { approveIntake?: boolean; taskId: string }) =>
-      decomposeLoopTask(taskId, activeGatewayProfile, { approveIntake }),
+      decomposeLoopTask(taskId, activeGatewayProfile, { approveIntake, board: loopSourceBoard }),
     onSuccess: async result => {
       if (!result.ok) {
         notify({
@@ -542,7 +528,9 @@ export function ChatView({
 
   const loopTaskArchiveMutation = useMutation({
     mutationFn: async ({ taskIds }: { taskIds: string[] }) => {
-      await Promise.all(taskIds.map(taskId => updateLoopTaskStatus(taskId, 'archived', activeGatewayProfile)))
+      await Promise.all(
+        taskIds.map(taskId => updateLoopTaskStatus(taskId, 'archived', activeGatewayProfile, { board: loopSourceBoard }))
+      )
     },
     onSuccess: async () => {
       await queryClient.invalidateQueries({
@@ -787,12 +775,6 @@ export function ChatView({
         onSelectTaskId={handleSelectLoopTaskId}
         onTaskAction={handleLoopTaskAction}
         open={loopPanelOpen}
-        selectedTaskComments={selectedLoopTaskCommentsQuery.data}
-        selectedTaskCommentsError={selectedLoopTaskCommentsQuery.error
-          ? selectedLoopTaskCommentsQuery.error instanceof Error
-            ? selectedLoopTaskCommentsQuery.error.message
-            : String(selectedLoopTaskCommentsQuery.error)
-          : null}
         selectedTaskDetail={selectedLoopTaskDetailQuery.data}
         selectedTaskDetailError={selectedLoopTaskDetailError}
         selectedTaskId={selectedLoopTaskId}
