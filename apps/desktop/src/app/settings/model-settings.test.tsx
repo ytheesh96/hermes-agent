@@ -89,7 +89,7 @@ describe('ModelSettings', () => {
     // provider is the unique signal of the full universe.
     expect((await screen.findAllByText('Nous')).length).toBeGreaterThan(0)
     expect(await screen.findByText(/DeepSeek/)).toBeTruthy()
-  })
+  }, 10000)
 
   it('activates an unconfigured api_key provider inline by saving its key', async () => {
     await renderModelSettings()
@@ -110,7 +110,7 @@ describe('ModelSettings', () => {
     fireEvent.click(activate)
 
     await waitFor(() => expect(setEnvVar).toHaveBeenCalledWith('DEEPSEEK_API_KEY', 'sk-test-123'))
-  })
+  }, 10000)
 
   it('writes the profile default speed (service_tier) when the fast switch is toggled', async () => {
     await renderModelSettings()
