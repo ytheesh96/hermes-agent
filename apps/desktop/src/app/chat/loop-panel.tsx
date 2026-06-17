@@ -563,6 +563,8 @@ interface LoopPanelProps {
   onAddTaskComment?: LoopTaskCommentSubmit
   onTaskAction?: (action: LoopTaskAction, row: LoopRow) => void
   open?: boolean
+  selectedTaskComments?: LoopTaskComment[] | null
+  selectedTaskCommentsError?: null | string
   selectedTaskDetail?: LoopTaskDetail | null
   selectedTaskDetailError?: null | string
   selectedTaskId?: null | string
@@ -625,11 +627,13 @@ function formatLoopCommentTime(createdAt?: number): string {
 function LoopTaskCommentsCard({
   detail,
   detailError,
+  commentsError,
   onAddComment,
   row
 }: {
   detail?: LoopTaskDetail | null
   detailError?: null | string
+  commentsError?: null | string
   onAddComment?: LoopTaskCommentSubmit
   row: LoopRow
 }) {
@@ -671,13 +675,15 @@ function LoopTaskCommentsCard({
       <div className="grid min-w-0 gap-2">
         {comments.length === 0 ? (
           <EmptyDetail>
-            {detailError
-              ? `Couldn't load comments: ${detailError}`
-              : detail
-                ? 'No comments yet.'
-                : visibleCount > 0
-                  ? `${visibleCount} comments recorded. Loading comments…`
-                  : 'No comments yet.'}
+            {commentsError
+              ? `Couldn't load comments: ${commentsError}`
+              : detailError
+                ? `Couldn't load comments: ${detailError}`
+                : detail
+                  ? 'No comments yet.'
+                  : visibleCount > 0
+                    ? `${visibleCount} comments recorded. Loading comments…`
+                    : 'No comments yet.'}
           </EmptyDetail>
         ) : (
           <div className="grid min-w-0 gap-2" data-testid="loop-task-comments-list">
@@ -1502,43 +1508,6 @@ function WorkerActivityDetails({
         )}
       </div>
 
-      <div className="flex flex-wrap gap-1.5">
-        <Button
-          aria-label={
-            worker.worker_session_id
-              ? `Open worker session ${worker.worker_session_id}`
-              : `No worker session recorded for run #${worker.run_id}`
-          }
-          className="h-7 px-2 text-xs"
-          disabled={!onTaskAction || !worker.worker_session_id}
-          onClick={() => onTaskAction?.('worker-session', row)}
-          type="button"
-          variant="outline"
-        >
-          {worker.worker_session_id ? 'Open worker session' : 'No worker session'}
-        </Button>
-        <Button
-          aria-label={`Inspect worker run #${worker.run_id}`}
-          className="h-7 px-2 text-xs"
-          disabled={!onTaskAction}
-          onClick={() => onTaskAction?.('worker-run', row)}
-          type="button"
-          variant="outline"
-        >
-          Inspect run
-        </Button>
-        <Button
-          aria-label={`Open worker logs for ${row.taskId}`}
-          className="h-7 px-2 text-xs"
-          disabled={!onTaskAction || !worker.log_tail_available}
-          onClick={() => onTaskAction?.('logs', row)}
-          type="button"
-          variant="outline"
-        >
-          Worker logs
-        </Button>
-      </div>
-
       {worker.log_tail ? (
         <LogView className="min-w-0 max-w-full max-h-32">{worker.log_tail}</LogView>
       ) : worker.log_tail_available ? (
@@ -1851,9 +1820,9 @@ function LoopRootOverview({
         </div>
       </section>
 
-      <LoopRootSpec root={root} />
-
       {decomposed ? <LoopRootAgentsCard groups={groups} onOpenTaskTab={onOpenTaskTab} root={root} /> : null}
+
+      <LoopRootSpec root={root} />
 
       <LoopArtifactSourcesCard hideEmpty onOpenArtifactSource={onOpenArtifactTab} rows={artifactSourceRows} />
     </div>
@@ -1864,6 +1833,7 @@ function LoopTaskDetails({
   backLabel,
   detail,
   detailError,
+  commentsError,
   onAddComment,
   onBack,
   onOpenArtifactTab,
@@ -1875,6 +1845,7 @@ function LoopTaskDetails({
   backLabel?: null | string
   detail?: LoopTaskDetail | null
   detailError?: null | string
+  commentsError?: null | string
   onAddComment?: LoopTaskCommentSubmit
   onBack?: () => void
   onOpenArtifactTab?: (entry: LoopArtifactSourceEntry, row: LoopRow) => void
@@ -1909,15 +1880,16 @@ function LoopTaskDetails({
           <LoopTaskActions onTaskAction={onTaskAction} row={row} />
         </div>
       </section>
+      {/* Child/parent agent rows for navigating the task execution graph. */}
+      <LoopTaskAgentsCard onSelectTaskId={onSelectTaskId} row={row} rowById={rowById} />
+
       {/* Markdown task description/spec with a graceful empty state. */}
       <DetailSection title="Description">
         {row.body?.trim() ? <TaskDescription text={row.body} /> : <EmptyDetail>No description provided.</EmptyDetail>}
       </DetailSection>
 
-      <LoopTaskCommentsCard detail={detail} detailError={detailError} onAddComment={onAddComment} row={row} />
+      <LoopTaskCommentsCard detail={detail} detailError={detailError} commentsError={commentsError} onAddComment={onAddComment} row={row} />
 
-      {/* Child/parent agent rows for navigating the task execution graph. */}
-      <LoopTaskAgentsCard onSelectTaskId={onSelectTaskId} row={row} rowById={rowById} />
       <LoopArtifactSourcesCard detail={detail} onOpenArtifactSource={onOpenArtifactTab} rows={[row]} />
 
       <DetailSection title="Worker activity">
@@ -2145,6 +2117,8 @@ export function LoopPanel({
   onAddTaskComment,
   onTaskAction,
   open = false,
+  selectedTaskComments,
+  selectedTaskCommentsError,
   selectedTaskDetail,
   selectedTaskDetailError,
   selectedTaskId,
@@ -2183,14 +2157,28 @@ export function LoopPanel({
     setActiveArtifactTabId(null)
   }, [selectedTaskId])
 
+  const renderedTaskId = activeTaskTabId || focusedTaskId
+
+  // Merge task detail with separately-fetched comments so the comments card
+  // has the actual comment data instead of just the count from session-source.
+  const mergedDetail = useMemo(() => {
+    if (!selectedTaskDetail && !selectedTaskComments) {
+      return selectedTaskDetail
+    }
+    return {
+      ...selectedTaskDetail,
+      comments: selectedTaskComments ?? selectedTaskDetail?.comments ?? []
+    }
+  }, [selectedTaskDetail, selectedTaskComments])
+
   const selected = useMemo(
-    () => selectedRowFrom(state, focusedTaskId, selectedTaskDetail),
-    [focusedTaskId, selectedTaskDetail, state]
+    () => selectedRowFrom(state, focusedTaskId, mergedDetail),
+    [focusedTaskId, mergedDetail, state]
   )
 
   const activeTaskTabRow = useMemo(
-    () => (activeTaskTabId ? selectedRowFrom(state, activeTaskTabId, selectedTaskDetail) : null),
-    [activeTaskTabId, selectedTaskDetail, state]
+    () => (activeTaskTabId ? selectedRowFrom(state, activeTaskTabId, mergedDetail) : null),
+    [activeTaskTabId, mergedDetail, state]
   )
 
   const activeArtifactTab = useMemo(
@@ -2213,19 +2201,17 @@ export function LoopPanel({
     rootOverviewEligible && rootRow && (!focusedTaskId || focusedTaskId === rootRow.taskId)
   )
 
-  const renderedTaskId = activeTaskTabId || focusedTaskId
-
   const rowById = useMemo(() => {
     const rows = state?.rows || []
     const map = new Map(rows.map(row => [row.taskId, row]))
-    const detailRow = detailRowFromTaskDetail(selectedTaskDetail, renderedTaskId)
+    const detailRow = detailRowFromTaskDetail(mergedDetail, renderedTaskId)
 
     if (detailRow) {
       map.set(detailRow.taskId, detailRow)
     }
 
     return map
-  }, [renderedTaskId, selectedTaskDetail, state])
+  }, [renderedTaskId, mergedDetail, state])
 
   const focusDrawerTask = useCallback(
     (taskId: string) => {
@@ -2656,7 +2642,8 @@ export function LoopPanel({
                 <div className="grid min-w-0 max-w-full gap-3">
                   <LoopTaskDetails
                     backLabel={null}
-                    detail={selectedTaskDetail}
+                    detail={mergedDetail}
+                    commentsError={selectedTaskCommentsError}
                     onAddComment={onAddTaskComment}
                     onOpenArtifactTab={openArtifactTab}
                     onSelectTaskId={selectRelatedTask}
@@ -2689,8 +2676,9 @@ export function LoopPanel({
               <div className="grid min-w-0 max-w-full gap-3">
                 <LoopTaskDetails
                   backLabel={detailBackLabel}
-                  detail={selectedTaskDetail}
+                  detail={mergedDetail}
                   detailError={selectedTaskDetailError}
+                  commentsError={selectedTaskCommentsError}
                   onAddComment={onAddTaskComment}
                   onBack={detailBack}
                   onOpenArtifactTab={openArtifactTab}
