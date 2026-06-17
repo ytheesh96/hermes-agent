@@ -631,6 +631,62 @@ def test_session_source_returns_non_archived_tenant_tasks_across_compression_lin
     assert child_payload["session_id"] == "tip-session"
 
 
+def test_session_source_recovers_overwritten_compression_parent(client, kanban_home):
+    """Loop composer follows a compaction child even after parent shutdown.
+
+    Desktop can reopen a continuation tip whose parent was later marked with a
+    normal shutdown reason. The compaction marker in the child still identifies
+    the logical lineage, so tenant-keyed Loop rows from the parent should show.
+    """
+    from hermes_state import SessionDB
+
+    session_db = SessionDB()
+    try:
+        now = time.time()
+        session_db.create_session("root-session", "cli")
+        session_db._conn.execute(
+            "UPDATE sessions "
+            "SET started_at = ?, ended_at = ?, end_reason = ? "
+            "WHERE id = ?",
+            (now - 100, now, "tui_shutdown", "root-session"),
+        )
+        session_db.create_session("tip-session", "cli", parent_session_id="root-session")
+        session_db._conn.execute(
+            "UPDATE sessions SET started_at = ? WHERE id = ?",
+            (now - 50, "tip-session"),
+        )
+        session_db.append_message(
+            "tip-session",
+            "user",
+            "[CONTEXT COMPACTION — REFERENCE ONLY] compacted prior turns",
+        )
+        session_db._conn.commit()
+    finally:
+        session_db.close()
+
+    conn = kb.connect()
+    try:
+        task_id = kb.create_task(
+            conn,
+            title="parent tenant task",
+            tenant="root-session",
+            session_id="root-session",
+        )
+    finally:
+        conn.close()
+
+    r = client.get(
+        "/api/plugins/kanban/session-source",
+        params={"session_id": "tip-session"},
+    )
+
+    assert r.status_code == 200, r.text
+    data = r.json()
+    assert data["lineage_session_ids"] == ["root-session", "tip-session"]
+    assert data["tenants"] == ["root-session"]
+    assert [task["id"] for task in data["tasks"]] == [task_id]
+
+
 def test_session_source_recovers_tasks_when_lineage_id_is_tenant_key(client, kanban_home):
     """Compressed Loop continuations can point at tenant-keyed Kanban work."""
     from hermes_state import SessionDB
@@ -1305,6 +1361,13 @@ def test_add_comment(client):
 
     r = client.get(f"/api/plugins/kanban/tasks/{t['id']}")
     comments = r.json()["comments"]
+    assert len(comments) == 1
+    assert comments[0]["body"] == "how's progress?"
+    assert comments[0]["author"] == "teknium"
+
+    r = client.get(f"/api/plugins/kanban/tasks/{t['id']}/comments")
+    assert r.status_code == 200
+    comments = r.json()
     assert len(comments) == 1
     assert comments[0]["body"] == "how's progress?"
     assert comments[0]["author"] == "teknium"

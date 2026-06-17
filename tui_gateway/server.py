@@ -4351,19 +4351,26 @@ def _(rid, params: dict) -> dict:
 
 
 def _resume_history_for_agent(db: Any, session_id: str) -> List[Dict[str, Any]]:
-    """Load model history for resume, preserving compression continuations."""
+    """Load compacted model history for resume.
+
+    Desktop display may merge compression ancestors separately, but the model
+    context must resume from the compacted tip only. Replaying the full
+    compression lineage here defeats compaction and can trigger a new
+    preflight compression on every turn.
+    """
+    target = session_id
     try:
-        history = db.get_messages_as_conversation(
-            session_id,
-            include_compression_lineage=True,
-        )
-    except TypeError:
-        # Older test doubles and out-of-tree SessionDB shims only understand
-        # the legacy signature. Fall back to the exact previous behavior.
-        return db.get_messages_as_conversation(session_id)
+        resolved = db.resolve_resume_session_id(session_id)
+        if resolved:
+            target = resolved
     except Exception:
-        return db.get_messages_as_conversation(session_id)
-    return history
+        target = session_id
+    try:
+        return db.get_messages_as_conversation(target)
+    except Exception:
+        if target != session_id:
+            return db.get_messages_as_conversation(session_id)
+        raise
 
 
 @method("session.resume")

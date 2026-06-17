@@ -10,6 +10,7 @@ used to load zero rows and show a blank chat.
 and redirects to the first descendant that actually has messages. These
 tests pin that behaviour.
 """
+import json
 import time
 
 import pytest
@@ -87,6 +88,50 @@ def test_compression_lineage_root_to_tip_from_tip_with_messages(db):
     assert db.get_compression_lineage_root_to_tip("tip") == ["root", "tip"]
     conv = db.get_messages_as_conversation("tip", include_compression_lineage=True)
     assert [m["content"] for m in conv] == ["before compression", "after compression"]
+
+
+def test_overwritten_compression_parent_still_resolves_to_tip(db):
+    _make_chain(db, [("root", None), ("tip", "root")])
+    db.append_message("root", role="user", content="before compression")
+    db.append_message(
+        "tip",
+        role="user",
+        content="[CONTEXT COMPACTION — REFERENCE ONLY] compacted prior turns",
+    )
+    db.append_message("tip", role="assistant", content="after compression")
+    now = time.time()
+    db._conn.execute(
+        "UPDATE sessions SET started_at = ?, ended_at = ?, end_reason = ? WHERE id = ?",
+        (now - 100, now, "tui_shutdown", "root"),
+    )
+    db._conn.execute(
+        "UPDATE sessions SET started_at = ? WHERE id = ?",
+        (now - 50, "tip"),
+    )
+    db._conn.commit()
+
+    assert db.resolve_resume_session_id("root") == "tip"
+    assert db.get_compression_lineage_root_to_tip("tip") == ["root", "tip"]
+    conv = db.get_messages_as_conversation("root", include_compression_lineage=True)
+    assert [m["content"] for m in conv] == [
+        "before compression",
+        "[CONTEXT COMPACTION — REFERENCE ONLY] compacted prior turns",
+        "after compression",
+    ]
+
+
+def test_compression_child_marker_resolves_to_tip_without_content_marker(db):
+    _make_chain(db, [("root", None), ("tip", "root")])
+    db.append_message("root", role="user", content="before compression")
+    db.append_message("tip", role="assistant", content="after compression")
+    db._conn.execute(
+        "UPDATE sessions SET model_config = ? WHERE id = ?",
+        (json.dumps({"_compressed_from": "root"}), "tip"),
+    )
+    db._conn.commit()
+
+    assert db.resolve_resume_session_id("root") == "tip"
+    assert db.get_compression_lineage_root_to_tip("tip") == ["root", "tip"]
 
 
 def test_returns_self_when_no_descendant_has_messages(db):

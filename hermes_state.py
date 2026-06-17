@@ -44,10 +44,17 @@ _BRANCH_CHILD_SQL = (
 )
 
 _COMPRESSION_CHILD_SQL = (
-    "EXISTS (SELECT 1 FROM sessions p"
-    "        WHERE p.id = {a}.parent_session_id"
-    "        AND p.end_reason = 'compression'"
-    "        AND {a}.started_at >= p.ended_at)"
+    "json_extract(COALESCE({a}.model_config, '{{}}'), '$._compressed_from') IS NOT NULL"
+    " OR EXISTS (SELECT 1 FROM sessions p"
+    "            WHERE p.id = {a}.parent_session_id"
+    "            AND p.end_reason = 'compression'"
+    "            AND {a}.started_at >= p.ended_at)"
+    " OR (json_extract(COALESCE({a}.model_config, '{{}}'), '$._branched_from') IS NULL"
+    "     AND json_extract(COALESCE({a}.model_config, '{{}}'), '$._delegate_from') IS NULL"
+    "     AND EXISTS (SELECT 1 FROM messages m"
+    "                 WHERE m.session_id = {a}.id"
+    "                 AND m.role = 'user'"
+    "                 AND m.content LIKE '[CONTEXT COMPACTION%'))"
 )
 
 # Rows that surface in pickers: roots + branch children (subagent runs and
@@ -1945,12 +1952,13 @@ class SessionDB:
         """Walk the compression-continuation chain forward and return the tip.
 
         A compression continuation is a child session where:
-        1. The parent's ``end_reason = 'compression'``
-        2. The child was created AFTER the parent was ended (started_at >= ended_at)
+        1. The child carries the stable ``_compressed_from`` marker; OR
+        2. The legacy parent ``end_reason = 'compression'`` heuristic matches; OR
+        3. The child contains the compacted-context reference marker.
 
-        The second condition distinguishes compression continuations from
-        delegate subagents or branch children, which can also have a
-        ``parent_session_id`` but were created while the parent was still live.
+        The marker checks keep older conversations readable even if the
+        compression parent was later reopened and re-ended with a normal
+        shutdown reason.
 
         Returns the session_id of the latest continuation in the chain, or the
         input ``session_id`` if it isn't part of a compression chain (or if the
@@ -1962,14 +1970,11 @@ class SessionDB:
         for _ in range(100):
             with self._lock:
                 cursor = self._conn.execute(
-                    "SELECT id FROM sessions "
-                    "WHERE parent_session_id = ? "
-                    "  AND started_at >= ("
-                    "      SELECT ended_at FROM sessions "
-                    "      WHERE id = ? AND end_reason = 'compression'"
-                    "  ) "
+                    "SELECT s.id FROM sessions s "
+                    "WHERE s.parent_session_id = ? "
+                    f"  AND ({_COMPRESSION_CHILD_SQL.format(a='s')}) "
                     "ORDER BY started_at DESC LIMIT 1",
-                    (current, current),
+                    (current,),
                 )
                 row = cursor.fetchone()
             if row is None:
@@ -1996,14 +2001,11 @@ class SessionDB:
         for _ in range(100):
             with self._lock:
                 cursor = self._conn.execute(
-                    "SELECT id FROM sessions "
-                    "WHERE parent_session_id = ? "
-                    "  AND started_at >= ("
-                    "      SELECT ended_at FROM sessions "
-                    "      WHERE id = ? AND end_reason = 'compression'"
-                    "  ) "
+                    "SELECT s.id FROM sessions s "
+                    "WHERE s.parent_session_id = ? "
+                    f"  AND ({_COMPRESSION_CHILD_SQL.format(a='s')}) "
                     "ORDER BY started_at DESC LIMIT 1",
-                    (current, current),
+                    (current,),
                 )
                 row = cursor.fetchone()
             if row is None:
@@ -2037,14 +2039,11 @@ class SessionDB:
                     break
                 seen.add(current)
                 row = self._conn.execute(
-                    """
+                    f"""
                     SELECT
                         child.parent_session_id AS parent_id,
-                        child.started_at AS child_started_at,
-                        parent.ended_at AS parent_ended_at,
-                        parent.end_reason AS parent_end_reason
+                        ({_COMPRESSION_CHILD_SQL.format(a='child')}) AS is_compression_child
                     FROM sessions child
-                    LEFT JOIN sessions parent ON parent.id = child.parent_session_id
                     WHERE child.id = ?
                     """,
                     (current,),
@@ -2052,22 +2051,8 @@ class SessionDB:
                 if row is None:
                     break
                 parent_id = row["parent_id"] if hasattr(row, "keys") else row[0]
-                child_started_at = (
-                    row["child_started_at"] if hasattr(row, "keys") else row[1]
-                )
-                parent_ended_at = (
-                    row["parent_ended_at"] if hasattr(row, "keys") else row[2]
-                )
-                parent_end_reason = (
-                    row["parent_end_reason"] if hasattr(row, "keys") else row[3]
-                )
-                if (
-                    not parent_id
-                    or parent_end_reason != "compression"
-                    or parent_ended_at is None
-                    or child_started_at is None
-                    or child_started_at < parent_ended_at
-                ):
+                is_compression_child = row["is_compression_child"] if hasattr(row, "keys") else row[1]
+                if not parent_id or not is_compression_child:
                     break
                 current = parent_id
 
@@ -2202,10 +2187,8 @@ class SessionDB:
                     UNION ALL
                     SELECT c.root_id, child.id
                     FROM chain c
-                    JOIN sessions parent ON parent.id = c.cur_id
                     JOIN sessions child ON child.parent_session_id = c.cur_id
-                    WHERE parent.end_reason = 'compression'
-                      AND child.started_at >= parent.ended_at
+                    WHERE {_COMPRESSION_CHILD_SQL.format(a='child')}
                 ),
                 chain_max AS (
                     SELECT
@@ -2277,7 +2260,7 @@ class SessionDB:
             sessions.append(s)
 
         # Project compression roots forward to their tips. Each row whose
-        # end_reason is 'compression' has a continuation child; replace the
+        # lineage has a continuation child; replace the
         # surfaced fields (id, message_count, title, last_active, ended_at,
         # end_reason, preview) with the tip's values so the list entry acts
         # as the live conversation. Keep the root's started_at to preserve
@@ -2285,11 +2268,8 @@ class SessionDB:
         if project_compression_tips and not include_children:
             projected = []
             for s in sessions:
-                if s.get("end_reason") != "compression":
-                    projected.append(s)
-                    continue
                 lineage_ids = self.get_compression_lineage(s["id"])
-                tip_id = lineage_ids[-1] if lineage_ids else s["id"]
+                tip_id = lineage_ids[-1] if len(lineage_ids) > 1 else s["id"]
                 if tip_id == s["id"]:
                     projected.append(s)
                     continue

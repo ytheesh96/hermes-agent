@@ -3070,6 +3070,43 @@ class TestCompressionChainProjection:
         assert tip_row["ended_at"] is None  # tip is still live
         assert tip_row["end_reason"] is None
 
+    def test_list_surfaces_tip_when_parent_end_reason_was_overwritten(self, db):
+        """A reopened compression parent may later be re-ended as shutdown.
+
+        The compaction reference in the child should still let the sidebar
+        project the logical conversation to the continuation tip.
+        """
+        import time as _time
+
+        t0 = _time.time() - 3600
+        db.create_session("root1", "cli")
+        db._conn.execute(
+            "UPDATE sessions SET started_at=?, ended_at=?, end_reason=? WHERE id=?",
+            (t0, t0 + 3600, "tui_shutdown", "root1"),
+        )
+        db.append_message("root1", "user", "before compression")
+
+        db.create_session("tip1", "cli", parent_session_id="root1")
+        db._conn.execute(
+            "UPDATE sessions SET started_at=? WHERE id=?",
+            (t0 + 1800, "tip1"),
+        )
+        db.append_message(
+            "tip1",
+            "user",
+            "[CONTEXT COMPACTION — REFERENCE ONLY] compacted prior turns",
+        )
+        db.append_message("tip1", "assistant", "after compression")
+        db._conn.commit()
+
+        sessions = db.list_sessions_rich(source="cli", limit=20)
+        ids = [s["id"] for s in sessions]
+        assert "tip1" in ids
+        assert "root1" not in ids
+        projected = next(s for s in sessions if s["id"] == "tip1")
+        assert projected["_lineage_root_id"] == "root1"
+        assert projected["_lineage_ids"] == ["root1", "tip1"]
+
     def test_list_projection_uses_tip_cwd(self, db):
         """Projected lineage rows should carry cwd from the live tip row.
 

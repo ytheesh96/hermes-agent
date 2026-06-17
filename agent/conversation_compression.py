@@ -581,11 +581,13 @@ def compress_context(
             except Exception:
                 pass
             agent._session_db_created = False
+            compressed_model_config = dict(agent._session_init_model_config or {})
+            compressed_model_config["_compressed_from"] = old_session_id
             agent._session_db.create_session(
                 session_id=agent.session_id,
                 source=agent.platform or os.environ.get("HERMES_SESSION_SOURCE", "cli"),
                 model=agent.model,
-                model_config=agent._session_init_model_config,
+                model_config=compressed_model_config,
                 parent_session_id=old_session_id,
             )
             agent._session_db_created = True

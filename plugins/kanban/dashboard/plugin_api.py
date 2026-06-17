@@ -494,31 +494,8 @@ def _session_compression_lineage(session_id: Optional[str]) -> list[str]:
         return [sid]
 
     try:
-        root = sid
-        seen = {sid}
-        # Walk backward only across compression-continuation edges. Branch and
-        # delegate children also have parent_session_id, but their parent was not
-        # ended for compression before the child began.
-        for _ in range(100):
-            row = session_db._conn.execute(  # read-only, no public ancestor helper
-                """
-                SELECT parent.id AS parent_id
-                FROM sessions child
-                JOIN sessions parent ON parent.id = child.parent_session_id
-                WHERE child.id = ?
-                  AND parent.end_reason = 'compression'
-                  AND child.started_at >= parent.ended_at
-                """,
-                (root,),
-            ).fetchone()
-            if not row or row["parent_id"] in seen:
-                break
-            root = row["parent_id"]
-            seen.add(root)
-        lineage = session_db.get_compression_lineage(root)
-        if sid not in lineage:
-            lineage.append(sid)
-        return lineage
+        lineage = session_db.get_compression_lineage_root_to_tip(sid)
+        return lineage or [sid]
     except Exception:
         return [sid]
     finally:
@@ -2140,6 +2117,18 @@ def _set_status_direct(
 class CommentBody(BaseModel):
     body: str
     author: Optional[str] = "dashboard"
+
+
+@router.get("/tasks/{task_id}/comments")
+def list_task_comments(task_id: str, board: Optional[str] = Query(None)):
+    board = _resolve_board(board)
+    conn = _conn(board=board)
+    try:
+        if kanban_db.get_task(conn, task_id) is None:
+            raise HTTPException(status_code=404, detail=f"task {task_id} not found")
+        return [_comment_dict(c) for c in kanban_db.list_comments(conn, task_id)]
+    finally:
+        conn.close()
 
 
 @router.post("/tasks/{task_id}/comments")

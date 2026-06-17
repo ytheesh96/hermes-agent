@@ -954,7 +954,7 @@ def test_session_resume_uses_parent_lineage_for_display(monkeypatch):
     assert captured["history_calls"] == [("tip", False), ("tip", True)]
 
 
-def test_session_resume_uses_compression_lineage_for_agent_history(monkeypatch):
+def test_session_resume_uses_compression_tip_for_agent_history(monkeypatch):
     captured = {}
 
     class FakeDB:
@@ -1025,9 +1025,11 @@ def test_session_resume_uses_compression_lineage_for_agent_history(monkeypatch):
         {"role": "user", "text": "tip prompt"},
     ]
     assert captured["agent_history"] == [
-        {"role": "user", "content": "parent prompt"},
-        {"role": "assistant", "content": "parent answer"},
         {"role": "user", "content": "tip prompt"},
+    ]
+    assert captured["history_calls"] == [
+        ("tip", False, False),
+        ("tip", True, False),
     ]
 
 

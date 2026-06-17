@@ -7010,6 +7010,17 @@ def _latest_loop_graph_snapshot_for_dashboard(messages: List[Dict[str, Any]]) ->
 
 
 def _compression_parent_id(db: Any, session: Dict[str, Any]) -> Optional[str]:
+    session_id = str(session.get("id") or "") if isinstance(session, dict) else ""
+    if session_id:
+        try:
+            lineage = db.get_compression_lineage_root_to_tip(session_id)
+        except Exception:
+            lineage = []
+        if session_id in lineage:
+            index = lineage.index(session_id)
+            if index > 0:
+                return str(lineage[index - 1])
+
     parent_id = session.get("parent_session_id") if isinstance(session, dict) else None
     if not parent_id:
         return None

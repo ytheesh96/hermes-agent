@@ -907,6 +907,53 @@ class TestWebServerEndpoints:
             "new child turn",
         ]
 
+    def test_get_session_messages_recovers_overwritten_compression_parent(self):
+        """A shutdown-ended parent with a compaction child should still open the tip."""
+        import time as _time
+
+        from hermes_state import SessionDB
+
+        db = SessionDB()
+        try:
+            now = _time.time()
+            db.create_session(session_id="overwritten-root", source="cli")
+            db.append_message(session_id="overwritten-root", role="user", content="previous turn")
+            db._conn.execute(
+                "UPDATE sessions "
+                "SET started_at = ?, ended_at = ?, end_reason = ? "
+                "WHERE id = ?",
+                (now - 100, now, "tui_shutdown", "overwritten-root"),
+            )
+            db.create_session(
+                session_id="overwritten-tip",
+                source="cli",
+                parent_session_id="overwritten-root",
+            )
+            db._conn.execute(
+                "UPDATE sessions SET started_at = ? WHERE id = ?",
+                (now - 50, "overwritten-tip"),
+            )
+            db.append_message(
+                session_id="overwritten-tip",
+                role="user",
+                content="[CONTEXT COMPACTION — REFERENCE ONLY] compacted prior turns",
+            )
+            db.append_message(session_id="overwritten-tip", role="assistant", content="latest reply")
+            db._conn.commit()
+        finally:
+            db.close()
+
+        resp = self.client.get("/api/sessions/overwritten-root/messages")
+        assert resp.status_code == 200
+        payload = resp.json()
+
+        assert payload["session_id"] == "overwritten-tip"
+        assert [m["content"] for m in payload["messages"]] == [
+            "previous turn",
+            "[CONTEXT COMPACTION — REFERENCE ONLY] compacted prior turns",
+            "latest reply",
+        ]
+
     def test_get_session_loop_tasks_reads_kanban_by_session_tenant_lineage(self):
         """Desktop can list current-session Loop rows directly from Kanban tenant data."""
         import time as _time
