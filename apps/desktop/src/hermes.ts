@@ -316,6 +316,17 @@ export function getLoopTaskDetail(
   })
 }
 
+export function getLoopTaskComments(
+  taskId: string,
+  profile?: string | null,
+  board?: null | string
+): Promise<LoopTaskComment[]> {
+  return window.hermesDesktop.api<LoopTaskComment[]>({
+    ...(profile ? { profile } : profileScoped()),
+    path: `/api/plugins/kanban/tasks/${encodeURIComponent(taskId)}/comments${kanbanBoardQuery(board)}`
+  })
+}
+
 export interface LoopTaskCommentResult {
   comment?: LoopTaskComment
   ok: boolean

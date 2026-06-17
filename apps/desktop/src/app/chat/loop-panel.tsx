@@ -12,6 +12,7 @@ import {
 import { StatusItemRow } from '@/app/chat/composer/status-stack/status-row'
 import { CompactMarkdown } from '@/components/chat/compact-markdown'
 import { DiffLines } from '@/components/chat/diff-lines'
+import { StatusIndicator, type StatusIndicatorKind } from '@/components/chat/status-indicator'
 import { StatusRow } from '@/components/chat/status-row'
 import { StatusSection } from '@/components/chat/status-section'
 import { Button } from '@/components/ui/button'
@@ -84,47 +85,43 @@ function clampLoopPanelWidth(width: number): number {
   return Math.min(viewportMax, Math.max(LOOP_PANEL_MIN_WIDTH, Math.round(width)))
 }
 
-function statusIndicatorClass(status: string): string {
-  const value = status.toLowerCase()
+function loopRowStatusIndicator(row: LoopRow): StatusIndicatorKind {
+  const status = normalizedLoopValue(row.status)
+  const runStatus = normalizedLoopValue(row.latestRun?.status)
+  const runOutcome = normalizedLoopValue(row.latestRun?.outcome)
+  const active = isActiveLoopRow(row) || row.active
+  const failed = FAILED_LOOP_STATUSES.has(status) || FAILED_LOOP_STATUSES.has(runStatus) || FAILED_LOOP_STATUSES.has(runOutcome)
+  const attention = attentionScore(row) > 0 && !failed
 
-  if (value === 'running' || value === 'in_progress' || value === 'claimed') {
-    return 'size-1.5 bg-(--ui-accent) shadow-[0_0_0.625rem_color-mix(in_srgb,var(--ui-accent)_45%,transparent)]'
+  if (attention) {
+    return 'attention'
   }
 
-  if (value === 'blocked' || value === 'stale') {
-    return 'size-1.5 bg-amber-500'
+  if (failed) {
+    return 'failed'
   }
 
-  if (value === 'error' || value === 'failed') {
-    return 'size-1.5 bg-destructive'
+  if (active) {
+    return 'active'
   }
 
-  if (value === 'done') {
-    return 'size-1.5 bg-emerald-500/80'
+  if (isDoneLoopRow(row)) {
+    return 'done'
   }
 
-  return 'size-1 bg-(--ui-text-quaternary) opacity-80'
+  if (status === 'triage') {
+    return 'triage'
+  }
+
+  if (isQueuedLoopRow(row)) {
+    return 'pending'
+  }
+
+  return 'unknown'
 }
 
 function LoopStatusIndicator({ row }: { row: LoopRow }) {
-  const draftStatus = row.status.trim().toLowerCase().replaceAll('-', '_') === 'triage'
-
-  return (
-    <span
-      aria-label={`Status: ${row.status}`}
-      className="grid w-3.5 shrink-0 place-items-center overflow-hidden"
-      role="img"
-    >
-      {draftStatus ? (
-        <span
-          aria-hidden="true"
-          className="box-border size-[0.7rem] rounded-full border border-dashed border-(--ui-text-tertiary)"
-        />
-      ) : (
-        <span aria-hidden="true" className={cn('rounded-full', statusIndicatorClass(row.status))} />
-      )}
-    </span>
-  )
+  return <StatusIndicator ariaLabel={`Status: ${row.status}`} kind={loopRowStatusIndicator(row)} />
 }
 
 function completedLoopRows(rows: LoopRow[]): number {
@@ -136,7 +133,7 @@ function completedLoopRows(rows: LoopRow[]): number {
 }
 
 const TERMINAL_LOOP_STATUSES = new Set(['archived', 'cancelled', 'complete', 'completed', 'done'])
-const FAILED_LOOP_STATUSES = new Set(['crashed', 'error', 'failed', 'failure', 'stale', 'timed_out', 'timeout'])
+const FAILED_LOOP_STATUSES = new Set(['blocked', 'crashed', 'error', 'failed', 'failure', 'stale', 'timed_out', 'timeout'])
 
 function normalizedLoopValue(value?: null | string): string {
   return (value || '').trim().toLowerCase().replaceAll('-', '_')
@@ -1622,6 +1619,7 @@ function loopOverviewStatusItem(row: LoopRow, options: { preferAssigneeForQueued
     runId: row.workerActivity?.run_id ?? row.latestRun?.id,
     sessionId: row.workerActivity?.worker_session_id || row.latestRun?.worker_session_id || undefined,
     state: queued ? 'running' : loopOverviewItemState(row),
+    statusIndicator: loopRowStatusIndicator(row),
     title: row.title,
     todoStatus: queued ? 'pending' : undefined,
     type: queued ? 'todo' : 'kanban-agent'
@@ -1642,6 +1640,32 @@ function loopTaskAgentState(status?: null | string): StatusItemState {
   return 'done'
 }
 
+function loopStatusIndicatorFromStatus(status?: null | string): StatusIndicatorKind {
+  const value = normalizedLoopValue(status)
+
+  if (FAILED_LOOP_STATUSES.has(value)) {
+    return 'failed'
+  }
+
+  if (ACTIVE_OVERVIEW_STATUSES.has(value)) {
+    return 'active'
+  }
+
+  if (DONE_OVERVIEW_STATUSES.has(value)) {
+    return 'done'
+  }
+
+  if (value === 'triage') {
+    return 'triage'
+  }
+
+  if (QUEUED_OVERVIEW_STATUSES.has(value)) {
+    return 'pending'
+  }
+
+  return 'unknown'
+}
+
 type LoopTaskAgentRelation = 'blocked-by' | 'blocking'
 
 function loopTaskAgentRelationLabel(relation: LoopTaskAgentRelation): string {
@@ -1660,6 +1684,7 @@ function loopTaskAgentStatusItem(row: LoopRow, relation: LoopTaskAgentRelation):
     runId: row.workerActivity?.run_id ?? row.latestRun?.id,
     sessionId: row.workerActivity?.worker_session_id || row.latestRun?.worker_session_id || undefined,
     state: loopOverviewItemState(row),
+    statusIndicator: loopRowStatusIndicator(row),
     title: row.title,
     type: 'kanban-agent'
   }
@@ -1686,6 +1711,7 @@ function loopRelatedTaskAgentStatusItem(
     id: `kanban-agent:${taskId}:relation`,
     kanbanTaskId: taskId,
     state: loopTaskAgentState(status),
+    statusIndicator: loopStatusIndicatorFromStatus(status),
     title: related?.title || relationTitle(taskId, rowById),
     type: 'kanban-agent'
   }
@@ -2161,8 +2187,14 @@ export function LoopPanel({
 
   // Merge task detail with separately-fetched comments so the comments card
   // has the actual comment data instead of just the count from session-source.
+  // Only merge when selectedTaskComments has been fetched (not undefined/loading).
   const mergedDetail = useMemo(() => {
-    if (!selectedTaskDetail && !selectedTaskComments) {
+    if (!selectedTaskDetail && selectedTaskComments === undefined) {
+      return selectedTaskDetail
+    }
+    // If comments query hasn't resolved yet (undefined), don't merge yet -
+    // let the detail's own comments (likely undefined) drive the loading state.
+    if (selectedTaskComments === undefined) {
       return selectedTaskDetail
     }
     return {

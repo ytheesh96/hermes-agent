@@ -1,5 +1,6 @@
 import { Fragment, memo, type ReactNode, useState } from 'react'
 
+import { StatusIndicator } from '@/components/chat/status-indicator'
 import { StatusRow } from '@/components/chat/status-row'
 import { TerminalOutput } from '@/components/chat/terminal-output'
 import { Button } from '@/components/ui/button'
@@ -31,6 +32,10 @@ const TODO_GLYPHS: Record<Exclude<TodoStatus, 'in_progress' | 'pending'>, { icon
 // Left slot: braille spinner while running, otherwise a small status dot
 // (green = done, red = failed) so the slot is always filled and rows align.
 function leadingGlyph(item: ComposerStatusItem, s: Translations['statusStack']): ReactNode {
+  if (item.statusIndicator) {
+    return <StatusIndicator ariaLabel={item.statusIndicator === 'active' ? s.running : undefined} kind={item.statusIndicator} />
+  }
+
   if (item.todoStatus === 'pending') {
     return (
       <span
@@ -84,7 +89,7 @@ export const StatusItemRow = memo(function StatusItemRow({ item, onDismiss, onOp
   const { t } = useI18n()
   const s = t.statusStack
   const [outputOpen, setOutputOpen] = useState(false)
-  const failed = item.state === 'failed'
+  const failed = item.state === 'failed' && item.statusIndicator !== 'attention'
   const running = item.state === 'running'
 
   const action =

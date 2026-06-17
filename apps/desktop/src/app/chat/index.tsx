@@ -20,6 +20,7 @@ import {
   decomposeLoopTask,
   getGlobalModelOptions,
   getLoopSessionSource,
+  getLoopTaskComments,
   getLoopTaskDetail,
   type HermesGateway,
   reviewLoopHandoffForTask,
@@ -471,6 +472,19 @@ export function ChatView({
     staleTime: 2_000
   })
 
+  const selectedLoopTaskCommentsQuery = useQuery({
+    queryKey: [
+      'loop-task-comments',
+      activeGatewayProfile,
+      loopSourceBoard,
+      focusedLoopTaskId,
+      loopPanelState?.revision || 0
+    ],
+    queryFn: () => getLoopTaskComments(focusedLoopTaskId!, activeGatewayProfile, loopSourceBoard),
+    enabled: gatewayOpen && loopPanelOpen && Boolean(focusedLoopTaskId) && Boolean(tenantLoopPanelState?.rows.length),
+    staleTime: 2_000
+  })
+
   const selectedLoopTaskDetailError = selectedLoopTaskDetailQuery.error
     ? selectedLoopTaskDetailQuery.error instanceof Error
       ? selectedLoopTaskDetailQuery.error.message
@@ -485,6 +499,7 @@ export function ChatView({
         queryKey: ['loop-session-source', activeGatewayProfile, loopSourceSessionId]
       })
       await queryClient.invalidateQueries({ queryKey: ['loop-task-detail', activeGatewayProfile] })
+      await queryClient.invalidateQueries({ queryKey: ['loop-task-comments', activeGatewayProfile] })
     }
   })
 
@@ -769,6 +784,12 @@ export function ChatView({
         onSelectTaskId={handleSelectLoopTaskId}
         onTaskAction={handleLoopTaskAction}
         open={loopPanelOpen}
+        selectedTaskComments={selectedLoopTaskCommentsQuery.data}
+        selectedTaskCommentsError={selectedLoopTaskCommentsQuery.error
+          ? selectedLoopTaskCommentsQuery.error instanceof Error
+            ? selectedLoopTaskCommentsQuery.error.message
+            : String(selectedLoopTaskCommentsQuery.error)
+          : null}
         selectedTaskDetail={selectedLoopTaskDetailQuery.data}
         selectedTaskDetailError={selectedLoopTaskDetailError}
         selectedTaskId={selectedLoopTaskId}

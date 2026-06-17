@@ -1,6 +1,7 @@
 import { atom, computed } from 'nanostores'
 
 import { inferLoopRootTaskIdFromTenantSource, type LoopWorkerActivity, type TenantLoopSource, type TenantLoopTask } from '@/app/chat/loop-state'
+import type { StatusIndicatorKind } from '@/components/chat/status-indicator'
 import { translateNow } from '@/i18n'
 import type { TodoItem, TodoStatus } from '@/lib/todos'
 
@@ -32,6 +33,8 @@ export interface ComposerStatusItem {
    *  backend recorded one. */
   sessionId?: string
   state: StatusItemState
+  /** Shared leading glyph grammar for Loop/Kanban rows. */
+  statusIndicator?: StatusIndicatorKind
   title: string
   /** todo: the full four-state status driving the row's checkmark glyph. */
   todoStatus?: TodoStatus
@@ -69,9 +72,10 @@ const todoToItem = (t: TodoItem): ComposerStatusItem => ({
 })
 
 const ACTIVE_KANBAN_TASK_STATUSES = new Set(['claimed', 'in_progress', 'running'])
-const PENDING_KANBAN_TASK_STATUSES = new Set(['queued', 'ready', 'scheduled', 'todo', 'triage'])
+const PENDING_KANBAN_TASK_STATUSES = new Set(['queued', 'ready', 'scheduled', 'todo'])
 const DONE_KANBAN_TASK_STATUSES = new Set(['archived', 'cancelled', 'complete', 'completed', 'done'])
 const FAILED_KANBAN_RUN_STATES = new Set([
+  'blocked',
   'crashed',
   'error',
   'failed',
@@ -86,6 +90,12 @@ const normalized = (value: unknown): string =>
   typeof value === 'string' && value.trim() ? value.trim().toLowerCase().replaceAll('-', '_') : ''
 const textValue = (value: unknown): string | undefined =>
   typeof value === 'string' && value.trim() ? value.trim() : undefined
+
+const needsAttentionText = (text: string): boolean =>
+  text.includes('review-required') ||
+  text.includes('review required') ||
+  text.includes('human approval') ||
+  text.includes('needs approval')
 
 const humanToolLabel = (name: string): string =>
   name
@@ -105,11 +115,51 @@ const kanbanTaskTodoStatus = (task: TenantLoopTask): TodoStatus => {
     return 'completed'
   }
 
-  if (PENDING_KANBAN_TASK_STATUSES.has(status)) {
+  if (status === 'triage' || PENDING_KANBAN_TASK_STATUSES.has(status)) {
     return 'pending'
   }
 
   return 'in_progress'
+}
+
+const kanbanTaskStatusIndicator = (task: TenantLoopTask): StatusIndicatorKind => {
+  const status = normalized(task.status)
+  const runStatus = normalized(task.latest_run?.status)
+  const runOutcome = normalized(task.latest_run?.outcome)
+  const text = [task.status, task.title, task.body, task.result, task.latest_summary, task.latest_run?.summary]
+    .filter((value): value is string => Boolean(value))
+    .join(' ')
+    .toLowerCase()
+
+  if (needsAttentionText(text)) {
+    return 'attention'
+  }
+
+  if (
+    FAILED_KANBAN_RUN_STATES.has(status) ||
+    FAILED_KANBAN_RUN_STATES.has(runStatus) ||
+    FAILED_KANBAN_RUN_STATES.has(runOutcome)
+  ) {
+    return 'failed'
+  }
+
+  if (ACTIVE_KANBAN_TASK_STATUSES.has(status)) {
+    return 'active'
+  }
+
+  if (DONE_KANBAN_TASK_STATUSES.has(status)) {
+    return 'done'
+  }
+
+  if (status === 'triage') {
+    return 'triage'
+  }
+
+  if (PENDING_KANBAN_TASK_STATUSES.has(status)) {
+    return 'pending'
+  }
+
+  return 'unknown'
 }
 
 const kanbanTaskToItem = (task: TenantLoopTask): ComposerStatusItem => {
@@ -120,6 +170,7 @@ const kanbanTaskToItem = (task: TenantLoopTask): ComposerStatusItem => {
     id: `kanban-task:${task.id}`,
     kanbanTaskId: task.id,
     state: todoStatus === 'completed' ? 'done' : 'running',
+    statusIndicator: kanbanTaskStatusIndicator(task),
     title: task.title || task.id,
     todoStatus,
     type: 'todo'
@@ -152,10 +203,7 @@ const workerNeedsForegroundAttention = (worker: LoopWorkerActivity): boolean => 
     outcome === 'blocked' ||
     FAILED_KANBAN_RUN_STATES.has(status) ||
     FAILED_KANBAN_RUN_STATES.has(outcome) ||
-    text.includes('review-required') ||
-    text.includes('review required') ||
-    text.includes('human approval') ||
-    text.includes('needs approval')
+    needsAttentionText(text)
   )
 }
 
@@ -164,6 +212,33 @@ const workerIsActive = (worker: LoopWorkerActivity): boolean => {
   const taskStatus = normalized(worker.task_status)
 
   return ACTIVE_KANBAN_TASK_STATUSES.has(status) || ACTIVE_KANBAN_TASK_STATUSES.has(taskStatus)
+}
+
+const workerStatusIndicator = (worker: LoopWorkerActivity): StatusIndicatorKind => {
+  const status = normalized(worker.status)
+  const outcome = normalized(worker.outcome)
+  const taskStatus = normalized(worker.task_status)
+  const text = workerAttentionText(worker)
+
+  if (needsAttentionText(text)) {
+    return 'attention'
+  }
+
+  if (
+    taskStatus === 'blocked' ||
+    status === 'blocked' ||
+    outcome === 'blocked' ||
+    FAILED_KANBAN_RUN_STATES.has(status) ||
+    FAILED_KANBAN_RUN_STATES.has(outcome)
+  ) {
+    return 'failed'
+  }
+
+  if (workerIsActive(worker)) {
+    return 'active'
+  }
+
+  return 'done'
 }
 
 const kanbanWorkerState = (worker: LoopWorkerActivity): StatusItemState => {
@@ -237,6 +312,7 @@ const kanbanWorkerToItem = (worker: LoopWorkerActivity): ComposerStatusItem => (
   runId: worker.run_id,
   sessionId: worker.worker_session_id || undefined,
   state: kanbanWorkerState(worker),
+  statusIndicator: workerStatusIndicator(worker),
   title: worker.task_title || worker.task_id,
   type: 'kanban-agent'
 })
@@ -253,10 +329,7 @@ const loopagentNeedsForegroundAttention = (agent: LoopagentActivity): boolean =>
     status === 'blocked' ||
     taskStatus === 'blocked' ||
     FAILED_KANBAN_RUN_STATES.has(status) ||
-    text.includes('review-required') ||
-    text.includes('review required') ||
-    text.includes('human approval') ||
-    text.includes('needs approval')
+    needsAttentionText(text)
   )
 }
 
@@ -270,6 +343,41 @@ const loopagentIsActive = (agent: LoopagentActivity): boolean => {
     ACTIVE_KANBAN_TASK_STATUSES.has(status) ||
     ACTIVE_KANBAN_TASK_STATUSES.has(taskStatus)
   )
+}
+
+const loopagentStatusIndicator = (agent: LoopagentActivity): StatusIndicatorKind => {
+  const status = normalized(agent.status)
+  const taskStatus = normalized(agent.taskStatus)
+  const text = [agent.errorPreview, agent.summaryPreview, agent.sourceEvent, agent.taskStatus]
+    .filter(Boolean)
+    .join(' ')
+    .toLowerCase()
+
+  if (needsAttentionText(text)) {
+    return 'attention'
+  }
+
+  if (status === 'blocked' || taskStatus === 'blocked' || FAILED_KANBAN_RUN_STATES.has(status)) {
+    return 'failed'
+  }
+
+  if (loopagentIsActive(agent)) {
+    return 'active'
+  }
+
+  if (DONE_KANBAN_TASK_STATUSES.has(taskStatus) || agent.status === 'completed') {
+    return 'done'
+  }
+
+  if (taskStatus === 'triage') {
+    return 'triage'
+  }
+
+  if (PENDING_KANBAN_TASK_STATUSES.has(taskStatus)) {
+    return 'pending'
+  }
+
+  return 'unknown'
 }
 
 const loopagentState = (agent: LoopagentActivity): StatusItemState => {
@@ -304,7 +412,7 @@ const loopagentTaskTodoStatus = (agent: LoopagentActivity): TodoStatus => {
     return 'completed'
   }
 
-  if (PENDING_KANBAN_TASK_STATUSES.has(status)) {
+  if (status === 'triage' || PENDING_KANBAN_TASK_STATUSES.has(status)) {
     return 'pending'
   }
 
@@ -320,6 +428,7 @@ const loopagentToItem = (agent: LoopagentActivity): ComposerStatusItem => {
       id: `kanban-task:${agent.taskId}`,
       kanbanTaskId: agent.taskId,
       state: todoStatus === 'completed' ? 'done' : 'running',
+      statusIndicator: loopagentStatusIndicator(agent),
       title: agent.title || agent.taskId,
       todoStatus,
       type: 'todo'
@@ -334,6 +443,7 @@ const loopagentToItem = (agent: LoopagentActivity): ComposerStatusItem => {
     runId: agent.runId,
     sessionId: agent.workerSessionId,
     state: loopagentState(agent),
+    statusIndicator: loopagentStatusIndicator(agent),
     title: agent.title || agent.taskId,
     type: 'kanban-agent'
   }

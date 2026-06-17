@@ -8,6 +8,80 @@ import { StatusItemRow } from './status-row'
 afterEach(() => cleanup())
 
 describe('StatusItemRow worker visuals', () => {
+  it('uses the shared Loop/Kanban status indicator grammar when provided', () => {
+    const { container, rerender } = render(
+      <I18nProvider configClient={null}>
+        <StatusItemRow
+          item={{
+            currentTool: 'Loop',
+            id: 'kanban-task:t_triage',
+            state: 'running',
+            statusIndicator: 'triage',
+            title: 'Draft Loop root',
+            todoStatus: 'pending',
+            type: 'todo'
+          }}
+        />
+      </I18nProvider>
+    )
+
+    expect(container.querySelector('.border-dashed')).toBeTruthy()
+
+    rerender(
+      <I18nProvider configClient={null}>
+        <StatusItemRow
+          item={{
+            currentTool: 'Loop',
+            id: 'kanban-task:t_todo',
+            state: 'running',
+            statusIndicator: 'pending',
+            title: 'Queued Loop root',
+            todoStatus: 'pending',
+            type: 'todo'
+          }}
+        />
+      </I18nProvider>
+    )
+
+    expect(container.querySelector('.codicon-pass-filled')).toBeTruthy()
+    expect(container.querySelector('.border-dashed')).toBeNull()
+
+    rerender(
+      <I18nProvider configClient={null}>
+        <StatusItemRow
+          item={{
+            currentTool: 'Reviewer',
+            id: 'kanban-agent:t_review:1',
+            state: 'failed',
+            statusIndicator: 'attention',
+            title: 'Review required child',
+            type: 'kanban-agent'
+          }}
+        />
+      </I18nProvider>
+    )
+
+    expect(container.querySelector('.tabler-icon-alert-circle')).toBeTruthy()
+    expect(screen.getByText('Review required child').className).not.toContain('text-destructive')
+
+    rerender(
+      <I18nProvider configClient={null}>
+        <StatusItemRow
+          item={{
+            currentTool: 'Peacock',
+            id: 'kanban-agent:t_blocked:1',
+            state: 'failed',
+            statusIndicator: 'failed',
+            title: 'Blocked child',
+            type: 'kanban-agent'
+          }}
+        />
+      </I18nProvider>
+    )
+
+    expect(container.querySelector('.codicon-circle-slash')).toBeTruthy()
+  })
+
   it('renders Kanban agents without a distinct badge', () => {
     const { rerender } = render(
       <I18nProvider configClient={null}>

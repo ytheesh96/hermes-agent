@@ -1168,12 +1168,10 @@ describe('LoopPanel', () => {
     expect(logTail.className).toContain('max-w-full')
     expect(screen.getByText('heartbeat')).toBeTruthy()
 
-    fireEvent.click(screen.getByRole('button', { name: /open worker session worker-session-42/i }))
-    expect(onTaskAction).toHaveBeenCalledWith('worker-session', expect.objectContaining({ taskId: 't_worker' }))
-    fireEvent.click(screen.getByRole('button', { name: /inspect worker run #42/i }))
-    expect(onTaskAction).toHaveBeenCalledWith('worker-run', expect.objectContaining({ taskId: 't_worker' }))
-    fireEvent.click(screen.getByRole('button', { name: /open worker logs for t_worker/i }))
-    expect(onTaskAction).toHaveBeenCalledWith('logs', expect.objectContaining({ taskId: 't_worker' }))
+    // Buttons removed per user request: "Open worker session", "Inspect run", "Worker logs"
+    expect(screen.queryByRole('button', { name: /open worker session/i })).toBeNull()
+    expect(screen.queryByRole('button', { name: /inspect worker run/i })).toBeNull()
+    expect(screen.queryByRole('button', { name: /open worker logs/i })).toBeNull()
   })
 
   it('renders clickable artifact and source outputs from task metadata', async () => {
