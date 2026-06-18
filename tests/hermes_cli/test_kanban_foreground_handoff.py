@@ -563,6 +563,53 @@ def test_blocked_waiting_prefix_loop_child_block_emits_foreground_handoff(kanban
     assert durable_handoffs[0]["reason"] == "blocked-waiting: sample data path is unavailable"
 
 
+def test_unblocking_loop_child_supersedes_pending_block_handoff(kanban_home):
+    with kb.connect() as conn:
+        root_id = _loop_root_node(conn, title="loop root", tenant="tenant-a")
+        child_id = _loop_node(conn, root_task_id=root_id, title="manual rescue blocker", tenant="tenant-a")
+        assert kb.claim_task(conn, child_id, claimer="worker-host:child") is not None
+        assert kb.block_task(conn, child_id, reason="review-required: foreground should inspect this")
+        handoff = kb.list_loop_handoffs(conn, task_id=child_id)[0]
+
+        assert kb.unblock_task(conn, child_id)
+        reviewed = kb.list_loop_handoffs(conn, task_id=child_id)[0]
+        superseded_events = [
+            event for event in kb.list_events(conn, child_id)
+            if event.kind == "loop_handoff_superseded"
+        ]
+        conn.execute(
+            """
+            UPDATE loop_handoffs
+               SET state = 'queued',
+                   attention = 'needs-orchestrator',
+                   verification_state = 'needs-orchestrator',
+                   verification_status = 'unknown'
+             WHERE id = ?
+            """,
+            (handoff["id"],),
+        )
+
+        next_child = _loop_node(conn, root_task_id=root_id, title="next reviewer blocker", tenant="tenant-a")
+        assert kb.claim_task(conn, next_child, claimer="worker-host:next") is not None
+        assert kb.block_task(conn, next_child, reason="review-required: still needs foreground")
+        batch = kb.claim_loop_handoff_batch(
+            conn,
+            tenant="tenant-a",
+            root_task_id=root_id,
+            reviewer_session_id="review-session-1",
+            limit=10,
+        )
+        post_claim_first = kb.list_loop_handoffs(conn, task_id=child_id)[0]
+
+    assert reviewed["id"] == handoff["id"]
+    assert reviewed["state"] == "cancelled_superseded"
+    assert reviewed["attention"] is None
+    assert reviewed["verification_state"] == "superseded"
+    assert superseded_events and superseded_events[-1].payload["handoff_ids"] == [handoff["id"]]
+    assert post_claim_first["state"] == "cancelled_superseded"
+    assert [item["task_id"] for item in batch] == [next_child]
+
+
 def test_loop_child_block_with_arbitrary_metadata_does_not_emit_handoff(kanban_home):
     with kb.connect() as conn:
         root_id = _loop_root_node(conn, title="loop root")
@@ -756,6 +803,58 @@ def test_claim_loop_handoff_batch_serializes_per_tenant_root_and_orders_dependen
     assert {handoff["reviewer_session_id"] for handoff in batch} == {"review-session-1"}
     assert blocked_by_active == []
     assert [handoff["task_id"] for handoff in other_batch] == [other_id]
+
+
+def test_followup_created_child_handoff_does_not_block_later_foreground_handoff(kanban_home):
+    with kb.connect() as conn:
+        root_id = _loop_root_node(conn, title="loop root", tenant="tenant-a")
+        first_child = _loop_node(conn, root_task_id=root_id, title="first reviewer blocker", tenant="tenant-a")
+        assert kb.claim_task(conn, first_child, claimer="worker:first") is not None
+        assert kb.block_task(conn, first_child, reason="review-required: first gap needs followup")
+        first_handoff = kb.list_loop_handoffs(conn, task_id=first_child)[0]
+
+        result = kb.review_loop_handoff_autonomous_action(
+            conn,
+            first_handoff["id"],
+            action="create_followups",
+            actor="reviewer-qa",
+            evidence_passed=False,
+            reason="turn first gap into follow-up work",
+            followups=[{
+                "kind": "test",
+                "title": "Add first gap regression",
+                "assignee": "implementation-worker",
+                "body": "Cover the first reviewer gap.",
+            }],
+        )
+        reviewed_first = kb.list_loop_handoffs(conn, task_id=first_child)[0]
+
+        conn.execute(
+            """
+            UPDATE loop_handoffs
+               SET state = 'assigned', attention = 'needs-orchestrator'
+             WHERE id = ?
+            """,
+            (first_handoff["id"],),
+        )
+
+        second_child = _loop_node(conn, root_task_id=root_id, title="second reviewer blocker", tenant="tenant-a")
+        assert kb.claim_task(conn, second_child, claimer="worker:second") is not None
+        assert kb.block_task(conn, second_child, reason="review-required: second gap needs review")
+
+        batch = kb.claim_loop_handoff_batch(
+            conn,
+            tenant="tenant-a",
+            root_task_id=root_id,
+            reviewer_session_id="review-session-2",
+            limit=10,
+        )
+
+    assert result["outcome"] == "followups_created"
+    assert reviewed_first["state"] == "closed"
+    assert reviewed_first["attention"] is None
+    assert reviewed_first["verification_state"] == "followups-created"
+    assert [handoff["task_id"] for handoff in batch] == [second_child]
 
 
 def test_loop_handoffs_survive_reconnect_and_expose_status_api(kanban_home):

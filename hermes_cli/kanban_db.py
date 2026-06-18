@@ -3205,6 +3205,113 @@ def loop_handoff_status(
     }
 
 
+def _supersede_pending_loop_handoffs(
+    conn: sqlite3.Connection,
+    task_id: str,
+    *,
+    reason: str,
+    handoff_kinds: Optional[Iterable[str]] = None,
+    now: Optional[int] = None,
+) -> list[int]:
+    """Cancel pending handoffs made stale by a newer task-state transition."""
+    task_id = str(task_id or "").strip()
+    if not task_id:
+        return []
+    states = ("recorded", "queued", "batched")
+    clauses = [
+        "task_id = ?",
+        "state IN (" + ",".join("?" for _ in states) + ")",
+    ]
+    args: list[Any] = [task_id, *states]
+    kinds = [str(kind).strip() for kind in (handoff_kinds or []) if str(kind).strip()]
+    if kinds:
+        clauses.append("handoff_kind IN (" + ",".join("?" for _ in kinds) + ")")
+        args.extend(kinds)
+    rows = conn.execute(
+        "SELECT id FROM loop_handoffs WHERE " + " AND ".join(clauses) + " ORDER BY id ASC",
+        args,
+    ).fetchall()
+    ids = [int(row["id"]) for row in rows]
+    if not ids:
+        return []
+    now = int(now or time.time())
+    placeholders = ",".join("?" for _ in ids)
+    conn.execute(
+        f"""
+        UPDATE loop_handoffs
+           SET state = 'cancelled_superseded', attention = NULL,
+               verification_state = 'superseded', verification_status = 'superseded',
+               decision_actor = 'task-state', decision_reason = ?,
+               resolved_at = COALESCE(resolved_at, ?),
+               completed_at = COALESCE(completed_at, ?),
+               updated_at = ?
+         WHERE id IN ({placeholders})
+        """,
+        (reason, now, now, now, *ids),
+    )
+    _append_event(
+        conn,
+        task_id,
+        "loop_handoff_superseded",
+        {"handoff_ids": ids, "reason": reason},
+    )
+    return ids
+
+
+def _supersede_resolved_worker_block_handoffs_for_scope(
+    conn: sqlite3.Connection,
+    *,
+    tenant: str,
+    root_task_id: str,
+    now: Optional[int] = None,
+) -> list[int]:
+    """Cancel legacy pending block handoffs whose task has already moved on."""
+    rows = conn.execute(
+        """
+        SELECT h.id, h.task_id
+          FROM loop_handoffs h
+          LEFT JOIN tasks t ON t.id = h.task_id
+         WHERE h.tenant = ?
+           AND h.root_task_id = ?
+           AND h.handoff_kind = 'worker_blocked'
+           AND h.state IN ('recorded', 'queued', 'batched')
+           AND COALESCE(t.status, '') != 'blocked'
+         ORDER BY h.id ASC
+        """,
+        (tenant, root_task_id),
+    ).fetchall()
+    ids = [int(row["id"]) for row in rows]
+    if not ids:
+        return []
+    now = int(now or time.time())
+    placeholders = ",".join("?" for _ in ids)
+    reason = "task state resolved before pending block handoff review"
+    conn.execute(
+        f"""
+        UPDATE loop_handoffs
+           SET state = 'cancelled_superseded', attention = NULL,
+               verification_state = 'superseded', verification_status = 'superseded',
+               decision_actor = 'task-state', decision_reason = ?,
+               resolved_at = COALESCE(resolved_at, ?),
+               completed_at = COALESCE(completed_at, ?),
+               updated_at = ?
+         WHERE id IN ({placeholders})
+        """,
+        (reason, now, now, now, *ids),
+    )
+    by_task: dict[str, list[int]] = {}
+    for row in rows:
+        by_task.setdefault(str(row["task_id"]), []).append(int(row["id"]))
+    for stale_task_id, stale_ids in by_task.items():
+        _append_event(
+            conn,
+            stale_task_id,
+            "loop_handoff_superseded",
+            {"handoff_ids": stale_ids, "reason": reason},
+        )
+    return ids
+
+
 def _loop_handoff_dependency_depths(
     conn: sqlite3.Connection, task_ids: set[str]) -> dict[str, int]:
     if not task_ids:
@@ -3252,9 +3359,17 @@ def claim_loop_handoff_batch(
         raise ValueError("reviewer_session_id is required")
     batch_id = batch_id or f"loop-review:{tenant}:{root_task_id}:{int(time.time())}"
     with write_txn(conn):
+        now = int(time.time())
+        _supersede_resolved_worker_block_handoffs_for_scope(
+            conn,
+            tenant=tenant,
+            root_task_id=root_task_id,
+            now=now,
+        )
         active = conn.execute(
             "SELECT 1 FROM loop_handoffs WHERE tenant = ? AND root_task_id = ? "
-            "AND state IN ('assigned', 'reviewing') LIMIT 1",
+            "AND state IN ('assigned', 'reviewing') "
+            "AND COALESCE(verification_state, '') != 'followups-created' LIMIT 1",
             (tenant, root_task_id),
         ).fetchone()
         if active:
@@ -3270,7 +3385,6 @@ def claim_loop_handoff_batch(
         ordered = sorted(rows, key=lambda row: (depths.get(row["task_id"], 0), row["created_at"], row["id"]))[:limit]
         ids = [int(row["id"]) for row in ordered]
         placeholders = ",".join("?" for _ in ids)
-        now = int(time.time())
         conn.execute(
             f"UPDATE loop_handoffs SET state = 'assigned', reviewer_session_id = ?, "
             f"review_batch_id = ?, started_at = COALESCE(started_at, ?), updated_at = ? "
@@ -4349,7 +4463,7 @@ def review_loop_handoff_autonomous_action(
 
     outcome = "followups_created" if action == "create_followups" and not evidence_passed else "approved"
     if outcome == "followups_created":
-        _keep_loop_root_running_for_followups(
+        root_repair_run_id = _keep_loop_root_running_for_followups(
             conn,
             handoff,
             actor=actor,
@@ -4357,15 +4471,16 @@ def review_loop_handoff_autonomous_action(
             created_cards=created_cards,
             now=now,
         )
-        conn.execute(
-            """
-            UPDATE loop_handoffs
-               SET state = 'assigned', attention = 'needs-orchestrator',
-                   resolved_at = NULL, completed_at = NULL, updated_at = ?
-             WHERE id = ?
-            """,
-            (now, handoff["id"]),
-        )
+        if root_repair_run_id is not None:
+            conn.execute(
+                """
+                UPDATE loop_handoffs
+                   SET state = 'assigned', attention = 'needs-orchestrator',
+                       resolved_at = NULL, completed_at = NULL, updated_at = ?
+                 WHERE id = ?
+                """,
+                (now, handoff["id"]),
+            )
     elif action == "approve_release" and evidence_passed:
         _release_loop_root_after_approved_handoff(conn, handoff, reason=reason, now=now)
 
@@ -5385,6 +5500,13 @@ def complete_task(
         if cur.rowcount != 1:
             return False
         loop_root_task_id = _loop_root_for_task(conn, task_id)
+        _supersede_pending_loop_handoffs(
+            conn,
+            task_id,
+            reason="task completed before pending block handoff review",
+            handoff_kinds=("worker_blocked",),
+            now=now,
+        )
         run_id = _end_run(
             conn, task_id,
             outcome="completed", status="done",
@@ -6061,6 +6183,13 @@ def unblock_task(conn: sqlite3.Connection, task_id: str) -> bool:
         )
         if cur.rowcount != 1:
             return False
+        _supersede_pending_loop_handoffs(
+            conn,
+            task_id,
+            reason="task unblocked before pending block handoff review",
+            handoff_kinds=("worker_blocked",),
+            now=now,
+        )
         _append_event(
             conn, task_id, "unblocked",
             {"status": new_status} if new_status != "ready" else None,
