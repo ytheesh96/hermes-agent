@@ -157,6 +157,8 @@ Tell them what you created in plain prose, naming the actual profiles you used:
 
 **Pipeline with gates:** `planner → implementer → reviewer`. Each stage's `parents=[previous_task]`. Reviewer blocks or completes; if reviewer blocks, the operator unblocks with feedback and respawns.
 
+**Blocked worker triage:** When a worker blocks, treat the block reason as a neutral unresolved blocker, not a user escalation verdict. First decide whether the Kanban layer can resolve it: add a clarifying comment, unblock, reassign, create a safe follow-up task, or adjust the graph. Escalate outward only when the blocker cannot be resolved by the available profiles or safe Kanban follow-up work.
+
 **Same-profile queue:** N tasks, all assigned to the same profile, no dependencies between them. Dispatcher serializes — that profile processes them in priority order, accumulating experience in its own memory.
 
 **Human-in-the-loop:** Any task can `kanban_block()` to wait for input. Dispatcher respawns after `/unblock`. The comment thread carries the full context.

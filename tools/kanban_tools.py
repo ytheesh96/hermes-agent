@@ -596,7 +596,7 @@ def _handle_complete(args: dict, **kw) -> str:
 
 
 def _handle_block(args: dict, **kw) -> str:
-    """Transition the task to blocked with a reason a human will read."""
+    """Transition the task to blocked with a reason reviewers can route."""
     tid = _default_task_id(args.get("task_id"))
     if not tid:
         return tool_error(
@@ -1081,11 +1081,12 @@ KANBAN_COMPLETE_SCHEMA = {
 KANBAN_BLOCK_SCHEMA = {
     "name": "kanban_block",
     "description": (
-        "Transition the task to blocked because you need human input "
-        "to proceed. ``reason`` will be shown to the human on the "
-        "board and included in context when someone unblocks you. "
-        "Use for genuine blockers only — don't block on things you can "
-        "resolve yourself."
+        "Transition the task to blocked because a real unresolved blocker "
+        "prevents completion. ``reason`` will be shown on the board and "
+        "included in context when an orchestrator, foreground reviewer, or "
+        "operator routes/unblocks the task. State the concrete blocker; do "
+        "not decide whether it needs the user unless the task explicitly "
+        "requires that label."
     ),
     "parameters": {
         "type": "object",
@@ -1097,9 +1098,10 @@ KANBAN_BLOCK_SCHEMA = {
             "reason": {
                 "type": "string",
                 "description": (
-                    "What you need answered, in one or two sentences. "
-                    "Don't paste the whole conversation; the human has "
-                    "the board and can ask follow-ups via comments."
+                    "The concrete unresolved blocker in one or two sentences. "
+                    "Don't paste the whole conversation; put deeper context "
+                    "in a kanban_comment. Avoid labels like needs-user; "
+                    "foreground review decides if user input is required."
                 ),
             },
             "summary": {
@@ -1117,7 +1119,9 @@ KANBAN_BLOCK_SCHEMA = {
                     "Does not wake the foreground agent unless paired with "
                     "foreground_handoff=true and an allowed handoff_kind or "
                     "escalation_kind, or unless the reason uses a legacy "
-                    "foreground boundary prefix."
+                    "foreground boundary prefix. For neutral Loop blockers "
+                    "that should be reviewed without pre-classifying user "
+                    "need, prefer handoff_kind=blocked_waiting."
                 ),
             },
             "board": _board_schema_prop(),

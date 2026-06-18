@@ -76,6 +76,34 @@ def test_active_session_lease_blocks_until_release(tmp_path, monkeypatch):
     assert active_sessions.active_session_registry_snapshot() == []
 
 
+def test_active_session_tracks_metadata_when_unlimited(tmp_path, monkeypatch):
+    home = tmp_path / ".hermes"
+    monkeypatch.setenv("HERMES_HOME", str(home))
+
+    lease, message = active_sessions.try_acquire_active_session(
+        session_id="session-1",
+        surface="tui",
+        config={},
+        metadata={"running": False, "live_session_id": "sid-1"},
+        track_when_unlimited=True,
+    )
+
+    assert message is None
+    assert lease is not None
+    snapshot = active_sessions.active_session_registry_snapshot()
+    assert len(snapshot) == 1
+    assert snapshot[0]["session_id"] == "session-1"
+    assert snapshot[0]["metadata"]["running"] is False
+
+    assert active_sessions.update_active_session_metadata(lease, {"running": True})
+    snapshot = active_sessions.active_session_registry_snapshot()
+    assert snapshot[0]["metadata"]["running"] is True
+    assert snapshot[0]["metadata"]["live_session_id"] == "sid-1"
+
+    lease.release()
+    assert active_sessions.active_session_registry_snapshot() == []
+
+
 def test_active_session_registry_prunes_dead_pids(tmp_path, monkeypatch):
     home = tmp_path / ".hermes"
     monkeypatch.setenv("HERMES_HOME", str(home))

@@ -13,6 +13,7 @@ import sys
 import threading
 import time
 import uuid
+from collections import Counter
 from datetime import datetime
 from pathlib import Path
 from typing import Any, Dict, List, Optional
@@ -245,6 +246,11 @@ class _SlashWorker:
         if model:
             argv += ["--model", model]
 
+        env = os.environ.copy()
+        env["HERMES_SESSION_KEY"] = session_key
+        env["HERMES_SESSION_ID"] = session_key
+        env["HERMES_TENANT"] = session_key
+
         self._closed = False
         self.proc = subprocess.Popen(
             argv,
@@ -254,7 +260,7 @@ class _SlashWorker:
             text=True,
             bufsize=1,
             cwd=os.getcwd(),
-            env=os.environ.copy(),
+            env=env,
         )
         threading.Thread(target=self._drain_stdout, daemon=True).start()
         threading.Thread(target=self._drain_stderr, daemon=True).start()
@@ -360,7 +366,8 @@ def _claim_active_session_slot(
             session_id=session_key,
             surface=surface,
             config=_load_cfg(),
-            metadata={"live_session_id": live_session_id},
+            metadata={"live_session_id": live_session_id, "running": False},
+            track_when_unlimited=True,
         )
     except Exception as exc:
         logger.warning("Failed to claim active session slot: %s", exc)
@@ -377,6 +384,19 @@ def _release_active_session_slot(session: dict | None) -> None:
         lease.release()
     except Exception:
         logger.debug("Failed to release active session slot", exc_info=True)
+
+
+def _set_session_running(session: dict, running: bool) -> None:
+    session["running"] = bool(running)
+    lease = session.get("active_session_lease")
+    if lease is None:
+        return
+    try:
+        from hermes_cli.active_sessions import update_active_session_metadata
+
+        update_active_session_metadata(lease, {"running": bool(running)})
+    except Exception:
+        logger.debug("Failed to update active session running state", exc_info=True)
 
 
 def _finalize_session(session: dict | None, end_reason: str = "tui_close") -> None:
@@ -1310,36 +1330,40 @@ def _tui_turn_persistence_fingerprint(message: Dict[str, Any]) -> tuple:
     return tuple(items)
 
 
-def _tui_persisted_turn_prefix_len(
+def _tui_unpersisted_turn_entries(
     db: Any,
     session_key: str,
     history_len: int,
     turn_entries: List[Dict[str, Any]],
-) -> int:
+) -> List[Dict[str, Any]]:
     if db is None or not turn_entries:
-        return 0
+        return []
     try:
         db_messages = db.get_messages_as_conversation(session_key)
     except Exception:
         logger.debug("desktop transcript DB de-dupe lookup failed", exc_info=True)
-        return 0
+        return list(turn_entries)
     if not isinstance(db_messages, list):
-        return 0
+        return list(turn_entries)
     try:
         start = max(0, int(history_len or 0))
     except Exception:
         start = 0
     if len(db_messages) <= start:
-        return 0
-    matched = 0
-    for expected, actual in zip(turn_entries, db_messages[start:]):
-        if (
-            _tui_turn_persistence_fingerprint(expected)
-            != _tui_turn_persistence_fingerprint(actual)
-        ):
-            break
-        matched += 1
-    return matched
+        return list(turn_entries)
+    persisted = Counter(
+        _tui_turn_persistence_fingerprint(message)
+        for message in db_messages[start:]
+        if isinstance(message, dict)
+    )
+    missing: List[Dict[str, Any]] = []
+    for message in turn_entries:
+        fingerprint = _tui_turn_persistence_fingerprint(message)
+        if persisted.get(fingerprint, 0) > 0:
+            persisted[fingerprint] -= 1
+            continue
+        missing.append(message)
+    return missing
 
 
 def _persist_tui_turn_entries(
@@ -1359,11 +1383,11 @@ def _persist_tui_turn_entries(
     with _session_db(session) as db:
         if db is None:
             return 0
-        skip_count = _tui_persisted_turn_prefix_len(
+        missing_entries = _tui_unpersisted_turn_entries(
             db, session_key, history_len, entries
         )
         appended = 0
-        for msg in entries[skip_count:]:
+        for msg in missing_entries:
             role = msg.get("role", "unknown")
             db.append_message(
                 session_id=session_key,
@@ -1504,7 +1528,15 @@ def _set_session_context(session_key: str, cwd: str | None = None) -> list:
         # know the parent workspace pass it explicitly so spawned agents inherit
         # it instead of falling back to the gateway launch dir.
         resolved = cwd if cwd is not None else _cwd_for_session_key(session_key)
-        return set_session_vars(session_key=session_key, cwd=resolved)
+        # Desktop/TUI session_key is the logical session id for local Loop and
+        # Kanban ownership. Pin both names so tools never fall back to stale
+        # process-global HERMES_SESSION_ID values from prior sessions.
+        return set_session_vars(
+            session_key=session_key,
+            session_id=session_key,
+            tenant=session_key,
+            cwd=resolved,
+        )
     except Exception:
         return []
 
@@ -3527,7 +3559,7 @@ def _reset_session_agent(sid: str, session: dict) -> dict:
     session["attached_images"] = []
     session["edit_snapshots"] = {}
     session["image_counter"] = 0
-    session["running"] = False
+    _set_session_running(session, False)
     session["show_reasoning"] = _load_show_reasoning()
     session["tool_progress_mode"] = _load_tool_progress_mode()
     session["tool_started_at"] = {}
@@ -5877,7 +5909,7 @@ def _(rid, params: dict) -> dict:
                     db.replace_messages(session["session_key"], truncated)
                 except Exception as exc:
                     print(f"[tui_gateway] prompt.submit: replace_messages failed: {exc}", file=sys.stderr)
-        session["running"] = True
+        _set_session_running(session, True)
         session["last_active"] = time.time()
         _start_inflight_turn(session, text)
 
@@ -5898,7 +5930,7 @@ def _(rid, params: dict) -> dict:
                 },
             )
             with session["history_lock"]:
-                session["running"] = False
+                _set_session_running(session, False)
                 _clear_inflight_turn(session)
             return
         _run_prompt_submit(rid, sid, session, text)
@@ -6028,7 +6060,7 @@ def _notification_poller_loop(
             if session.get("running"):
                 process_registry.completion_queue.put(evt)
                 continue
-            session["running"] = True
+            _set_session_running(session, True)
 
         rid = f"__notif__{int(time.time() * 1000)}"
         try:
@@ -6041,7 +6073,7 @@ def _notification_poller_loop(
                 file=sys.stderr,
             )
             with session["history_lock"]:
-                session["running"] = False
+                _set_session_running(session, False)
 
     # Drain any remaining events after stop signal (process all pending
     # before exiting so nothing is lost on shutdown). Events owned by other
@@ -6071,7 +6103,7 @@ def _notification_poller_loop(
             if session.get("running"):
                 process_registry.completion_queue.put(evt)
                 break
-            session["running"] = True
+            _set_session_running(session, True)
 
         rid = f"__notif__{int(time.time() * 1000)}"
         try:
@@ -6084,7 +6116,7 @@ def _notification_poller_loop(
                 file=sys.stderr,
             )
             with session["history_lock"]:
-                session["running"] = False
+                _set_session_running(session, False)
 
     # Hand any other sessions' events back to the shared queue.
     for evt in deferred:
@@ -6490,7 +6522,7 @@ def _run_prompt_submit(rid, sid: str, session: dict, text: Any) -> None:
                 reset_hermes_home_override(home_token)
             _clear_session_context(session_tokens)
             with session["history_lock"]:
-                session["running"] = False
+                _set_session_running(session, False)
                 session["last_active"] = time.time()
                 _clear_inflight_turn(session)
             _emit("session.info", sid, _session_info(agent, session))
@@ -6507,7 +6539,7 @@ def _run_prompt_submit(rid, sid: str, session: dict, text: Any) -> None:
                     # User already sent something — their turn wins,
                     # the judge will re-run on the next turn anyway.
                     return
-                session["running"] = True
+                _set_session_running(session, True)
             try:
                 _emit("message.start", sid)
                 _run_prompt_submit(rid, sid, session, goal_followup)
@@ -6518,7 +6550,7 @@ def _run_prompt_submit(rid, sid: str, session: dict, text: Any) -> None:
                     file=sys.stderr,
                 )
                 with session["history_lock"]:
-                    session["running"] = False
+                    _set_session_running(session, False)
 
         # Drain completion notifications that arrived during this turn.
         # The background poller handles between-turn delivery; this is
@@ -6531,7 +6563,7 @@ def _run_prompt_submit(rid, sid: str, session: dict, text: Any) -> None:
                     if session.get("running"):
                         process_registry.completion_queue.put(_evt)
                         break
-                    session["running"] = True
+                    _set_session_running(session, True)
                 try:
                     _emit("message.start", sid)
                     _run_prompt_submit(rid, sid, session, synth)
@@ -6542,7 +6574,7 @@ def _run_prompt_submit(rid, sid: str, session: dict, text: Any) -> None:
                         file=sys.stderr,
                     )
                     with session["history_lock"]:
-                        session["running"] = False
+                        _set_session_running(session, False)
         except Exception as _drain_exc:
             print(
                 f"[tui_gateway] completion queue drain failed: "

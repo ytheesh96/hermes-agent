@@ -614,9 +614,9 @@ def test_block_accepts_summary_and_metadata(worker_env):
     from tools import kanban_tools as kt
 
     out = kt._handle_block({
-        "reason": "needs-user: choose rollout window",
+        "reason": "rollout window decision is unresolved",
         "summary": "rollout window decision needed",
-        "metadata": {"foreground_handoff": True, "handoff_kind": "needs_user"},
+        "metadata": {"foreground_handoff": True, "handoff_kind": "blocked_waiting"},
     })
     d = json.loads(out)
     assert d["ok"] is True
@@ -627,7 +627,7 @@ def test_block_accepts_summary_and_metadata(worker_env):
         assert run is not None
         assert run.outcome == "blocked"
         assert run.summary == "rollout window decision needed"
-        assert run.metadata == {"foreground_handoff": True, "handoff_kind": "needs_user"}
+        assert run.metadata == {"foreground_handoff": True, "handoff_kind": "blocked_waiting"}
     finally:
         conn.close()
 
@@ -1256,6 +1256,10 @@ def test_kanban_guidance_in_worker_prompt(monkeypatch, tmp_path):
     assert "kanban_complete" in prompt
     assert "kanban_block" in prompt
     assert "kanban_create" in prompt
+    assert "State concrete blocker" in prompt
+    assert "do not classify it as user, foreground, or orchestrator" in prompt
+    assert "Route after review" in prompt
+    assert "foreground review decides if user input is required" in prompt
     # Anti-shell guidance
     assert "Do not shell out" in prompt or "tools — they work" in prompt
 

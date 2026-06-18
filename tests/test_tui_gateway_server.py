@@ -86,6 +86,20 @@ def test_session_context_uses_session_cwd(monkeypatch, tmp_path):
         server._sessions.pop(sid, None)
 
 
+def test_session_context_binds_session_id_to_session_key(monkeypatch):
+    from gateway.session_context import get_session_env
+
+    monkeypatch.setenv("HERMES_SESSION_ID", "stale-session")
+
+    tokens = server._set_session_context("fresh-session")
+    try:
+        assert get_session_env("HERMES_SESSION_KEY") == "fresh-session"
+        assert get_session_env("HERMES_SESSION_ID") == "fresh-session"
+        assert get_session_env("HERMES_TENANT") == "fresh-session"
+    finally:
+        server._clear_session_context(tokens)
+
+
 def test_handoff_fail_marks_only_inflight_rows(monkeypatch):
     class DbContext:
         def __init__(self, db):
@@ -4760,6 +4774,51 @@ def test_prompt_submit_does_not_duplicate_agent_flushed_db_rows(monkeypatch):
         server._sessions.pop("sid", None)
 
 
+def test_tui_backstop_dedupes_rows_interleaved_by_observed_card(monkeypatch):
+    class _DB:
+        def __init__(self):
+            self.messages = [
+                {"role": "assistant", "content": "previous"},
+                {"role": "user", "content": "handoff card", "observed": True},
+                {"role": "user", "content": "hi"},
+                {"role": "assistant", "content": "reply"},
+            ]
+            self.appended = []
+
+        def get_messages_as_conversation(self, session_key):
+            assert session_key == "key"
+            return list(self.messages)
+
+        def append_message(self, **kwargs):
+            self.appended.append(kwargs)
+
+    class _Context:
+        def __init__(self, db):
+            self.db = db
+
+        def __enter__(self):
+            return self.db
+
+        def __exit__(self, *_args):
+            return False
+
+    db = _DB()
+    monkeypatch.setattr(server, "_session_db", lambda _session: _Context(db))
+
+    appended = server._persist_tui_turn_entries(
+        {"session_key": "key"},
+        "key",
+        1,
+        [
+            {"role": "user", "content": "hi"},
+            {"role": "assistant", "content": "reply"},
+        ],
+    )
+
+    assert appended == 0
+    assert db.appended == []
+
+
 def test_prompt_submit_can_truncate_before_user_ordinal(monkeypatch):
     """Desktop user-message edits should restart the turn from the edited user."""
 
@@ -7658,6 +7717,41 @@ def test_slash_worker_close_reaps_zombie_and_closes_fds():
     assert calls["kill"] == 1
     assert calls["wait"] >= 2  # reaped after both terminate and kill
     assert calls["stdin"] == calls["stdout"] == calls["stderr"] == 1
+
+
+def test_slash_worker_spawn_env_pins_session_identity(monkeypatch):
+    captured = {}
+
+    class FakeProc:
+        stdin = object()
+        stdout = []
+        stderr = []
+
+        def poll(self):
+            return 0
+
+    class FakeThread:
+        def __init__(self, *args, **kwargs):
+            pass
+
+        def start(self):
+            pass
+
+    def fake_popen(argv, **kwargs):
+        captured["argv"] = argv
+        captured["env"] = kwargs["env"]
+        return FakeProc()
+
+    monkeypatch.setenv("HERMES_SESSION_ID", "stale-session")
+    monkeypatch.setenv("HERMES_TENANT", "stale-tenant")
+    monkeypatch.setattr(server.subprocess, "Popen", fake_popen)
+    monkeypatch.setattr(server.threading, "Thread", FakeThread)
+
+    server._SlashWorker("fresh-session", model="")
+
+    assert captured["env"]["HERMES_SESSION_KEY"] == "fresh-session"
+    assert captured["env"]["HERMES_SESSION_ID"] == "fresh-session"
+    assert captured["env"]["HERMES_TENANT"] == "fresh-session"
 
 
 def test_close_session_by_id_is_idempotent_and_full(monkeypatch):

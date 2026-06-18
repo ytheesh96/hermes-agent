@@ -201,6 +201,17 @@ def test_session_id_set_via_contextvars(monkeypatch):
     assert get_session_env("HERMES_SESSION_ID") == ""
 
 
+def test_tenant_set_via_contextvars(monkeypatch):
+    """set_session_vars should set HERMES_TENANT via contextvars."""
+    monkeypatch.setenv("HERMES_TENANT", "stale-env-tenant")
+
+    tokens = set_session_vars(tenant="ctx-tenant-456")
+    assert get_session_env("HERMES_TENANT") == "ctx-tenant-456"
+
+    clear_session_vars(tokens)
+    assert get_session_env("HERMES_TENANT") == ""
+
+
 def test_set_session_env_includes_session_key():
     """_set_session_env should propagate session_key from SessionContext."""
     runner = object.__new__(GatewayRunner)

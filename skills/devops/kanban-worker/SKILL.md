@@ -48,9 +48,9 @@ kanban_complete(
 )
 ```
 
-**Coding task that needs human review (review-required):**
+**Coding task that needs review (review-required):**
 
-For most code-changing tasks, the work isn't truly *done* until a human reviewer has eyes on it. Block instead of complete, with `reason` prefixed `review-required: ` so the dashboard surfaces the row as needing review. Drop the structured metadata (changed files, test counts, diff/PR url) into a comment first, since `kanban_block` only carries the human-readable reason — comments are the durable annotation channel. Reviewer either approves and runs `hermes kanban unblock <id>` (which re-spawns you with the comment thread for any follow-ups) or asks for changes via another comment.
+For most code-changing tasks, the work isn't truly *done* until a reviewer has eyes on it. Block instead of complete, with `reason` prefixed `review-required: ` so the dashboard surfaces the row as needing review. Drop the structured metadata (changed files, test counts, diff/PR url) into a comment first, since `kanban_block` only carries the readable reason — comments are the durable annotation channel. The reviewer/orchestrator decides whether to approve, route safe follow-up work, ask for changes, or escalate to the user.
 
 ```python
 import json
@@ -126,21 +126,21 @@ kanban_complete(
 
 If a `kanban_create` call fails (exception, tool_error), the card was NOT created — do not include a phantom id for it. Retry the create, or omit the id and mention the failure in your summary. The prose-scan pass also catches `t_<hex>` references in your free-form summary that don't resolve; these don't block the completion but show up as advisory warnings on the task in the dashboard.
 
-## Block reasons that get answered fast
+## Block reasons that route cleanly
 
-Bad: `"stuck"` — the human has no context.
+Bad: `"stuck"` — the reviewer/orchestrator has no context.
 
-Good: one sentence naming the specific decision you need. Leave longer context as a comment instead.
+Good: one sentence naming the specific unresolved blocker. Leave longer context as a comment instead. Do not pre-label a block as `needs-user`; foreground review decides whether the user is actually required.
 
 ```python
 kanban_comment(
     task_id=os.environ["HERMES_KANBAN_TASK"],
     body="Full context: I have user IPs from Cloudflare headers but some users are behind NATs with thousands of peers. Keying on IP alone causes false positives.",
 )
-kanban_block(reason="Rate limit key choice: IP (simple, NAT-unsafe) or user_id (requires auth, skips anonymous endpoints)?")
+kanban_block(reason="Rate limit key choice is unresolved: IP is simple but NAT-unsafe; user_id requires auth and skips anonymous endpoints.")
 ```
 
-The block message is what appears in the dashboard / gateway notifier. The comment is the deeper context a human reads when they open the task.
+The block message is what appears in the dashboard / gateway notifier. The comment is the deeper context a reviewer reads when they open the task.
 
 ## Heartbeats worth sending
 
@@ -154,7 +154,7 @@ If you open the task and `kanban_show` returns `runs: [...]` with one or more cl
 
 - `outcome: "timed_out"` — the previous attempt hit `max_runtime_seconds`. You may need to chunk the work or shorten it.
 - `outcome: "crashed"` — OOM or segfault. Reduce memory footprint.
-- `outcome: "spawn_failed"` + `error: "..."` — usually a profile config issue (missing credential, bad PATH). Ask the human via `kanban_block` instead of retrying blindly.
+- `outcome: "spawn_failed"` + `error: "..."` — usually a profile config issue (missing credential, bad PATH). Block with the concrete setup problem instead of retrying blindly.
 - `outcome: "reclaimed"` + `summary: "task archived..."` — operator archived the task out from under the previous run; you probably shouldn't be running at all, check status carefully.
 - `outcome: "blocked"` — a previous attempt blocked; the unblock comment should be in the thread by now.
 
@@ -168,7 +168,7 @@ You can configure the gateway to receive cross-profile Kanban task notifications
 ## Do NOT
 
 - Call `delegate_task` as a substitute for `kanban_create`. `delegate_task` is for short reasoning subtasks inside YOUR run; `kanban_create` is for cross-agent handoffs that outlive one API loop.
-- Call `clarify` to ask the human a question. You are running headless — there is no live user to answer. The call will time out (default ~120s) and the task will sit silently in `running` with no signal that it needs input. Use `kanban_comment` (context) + `kanban_block(reason=...)` (decision needed) instead — the task surfaces on the board as blocked, the operator sees it, unblocks with their answer in a comment, and you respawn with the thread.
+- Call `clarify` to ask the human a question. You are running headless — there is no live user to answer. The call will time out (default ~120s) and the task will sit silently in `running` with no signal that it is blocked. Use `kanban_comment` (context) + `kanban_block(reason=...)` (concrete blocker) instead — the task surfaces on the board as blocked, and the orchestrator/foreground reviewer decides whether it can resolve, route follow-up work, or escalate to the user.
 - Modify files outside `$HERMES_KANBAN_WORKSPACE` unless the task body says to.
 - Create follow-up tasks assigned to yourself — assign to the right specialist.
 - Complete a task you didn't actually finish. Block it instead.

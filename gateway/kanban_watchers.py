@@ -774,6 +774,37 @@ class GatewayKanbanWatchersMixin:
             conn = None
             fingerprint = _board_db_fingerprint(slug)
             disabled_entry = disabled_corrupt_boards.get(slug)
+
+            def _foreground_session_busy(session_id: str) -> bool:
+                session_id = str(session_id or "")
+                if not session_id:
+                    return False
+                if session_id in getattr(self, "_running_agents", {}):
+                    return True
+                try:
+                    from hermes_cli.active_sessions import active_session_registry_snapshot
+
+                    for entry in active_session_registry_snapshot():
+                        if str(entry.get("session_id") or "") != session_id:
+                            continue
+                        metadata = entry.get("metadata")
+                        if not isinstance(metadata, dict):
+                            continue
+                        running = metadata.get("running")
+                        if running is True or str(running).strip().lower() in {
+                            "1",
+                            "true",
+                            "yes",
+                            "on",
+                        }:
+                            return True
+                except Exception:
+                    logger.debug(
+                        "kanban dispatcher: active-session busy lookup failed",
+                        exc_info=True,
+                    )
+                return False
+
             if disabled_entry is not None:
                 disabled_fingerprint, disabled_at = disabled_entry
                 age = time.monotonic() - disabled_at
@@ -816,6 +847,7 @@ class GatewayKanbanWatchersMixin:
                 try:
                     review_batch = _kb.run_next_loop_handoff_review_batch(
                         conn,
+                        session_busy=_foreground_session_busy,
                         review_runner=lambda batch: _kb.start_loop_handoff_review_process(batch, board=slug),
                     )
                 except Exception:

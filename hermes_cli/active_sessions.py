@@ -237,15 +237,18 @@ def try_acquire_active_session(
     surface: str,
     config: Any,
     metadata: Optional[dict[str, Any]] = None,
+    track_when_unlimited: bool = False,
 ) -> tuple[Optional[ActiveSessionLease], Optional[str]]:
     """Acquire an active-session slot.
 
     Returns ``(lease, None)`` on success.  When the cap is disabled, the lease is
-    a no-op object so callers can unconditionally call ``release()``.
+    normally a no-op object so callers can unconditionally call ``release()``.
+    ``track_when_unlimited`` lets live surfaces publish presence/busy metadata
+    without enforcing a concurrency cap.
     """
     max_sessions = resolve_max_concurrent_sessions(config)
     lease_id = uuid.uuid4().hex
-    if max_sessions is None:
+    if max_sessions is None and not track_when_unlimited:
         return ActiveSessionLease(
             lease_id=lease_id,
             session_id=session_id,
@@ -276,7 +279,7 @@ def try_acquire_active_session(
         if pruned:
             logger.info("Pruned %d stale active session lease(s)", pruned)
         active_count = len(entries)
-        if active_count >= max_sessions:
+        if max_sessions is not None and active_count >= max_sessions:
             _write_entries(state_path, entries)
             logger.info(
                 "Active session limit reached: active=%d max=%d surface=%s",
@@ -293,6 +296,45 @@ def try_acquire_active_session(
         session_id=str(session_id),
         surface=str(surface),
     ), None
+
+
+def update_active_session_metadata(
+    lease: Optional[ActiveSessionLease],
+    metadata: dict[str, Any],
+) -> bool:
+    """Merge metadata into an active-session lease entry."""
+    if (
+        lease is None
+        or lease.released
+        or not lease.enabled
+        or not isinstance(metadata, dict)
+    ):
+        return False
+    clean = {str(k): v for k, v in metadata.items() if isinstance(k, str)}
+    if not clean:
+        return False
+    state_path = _state_path()
+    try:
+        with _FileLock(_lock_path()):
+            entries = _prune_dead(_read_entries(state_path))
+            updated = False
+            now = time.time()
+            for entry in entries:
+                if str(entry.get("lease_id") or "") != lease.lease_id:
+                    continue
+                current = entry.get("metadata")
+                if not isinstance(current, dict):
+                    current = {}
+                entry["metadata"] = {**current, **clean}
+                entry["updated_at"] = now
+                updated = True
+                break
+            if updated:
+                _write_entries(state_path, entries)
+            return updated
+    except Exception:
+        logger.debug("Failed to update active session metadata", exc_info=True)
+        return False
 
 
 def release_active_session(lease: ActiveSessionLease) -> None:

@@ -86,7 +86,7 @@ import time
 from contextvars import ContextVar, Token
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Iterable, Optional
+from typing import Any, Callable, Iterable, Optional
 
 from toolsets import get_toolset_names
 
@@ -2859,10 +2859,12 @@ def _is_loop_root_handoff_source(
 
 
 def _is_explicit_loop_foreground_boundary_reason(reason: Optional[str]) -> bool:
-    """Return True for block reasons that deliberately wake foreground/human review."""
+    """Return True for block reasons that deliberately wake Loop review."""
     normalized = str(reason or "").strip().lower()
     return normalized.startswith(
         (
+            "blocked-waiting:",
+            "orchestrator-required:",
             "review-required:",
             "foreground-required:",
             "foreground-handoff:",
@@ -2876,6 +2878,7 @@ def _is_explicit_loop_foreground_boundary_reason(reason: Optional[str]) -> bool:
 
 
 _LOOP_FOREGROUND_HANDOFF_METADATA_KINDS = {
+    "blocked_waiting",
     "needs_user",
     "review_required",
     "safety_boundary",
@@ -3435,8 +3438,13 @@ def _loop_handoff_origin_session_candidates(
     return candidates
 
 
-def _live_loop_handoff_session_id(session_db: Any, candidates: Iterable[str]) -> Optional[str]:
-    """Pick the live foreground session/tip for candidate ids, if any.
+def _live_loop_handoff_session_status(
+    session_db: Any,
+    candidates: Iterable[str],
+    *,
+    session_busy: Optional[Callable[[str], bool]] = None,
+) -> tuple[Optional[str], bool]:
+    """Pick the live foreground session/tip and report whether it is busy.
 
     Handoffs should return to the originating foreground conversation when it
     is still live. If that conversation was compacted, route to the current
@@ -3459,8 +3467,20 @@ def _live_loop_handoff_session_id(session_db: Any, candidates: Iterable[str]) ->
             except Exception:
                 row = None
             if row and row.get("ended_at") is None:
-                return candidate
-    return None
+                if session_busy is not None:
+                    try:
+                        if session_busy(candidate):
+                            return candidate, True
+                    except Exception:
+                        _log.debug("loop handoff session busy check failed", exc_info=True)
+                return candidate, False
+    return None, False
+
+
+def _live_loop_handoff_session_id(session_db: Any, candidates: Iterable[str]) -> Optional[str]:
+    """Pick the live foreground session/tip for candidate ids, if any."""
+    live_session_id, busy = _live_loop_handoff_session_status(session_db, candidates)
+    return None if busy else live_session_id
 
 
 def _current_session_profile_name() -> str:
@@ -3482,7 +3502,8 @@ def _loop_handoff_review_target(
     tenant: Optional[str],
     root_task_id: str,
     session_db: Any = None,
-) -> tuple[Any, str, str, str]:
+    session_busy: Optional[Callable[[str], bool]] = None,
+) -> Optional[tuple[Any, str, str, str]]:
     """Resolve where a foreground handoff batch should be injected.
 
     Prefer the live originating/root foreground session (or its compression
@@ -3496,15 +3517,19 @@ def _loop_handoff_review_target(
     except Exception:
         default_session_db = None
     live_session_id = None
+    live_session_busy = False
     if default_session_db is not None:
-        live_session_id = _live_loop_handoff_session_id(
+        live_session_id, live_session_busy = _live_loop_handoff_session_status(
             default_session_db,
             _loop_handoff_origin_session_candidates(
                 conn,
                 tenant=tenant,
                 root_task_id=root_task_id,
             ),
+            session_busy=session_busy,
         )
+    if live_session_busy:
+        return None
     if live_session_id:
         return default_session_db, live_session_id, _current_session_profile_name(), "foreground"
 
@@ -3531,6 +3556,7 @@ def claim_next_loop_handoff_review_batch(
     *,
     session_db: Any = None,
     limit: int = 10,
+    session_busy: Optional[Callable[[str], bool]] = None,
 ) -> Optional[dict[str, Any]]:
     """Scheduler entrypoint: claim one queued Loop handoff batch into a review session.
 
@@ -3544,12 +3570,16 @@ def claim_next_loop_handoff_review_batch(
     for scope in _pending_loop_handoff_review_scopes(conn):
         tenant = str(scope.get("tenant") or scope["root_task_id"])
         root_task_id = scope["root_task_id"]
-        target_session_db, reviewer_session_id, reviewer_profile, review_route = _loop_handoff_review_target(
+        target = _loop_handoff_review_target(
             conn,
             tenant=tenant,
             root_task_id=root_task_id,
             session_db=session_db,
+            session_busy=session_busy,
         )
+        if target is None:
+            continue
+        target_session_db, reviewer_session_id, reviewer_profile, review_route = target
         batch_id = f"loop-review:{tenant or 'default'}:{root_task_id}:{int(time.time())}"
         handoffs = claim_loop_handoff_batch(
             conn,
@@ -3659,7 +3689,14 @@ def _loop_handoff_review_runner_prompt(batch: dict[str, Any]) -> str:
         "in this resumed foreground review session. Treat the transcript "
         "cards as minimal visible artifacts only; use their payload_ref values "
         "or the Loop/Kanban drawer/API to fetch full handoff details before "
-        "deciding. Resolve each reviewed payload_ref through the durable Loop "
+        "deciding. Treat worker blocks as neutral unresolved blockers; the "
+        "worker is not responsible for deciding whether the blocker needs the "
+        "user, the foreground agent, or Kanban follow-up work. First decide "
+        "whether the blocker can be resolved safely by foreground review or "
+        "by creating safe Kanban follow-ups. Escalate to the user only when "
+        "the reviewed blocker truly requires user input, a product decision, "
+        "sensitive data, external side effects, or ambiguous acceptance "
+        "criteria. Resolve each reviewed payload_ref through the durable Loop "
         "handoff action API, such as "
         "hermes_cli.kanban_db.review_loop_handoff_autonomous_action(...) or "
         "the Loop/Kanban auto-action endpoint. Do not finish with prose such "
@@ -3719,6 +3756,7 @@ def run_next_loop_handoff_review_batch(
     *,
     session_db: Any = None,
     limit: int = 10,
+    session_busy: Optional[Callable[[str], bool]] = None,
     review_runner: Any,
 ) -> Optional[dict[str, Any]]:
     """Claim one queued Loop handoff batch and execute its reviewer runner.
@@ -3730,7 +3768,12 @@ def run_next_loop_handoff_review_batch(
     """
     if review_runner is None:
         raise ValueError("review_runner is required")
-    batch = claim_next_loop_handoff_review_batch(conn, session_db=session_db, limit=limit)
+    batch = claim_next_loop_handoff_review_batch(
+        conn,
+        session_db=session_db,
+        limit=limit,
+        session_busy=session_busy,
+    )
     if not batch:
         return None
     try:

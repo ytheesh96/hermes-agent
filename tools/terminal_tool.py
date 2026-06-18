@@ -37,6 +37,7 @@ import logging
 import os
 import platform
 import re
+import shlex
 import time
 import threading
 import atexit
@@ -1086,6 +1087,28 @@ def _safe_getcwd() -> str:
         return os.getenv("TERMINAL_CWD") or os.path.expanduser("~")
 
 
+def _command_with_current_session_env(command: str) -> str:
+    """Ensure reused terminal snapshots see the active Hermes ownership."""
+    try:
+        from gateway.session_context import get_session_env
+
+        session_id = get_session_env("HERMES_SESSION_ID", "")
+        tenant = get_session_env("HERMES_TENANT", "")
+    except Exception:
+        session_id = os.environ.get("HERMES_SESSION_ID", "")
+        tenant = os.environ.get("HERMES_TENANT", "")
+    session_id = str(session_id or "").strip()
+    tenant = str(tenant or "").strip()
+    exports = []
+    if session_id:
+        exports.append(f"export HERMES_SESSION_ID={shlex.quote(session_id)}")
+    if tenant:
+        exports.append(f"export HERMES_TENANT={shlex.quote(tenant)}")
+    if not exports:
+        return command
+    return "\n".join(exports + [command])
+
+
 def _get_env_config() -> Dict[str, Any]:
     """Get terminal environment configuration from environment variables."""
     # Default image with Python and Node.js for maximum compatibility
@@ -2120,6 +2143,7 @@ def terminal_tool(
                 "processes, call process(action='close') after writing so it receives "
                 "EOF."
             )
+        execution_command = _command_with_current_session_env(command)
 
         if background:
             # Spawn a tracked background process via the process registry.
@@ -2137,7 +2161,7 @@ def terminal_tool(
             try:
                 if env_type == "local":
                     proc_session = process_registry.spawn_local(
-                        command=command,
+                        command=execution_command,
                         cwd=effective_cwd,
                         task_id=effective_task_id,
                         session_key=session_key,
@@ -2147,7 +2171,7 @@ def terminal_tool(
                 else:
                     proc_session = process_registry.spawn_via_env(
                         env=env,
-                        command=command,
+                        command=execution_command,
                         cwd=effective_cwd,
                         task_id=effective_task_id,
                         session_key=session_key,
@@ -2356,7 +2380,7 @@ def terminal_tool(
                             default_cwd=cwd,
                         ),
                     }
-                    result = env.execute(command, **execute_kwargs)
+                    result = env.execute(execution_command, **execute_kwargs)
                 except Exception as e:
                     error_str = str(e).lower()
                     if "timeout" in error_str:

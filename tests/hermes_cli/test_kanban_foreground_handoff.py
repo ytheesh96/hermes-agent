@@ -494,11 +494,11 @@ def test_structured_loop_child_block_metadata_emits_and_persists_handoff(kanban_
         assert kb.block_task(
             conn,
             child_id,
-            reason="blocked pending user choice",
-            summary="choose launch region before continuing",
+            reason="blocked waiting on launch-region decision",
+            summary="launch region decision is unresolved",
             metadata={
                 "foreground_handoff": True,
-                "handoff_kind": "needs_user",
+                "handoff_kind": "blocked_waiting",
                 "changed_files": ["launch.py"],
                 "artifacts": ["/tmp/launch-plan.md"],
                 "worker_session_id": "worker-session-42",
@@ -522,27 +522,45 @@ def test_structured_loop_child_block_metadata_emits_and_persists_handoff(kanban_
     assert payload is not None
     assert payload["root_task_id"] == root_id
     assert payload["handoff_kind"] == "worker_blocked"
-    assert payload["summary"] == "choose launch region before continuing"
-    assert payload["reason"] == "blocked pending user choice"
+    assert payload["summary"] == "launch region decision is unresolved"
+    assert payload["reason"] == "blocked waiting on launch-region decision"
     assert payload["worker_session_id"] == "worker-session-42"
     assert payload["artifacts"] == ["/tmp/launch-plan.md"]
     assert len(durable_handoffs) == 1
     handoff = durable_handoffs[0]
-    assert handoff["summary"] == "choose launch region before continuing"
-    assert handoff["reason"] == "blocked pending user choice"
+    assert handoff["summary"] == "launch region decision is unresolved"
+    assert handoff["reason"] == "blocked waiting on launch-region decision"
     assert handoff["worker_metadata"] is not None
     assert handoff["worker_metadata"]["foreground_handoff"] is True
     assert handoff["artifacts"] == ["/tmp/launch-plan.md"]
     assert handoff["changed_files"] == ["launch.py"]
     assert raw_handoff is not None
-    assert raw_handoff["summary"] == "choose launch region before continuing"
-    assert raw_handoff["reason"] == "blocked pending user choice"
-    assert json.loads(raw_handoff["worker_metadata_json"])["handoff_kind"] == "needs_user"
+    assert raw_handoff["summary"] == "launch region decision is unresolved"
+    assert raw_handoff["reason"] == "blocked waiting on launch-region decision"
+    assert json.loads(raw_handoff["worker_metadata_json"])["handoff_kind"] == "blocked_waiting"
     assert json.loads(raw_handoff["artifacts_json"]) == ["/tmp/launch-plan.md"]
     assert json.loads(raw_handoff["changed_files_json"]) == ["launch.py"]
-    assert runs[-1].summary == "choose launch region before continuing"
+    assert runs[-1].summary == "launch region decision is unresolved"
     assert runs[-1].metadata is not None
-    assert runs[-1].metadata["handoff_kind"] == "needs_user"
+    assert runs[-1].metadata["handoff_kind"] == "blocked_waiting"
+
+
+def test_blocked_waiting_prefix_loop_child_block_emits_foreground_handoff(kanban_home):
+    with kb.connect() as conn:
+        root_id = _loop_root_node(conn, title="loop root")
+        child_id = _loop_node(conn, root_task_id=root_id, title="neutral blocker")
+        assert kb.claim_task(conn, child_id, claimer="worker-host:child") is not None
+
+        assert kb.block_task(conn, child_id, reason="blocked-waiting: sample data path is unavailable")
+
+        handoffs = _handoff_events(conn, child_id)
+        durable_handoffs = kb.list_loop_handoffs(conn, task_id=child_id)
+
+    assert len(handoffs) == 1
+    assert handoffs[0].payload["root_task_id"] == root_id
+    assert handoffs[0].payload["reason"] == "blocked-waiting: sample data path is unavailable"
+    assert len(durable_handoffs) == 1
+    assert durable_handoffs[0]["reason"] == "blocked-waiting: sample data path is unavailable"
 
 
 def test_loop_child_block_with_arbitrary_metadata_does_not_emit_handoff(kanban_home):
@@ -928,6 +946,8 @@ def test_scheduler_claims_next_handoff_into_stable_review_session(kanban_home):
     assert "payload_ref" in prompt
     assert "drawer/API" in prompt
     assert "review_loop_handoff_autonomous_action" in prompt
+    assert "Treat worker blocks as neutral unresolved blockers" in prompt
+    assert "Escalate to the user only when" in prompt
     assert "Do not finish with prose" in prompt
     assert "durable action returns ok" in prompt
     assert "proof packets" not in prompt
@@ -1009,6 +1029,55 @@ def test_scheduler_routes_live_originating_session_instead_of_synthetic_review(k
     assert events
     assert events[-1].payload is not None
     assert events[-1].payload["review_route"] == "foreground"
+
+
+def test_scheduler_defers_live_originating_session_while_busy(kanban_home, monkeypatch):
+    import hermes_state
+    from hermes_state import SessionDB
+
+    origin_session_id = "20260615_origin_busy"
+    monkeypatch.setattr(hermes_state, "DEFAULT_DB_PATH", kanban_home / "state.db")
+    session_db = SessionDB()
+    session_db.create_session(origin_session_id, "tui", model="gpt-test")
+
+    with kb.connect() as conn:
+        task_id = _loop_node(
+            conn,
+            title="busy foreground handoff node",
+            tenant=origin_session_id,
+            session_id=origin_session_id,
+        )
+        assert kb.claim_task(conn, task_id, claimer="worker-host:123") is not None
+        assert kb.complete_task(
+            conn,
+            task_id,
+            summary="ready for busy origin",
+            metadata={"tests_run": ["pytest -q"]},
+        )
+
+        batch = kb.claim_next_loop_handoff_review_batch(
+            conn,
+            limit=10,
+            session_busy=lambda session_id: session_id == origin_session_id,
+        )
+        handoff = kb.list_loop_handoffs(conn, task_id=task_id)[0]
+        events = [
+            event
+            for event in kb.list_events(conn, task_id)
+            if event.kind == "loop_handoff_review_session"
+        ]
+
+    synthetic_session_id = kb.loop_handoff_reviewer_session_id(
+        origin_session_id, "t_looproot"
+    )
+
+    assert batch is None
+    assert handoff["state"] == "queued"
+    assert handoff["reviewer_session_id"] is None
+    assert handoff["review_run_id"] is None
+    assert session_db.get_messages(origin_session_id) == []
+    assert session_db.get_session(synthetic_session_id) is None
+    assert events == []
 
 
 def test_scheduler_routes_originating_compression_root_to_live_tip(kanban_home, monkeypatch):

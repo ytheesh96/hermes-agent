@@ -38,6 +38,20 @@ _ORPHAN_GRACE_S = max(0.0, _env_float("HERMES_SLASH_WATCHDOG_GRACE_S", 5.0))
 _in_flight = threading.Event()  # set while a command is executing
 
 
+def _bind_session_env(session_key: str) -> None:
+    """Pin slash-worker side effects to the session it serves."""
+    key = str(session_key or "").strip()
+    os.environ["HERMES_SESSION_KEY"] = key
+    os.environ["HERMES_SESSION_ID"] = key
+    os.environ["HERMES_TENANT"] = key
+    try:
+        from gateway.session_context import set_session_vars
+
+        set_session_vars(session_key=key, session_id=key, tenant=key)
+    except Exception:
+        pass
+
+
 def _is_orphaned(original_ppid, parent_create_time, getppid=os.getppid) -> bool:
     """True once our spawning gateway is gone. Compare to the ORIGINAL ppid
     (never ==1: Linux reparents to a subreaper) and guard PID reuse via
@@ -98,7 +112,7 @@ def main():
     p.add_argument("--model", default="")
     args = p.parse_args()
 
-    os.environ["HERMES_SESSION_KEY"] = args.session_key
+    _bind_session_env(args.session_key)
     os.environ["HERMES_INTERACTIVE"] = "1"
 
     # Start before the (hundreds-of-ms) HermesCLI build — that window is itself
