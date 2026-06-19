@@ -5,9 +5,9 @@ import {
   type ThreadMessage
 } from '@assistant-ui/react'
 import { useStore } from '@nanostores/react'
-import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
+import { useQuery } from '@tanstack/react-query'
 import type * as React from 'react'
-import { Suspense, useCallback, useEffect, useMemo, useRef, useState } from 'react'
+import { Suspense, useCallback, useMemo, useRef } from 'react'
 import { useLocation } from 'react-router-dom'
 
 import { Thread } from '@/components/assistant-ui/thread'
@@ -16,26 +16,15 @@ import { PromptOverlays } from '@/components/prompt-overlays'
 import { Button } from '@/components/ui/button'
 import { Codicon } from '@/components/ui/codicon'
 import { ErrorState } from '@/components/ui/error-state'
-import {
-  addLoopTaskComment,
-  decomposeLoopTask,
-  getGlobalModelOptions,
-  getLoopSessionSource,
-  getLoopTaskDetail,
-  type HermesGateway,
-  reviewLoopHandoffForTask,
-  updateLoopTaskStatus
-} from '@/hermes'
+import { getGlobalModelOptions, type HermesGateway } from '@/hermes'
 import { useI18n } from '@/i18n'
 import type { ChatMessage } from '@/lib/chat-messages'
 import { quickModelOptions, sessionTitle, toRuntimeMessage } from '@/lib/chat-runtime'
 import { useIncrementalExternalStoreRuntime } from '@/lib/incremental-external-store-runtime'
 import { cn } from '@/lib/utils'
 import type { ComposerAttachment } from '@/store/composer'
-import { reconcileKanbanSessionSourceForComposer } from '@/store/composer-status'
 import { $pinnedSessionIds } from '@/store/layout'
-import { notify, notifyError } from '@/store/notifications'
-import { $activeGatewayProfile, $gatewaySwapTarget } from '@/store/profile'
+import { $gatewaySwapTarget } from '@/store/profile'
 import {
   $activeSessionId,
   $awaitingResponse,
@@ -57,7 +46,7 @@ import {
   sessionMatchesAnyId,
   sessionPinId
 } from '@/store/session'
-import { isNewSessionWindow, isSecondaryWindow, openSessionInNewWindow } from '@/store/windows'
+import { isSecondaryWindow } from '@/store/windows'
 import type { ModelOptionsResponse } from '@/types/hermes'
 
 import { routeSessionId } from '../routes'
@@ -71,15 +60,6 @@ import { droppedFileInlineRefs, type SessionDragPayload, sessionInlineRef } from
 import type { ChatBarState } from './composer/types'
 import { type DroppedFile, partitionDroppedFiles } from './hooks/use-composer-actions'
 import { useFileDropZone } from './hooks/use-file-drop-zone'
-import { buildLoopChatDraft } from './loop-intake'
-import { LoopPanel, type LoopTaskAction } from './loop-panel'
-import { loopSessionSourceRefetchInterval } from './loop-refresh'
-import {
-  deriveLoopPanelStateFromTenantSource,
-  type LoopPanelState,
-  type LoopRow,
-  type TenantLoopSource
-} from './loop-state'
 import { ScrollToBottomButton } from './scroll-to-bottom-button'
 import { SessionActionsMenu } from './sidebar/session-actions-menu'
 import { threadLoadingState } from './thread-loading'
@@ -100,6 +80,7 @@ interface ChatViewProps extends Omit<React.ComponentProps<'div'>, 'onSubmit'> {
   onPickFiles: () => void
   onPickFolders: () => void
   onPickImages: () => void
+  onOpenKanbanTask?: (taskId: string) => void
   onRemoveAttachment: (id: string) => void
   onSteer: (text: string) => Promise<boolean> | boolean
   onSubmit: (
@@ -122,35 +103,6 @@ interface ChatHeaderProps {
   onToggleSelectedPin: () => void
   routedSessionId: null | string
   selectedSessionId: null | string
-}
-
-function normalizeLoopStatus(status?: null | string): string {
-  return (status || '').trim().toLowerCase().replaceAll('-', '_')
-}
-
-function archiveableLoopRows(state: LoopPanelState | null, fallback: LoopRow): LoopRow[] {
-  const rows = state?.rows.length ? state.rows : [fallback]
-  const seen = new Set<string>()
-
-  return rows.filter(row => {
-    if (seen.has(row.taskId) || normalizeLoopStatus(row.status) === 'archived') {
-      return false
-    }
-
-    seen.add(row.taskId)
-
-    return true
-  })
-}
-
-function shouldApproveLoopIntakeOnSubmit(row: LoopRow): boolean {
-  const intake = row.loopIntake
-
-  if (!intake || intake.needed !== true || intake.dispatchable === true) {
-    return false
-  }
-
-  return true
 }
 
 function ChatHeader({
@@ -325,6 +277,7 @@ export function ChatView({
   onPickFiles,
   onPickFolders,
   onPickImages,
+  onOpenKanbanTask,
   onRemoveAttachment,
   onSteer,
   onSubmit,
@@ -348,8 +301,6 @@ export function ChatView({
   const freshDraftReady = useStore($freshDraftReady)
   const gatewayState = useStore($gatewayState)
   const gatewaySwapTarget = useStore($gatewaySwapTarget)
-  const activeGatewayProfile = useStore($activeGatewayProfile)
-  const queryClient = useQueryClient()
   const gatewayOpen = gatewayState === 'open'
   const introPersonality = useStore($introPersonality)
   const introSeed = useStore($introSeed)
@@ -442,238 +393,6 @@ export function ChatView({
     [contextSuggestions, currentModel, currentProvider, gatewayOpen, modelMenuContent, quickModels]
   )
 
-  const loopSourceSessionId = selectedSessionId || activeSessionId || routedSessionId || ''
-
-  const loopSourceQuery = useQuery<TenantLoopSource>({
-    queryKey: ['loop-session-source', activeGatewayProfile, loopSourceSessionId],
-    queryFn: () => getLoopSessionSource(loopSourceSessionId, activeGatewayProfile),
-    enabled: gatewayOpen && Boolean(loopSourceSessionId),
-    refetchInterval: query => loopSessionSourceRefetchInterval(query.state.data),
-    refetchOnWindowFocus: true,
-    staleTime: 2_000
-  })
-
-  const tenantLoopPanelState = useMemo(
-    () => deriveLoopPanelStateFromTenantSource(loopSourceQuery.data),
-    [loopSourceQuery.data]
-  )
-
-  useEffect(() => {
-    if (!loopSourceSessionId) {
-      return
-    }
-
-    reconcileKanbanSessionSourceForComposer({
-      activeSessionId,
-      source: loopSourceQuery.data,
-      sourceSessionId: loopSourceSessionId
-    })
-  }, [activeSessionId, loopSourceQuery.data, loopSourceSessionId])
-
-  const loopPanelState = tenantLoopPanelState
-  const [selectedLoopTaskId, setSelectedLoopTaskId] = useState<string | null>(null)
-  const [focusedLoopTaskId, setFocusedLoopTaskId] = useState<string | null>(null)
-  const [loopPanelOpen, setLoopPanelOpen] = useState(false)
-  const [loopPanelHidden, setLoopPanelHidden] = useState(false)
-
-  const loopPanelRootKey = loopPanelState?.rootTaskId || ''
-  const loopSourceBoard = loopSourceQuery.data?.board || undefined
-
-  const selectedLoopTaskDetailQuery = useQuery({
-    queryKey: [
-      'loop-task-detail',
-      activeGatewayProfile,
-      loopSourceBoard,
-      focusedLoopTaskId,
-      loopPanelState?.revision || 0
-    ],
-    queryFn: () => getLoopTaskDetail(focusedLoopTaskId!, activeGatewayProfile, loopSourceBoard),
-    enabled: gatewayOpen && loopPanelOpen && Boolean(focusedLoopTaskId) && Boolean(tenantLoopPanelState?.rows.length),
-    staleTime: 2_000
-  })
-
-  const selectedLoopTaskDetailError = selectedLoopTaskDetailQuery.error
-    ? selectedLoopTaskDetailQuery.error instanceof Error
-      ? selectedLoopTaskDetailQuery.error.message
-      : String(selectedLoopTaskDetailQuery.error)
-    : null
-
-  const loopTaskCommentMutation = useMutation({
-    mutationFn: ({ body, taskId }: { body: string; taskId: string }) =>
-      addLoopTaskComment(taskId, body, activeGatewayProfile, 'desktop', loopSourceBoard),
-    onSuccess: async () => {
-      await queryClient.invalidateQueries({
-        queryKey: ['loop-session-source', activeGatewayProfile, loopSourceSessionId]
-      })
-      await queryClient.invalidateQueries({ queryKey: ['loop-task-detail', activeGatewayProfile] })
-    }
-  })
-
-  const loopTaskStatusMutation = useMutation({
-    mutationFn: ({ status, taskId }: { status: string; taskId: string }) =>
-      updateLoopTaskStatus(taskId, status, activeGatewayProfile, {
-        blockReason: status === 'blocked' ? 'Blocked from Loop side panel' : undefined,
-        board: loopSourceBoard
-      }),
-    onSuccess: async () => {
-      await queryClient.invalidateQueries({
-        queryKey: ['loop-session-source', activeGatewayProfile, loopSourceSessionId]
-      })
-      await queryClient.invalidateQueries({ queryKey: ['loop-task-detail', activeGatewayProfile] })
-    }
-  })
-
-  const loopTaskDecomposeMutation = useMutation({
-    mutationFn: ({ approveIntake, taskId }: { approveIntake?: boolean; taskId: string }) =>
-      decomposeLoopTask(taskId, activeGatewayProfile, { approveIntake, board: loopSourceBoard }),
-    onSuccess: async result => {
-      if (!result.ok) {
-        notify({
-          kind: 'warning',
-          title: 'Loop submit blocked',
-          message: result.reason || `Could not submit ${result.task_id || 'Loop task'}`
-        })
-      }
-
-      await queryClient.invalidateQueries({
-        queryKey: ['loop-session-source', activeGatewayProfile, loopSourceSessionId]
-      })
-      await queryClient.invalidateQueries({ queryKey: ['loop-task-detail', activeGatewayProfile] })
-    },
-    onError: error => {
-      notifyError(error, 'Loop submit failed')
-    }
-  })
-
-  const loopTaskArchiveMutation = useMutation({
-    mutationFn: async ({ taskIds }: { taskIds: string[] }) => {
-      await Promise.all(
-        taskIds.map(taskId => updateLoopTaskStatus(taskId, 'archived', activeGatewayProfile, { board: loopSourceBoard }))
-      )
-    },
-    onSuccess: async () => {
-      await queryClient.invalidateQueries({
-        queryKey: ['loop-session-source', activeGatewayProfile, loopSourceSessionId]
-      })
-      await queryClient.invalidateQueries({ queryKey: ['loop-task-detail', activeGatewayProfile] })
-    }
-  })
-
-  const loopReviewDecisionMutation = useMutation({
-    mutationFn: ({
-      action,
-      taskId
-    }: {
-      action: Extract<LoopTaskAction, 'accept-review' | 'escalate-review' | 'reject-review'>
-      taskId: string
-    }) => reviewLoopHandoffForTask(taskId, action, activeGatewayProfile, { board: loopSourceQuery.data?.board }),
-    onSuccess: async () => {
-      await queryClient.invalidateQueries({
-        queryKey: ['loop-session-source', activeGatewayProfile, loopSourceSessionId]
-      })
-      await queryClient.invalidateQueries({ queryKey: ['loop-task-detail', activeGatewayProfile] })
-    },
-    onError: error => {
-      console.error('Loop review decision failed', error)
-    }
-  })
-
-  useEffect(() => {
-    setSelectedLoopTaskId(null)
-    setFocusedLoopTaskId(null)
-    setLoopPanelOpen(false)
-    setLoopPanelHidden(false)
-  }, [loopPanelRootKey])
-
-  const handleSelectLoopTaskId = useCallback((taskId: string) => {
-    setSelectedLoopTaskId(taskId)
-    setFocusedLoopTaskId(taskId)
-    setLoopPanelOpen(true)
-    setLoopPanelHidden(false)
-  }, [])
-
-  const handleHideLoopPanel = useCallback(() => {
-    setLoopPanelOpen(false)
-    setLoopPanelHidden(true)
-  }, [])
-
-  const handleAddLoopTaskComment = useCallback(
-    async (taskId: string, body: string) => {
-      await loopTaskCommentMutation.mutateAsync({ body, taskId })
-    },
-    [loopTaskCommentMutation]
-  )
-
-  const handleLoopTaskAction = useCallback(
-    (action: LoopTaskAction, row: LoopRow) => {
-      if (action === 'worker-session' && row.workerActivity?.worker_session_id) {
-        void openSessionInNewWindow(row.workerActivity.worker_session_id, { watch: true })
-
-        return
-      }
-
-      if (action === 'details' || action === 'kanban' || action === 'logs' || action === 'worker-run') {
-        handleSelectLoopTaskId(row.taskId)
-
-        return
-      }
-
-      if (action === 'ask-hermes') {
-        onAddContextRef(`@task:${row.taskId}`, row.title || row.taskId, `Loop task ${row.taskId}`)
-        requestComposerInsert(buildLoopChatDraft(row), { mode: 'block', target: 'main' })
-
-        return
-      }
-
-      if (action === 'decompose') {
-        loopTaskDecomposeMutation.mutate({ approveIntake: shouldApproveLoopIntakeOnSubmit(row), taskId: row.taskId })
-
-        return
-      }
-
-      if (action === 'archive-loop') {
-        const taskIds = archiveableLoopRows(loopPanelState, row).map(task => task.taskId)
-
-        if (taskIds.length) {
-          loopTaskArchiveMutation.mutate({ taskIds })
-        }
-
-        return
-      }
-
-      if (action === 'accept-review' || action === 'escalate-review' || action === 'reject-review') {
-        loopReviewDecisionMutation.mutate({ action, taskId: row.taskId })
-
-        return
-      }
-
-      const nextStatusByAction: Partial<Record<LoopTaskAction, string>> = {
-        archive: 'archived',
-        block: 'blocked',
-        park: 'scheduled',
-        start: 'ready',
-        unblock: 'ready'
-      }
-
-      const nextStatus = nextStatusByAction[action]
-
-      if (!nextStatus) {
-        return
-      }
-
-      loopTaskStatusMutation.mutate({ status: nextStatus, taskId: row.taskId })
-    },
-    [
-      handleSelectLoopTaskId,
-      loopPanelState,
-      loopReviewDecisionMutation,
-      loopTaskArchiveMutation,
-      loopTaskDecomposeMutation,
-      loopTaskStatusMutation,
-      onAddContextRef
-    ]
-  )
-
   // Drop files anywhere in the conversation area, not just on the composer
   // input. In-app drags (project tree / gutter) carry workspace-relative paths
   // the gateway resolves directly, so they stay inline `@file:` refs. OS/Finder
@@ -707,12 +426,12 @@ export function ChatView({
   return (
     <div
       className={cn(
-        'relative isolate grid h-full min-w-0 grid-cols-[minmax(0,1fr)_auto] overflow-hidden bg-(--ui-chat-surface-background)',
+        'relative isolate flex h-full min-w-0 overflow-hidden bg-(--ui-chat-surface-background)',
         className
       )}
     >
       <Backdrop />
-      <div className="row-start-1 flex min-h-0 min-w-0 flex-col overflow-hidden" style={{ gridColumn: '1 / 2' }}>
+      <div className="flex min-h-0 min-w-0 flex-1 flex-col overflow-hidden">
         <ChatHeader
           activeSessionId={activeSessionId}
           isRoutedSessionView={isRoutedSessionView}
@@ -743,7 +462,7 @@ export function ChatView({
                 onBranchInNewChat={onBranchInNewChat}
                 onCancel={onCancel}
                 onDismissError={onDismissError}
-                onOpenKanbanTask={handleSelectLoopTaskId}
+                onOpenKanbanTask={onOpenKanbanTask}
                 onRestoreToMessage={onRestoreToMessage}
                 sessionId={activeSessionId}
                 sessionKey={threadKey}
@@ -762,7 +481,7 @@ export function ChatView({
                     onAttachDroppedItems={onAttachDroppedItems}
                     onAttachImageBlob={onAttachImageBlob}
                     onCancel={onCancel}
-                    onOpenKanbanTask={handleSelectLoopTaskId}
+                    onOpenKanbanTask={onOpenKanbanTask}
                     onPasteClipboardImage={onPasteClipboardImage}
                     onPickFiles={onPickFiles}
                     onPickFolders={onPickFolders}
@@ -800,20 +519,6 @@ export function ChatView({
           </div>
         </div>
       </div>
-      <LoopPanel
-        artifactSourceBaseDir={currentCwd}
-        hidden={loopPanelHidden}
-        onAddTaskComment={handleAddLoopTaskComment}
-        onFocusTaskId={setFocusedLoopTaskId}
-        onHide={handleHideLoopPanel}
-        onSelectTaskId={handleSelectLoopTaskId}
-        onTaskAction={handleLoopTaskAction}
-        open={loopPanelOpen}
-        selectedTaskDetail={selectedLoopTaskDetailQuery.data}
-        selectedTaskDetailError={selectedLoopTaskDetailError}
-        selectedTaskId={selectedLoopTaskId}
-        state={loopPanelState}
-      />
     </div>
   )
 }

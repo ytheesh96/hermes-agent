@@ -35,6 +35,7 @@ const INTRINSIC = `clamp(${PREVIEW_RAIL_MIN_WIDTH}, 36vw, 32rem)`
 export const PREVIEW_RAIL_PANE_WIDTH = `min(${INTRINSIC}, max(0rem, calc(100vw - var(--pane-chat-sidebar-width) - var(--pane-file-browser-width, 0rem) - var(--chat-min-width))))`
 
 interface ChatPreviewRailProps {
+  embedded?: boolean
   onRestartServer?: (url: string, context?: string) => Promise<string>
   setTitlebarToolGroup?: SetTitlebarToolGroup
 }
@@ -52,7 +53,7 @@ function tabLabelFor(target: PreviewTarget): string {
   return tail || value || translateNow('preview.tab')
 }
 
-export function ChatPreviewRail({ onRestartServer, setTitlebarToolGroup }: ChatPreviewRailProps) {
+export function ChatPreviewRail({ embedded = false, onRestartServer, setTitlebarToolGroup }: ChatPreviewRailProps) {
   const { t } = useI18n()
   const previewReloadRequest = useStore($previewReloadRequest)
   const activeTabId = useStore($rightRailActiveTabId)
@@ -82,7 +83,12 @@ export function ChatPreviewRail({ onRestartServer, setTitlebarToolGroup }: ChatP
   const isPreview = activeTab.id === RIGHT_RAIL_PREVIEW_TAB_ID
 
   return (
-    <aside className="relative flex h-full w-full min-w-0 flex-col overflow-hidden border-l border-(--ui-stroke-tertiary) bg-(--ui-editor-surface-background) text-(--ui-text-tertiary)">
+    <aside
+      className={cn(
+        'relative flex h-full w-full min-w-0 flex-col overflow-hidden bg-(--ui-editor-surface-background) text-(--ui-text-tertiary)',
+        !embedded && 'border-l border-(--ui-stroke-tertiary)'
+      )}
+    >
       <div className="group/rail-tabs flex h-(--titlebar-height) shrink-0 border-b border-(--ui-stroke-tertiary) bg-(--ui-sidebar-surface-background)">
         <div
           className="flex min-w-0 flex-1 overflow-x-auto overflow-y-hidden overscroll-x-contain [-ms-overflow-style:none] [scrollbar-width:none] [&::-webkit-scrollbar]:hidden"

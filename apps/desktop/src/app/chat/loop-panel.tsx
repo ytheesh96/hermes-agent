@@ -597,6 +597,7 @@ export function LoopTaskStack({
 
 interface LoopPanelProps {
   artifactSourceBaseDir?: null | string
+  embedded?: boolean
   enableDebugJson?: boolean
   hidden?: boolean
   onFocusTaskId?: (taskId: string) => void
@@ -2079,9 +2080,9 @@ function LoopTaskDetails({
       </DetailSection>
 
       <LoopTaskCommentsCard
+        commentsError={commentsError}
         detail={detail}
         detailError={detailError}
-        commentsError={commentsError}
         onAddComment={onAddComment}
         row={row}
       />
@@ -2305,6 +2306,7 @@ function artifactDiffPath(entry: LoopArtifactSourceEntry, target: PreviewTarget 
 
 export function LoopPanel({
   artifactSourceBaseDir,
+  embedded = false,
   enableDebugJson = false,
   hidden = false,
   onFocusTaskId,
@@ -2783,30 +2785,34 @@ export function LoopPanel({
     <aside
       aria-hidden={false}
       className={cn(
-        'relative row-start-1 min-w-0 shrink-0 overflow-hidden text-(--ui-text-secondary)',
-        !open && 'hidden xl:block'
+        embedded
+          ? 'relative flex h-full min-h-0 min-w-0 flex-1 overflow-hidden text-(--ui-text-secondary)'
+          : 'relative row-start-1 min-w-0 shrink-0 overflow-hidden text-(--ui-text-secondary)',
+        !embedded && !open && 'hidden xl:block'
       )}
-      data-layout="docked"
+      data-layout={embedded ? 'tabbed' : 'docked'}
       data-modal="false"
       data-pane-id="loop-panel"
       data-pane-open={open ? 'true' : 'false'}
       data-pane-side="right"
       data-state={open ? 'open' : 'preview'}
       data-testid="loop-panel"
-      style={{ gridColumn: '2 / 3', minWidth: LOOP_PANEL_MIN_WIDTH, width: panelWidth }}
+      style={embedded ? undefined : { gridColumn: '2 / 3', minWidth: LOOP_PANEL_MIN_WIDTH, width: panelWidth }}
     >
-      <div
-        aria-label="Resize loop-panel"
-        aria-orientation="vertical"
-        className="group absolute bottom-0 left-0 top-0 z-20 w-1 -translate-x-1/2 cursor-col-resize [-webkit-app-region:no-drag]"
-        onKeyDown={resizeByKeyboard}
-        onPointerDown={startResize}
-        role="separator"
-        tabIndex={0}
-      >
-        <span className="absolute inset-y-0 left-1/2 w-px -translate-x-1/2 bg-(--ui-stroke-secondary)" />
-        <span className="absolute inset-y-0 left-1/2 w-(--vscode-sash-hover-size,0.25rem) -translate-x-1/2 bg-(--ui-sash-hover-border) opacity-0 transition-opacity duration-100 group-hover:opacity-100 group-focus-visible:opacity-100" />
-      </div>
+      {!embedded && (
+        <div
+          aria-label="Resize loop-panel"
+          aria-orientation="vertical"
+          className="group absolute bottom-0 left-0 top-0 z-20 w-1 -translate-x-1/2 cursor-col-resize [-webkit-app-region:no-drag]"
+          onKeyDown={resizeByKeyboard}
+          onPointerDown={startResize}
+          role="separator"
+          tabIndex={0}
+        >
+          <span className="absolute inset-y-0 left-1/2 w-px -translate-x-1/2 bg-(--ui-stroke-secondary)" />
+          <span className="absolute inset-y-0 left-1/2 w-(--vscode-sash-hover-size,0.25rem) -translate-x-1/2 bg-(--ui-sash-hover-border) opacity-0 transition-opacity duration-100 group-hover:opacity-100 group-focus-visible:opacity-100" />
+        </div>
+      )}
 
       <div className="relative flex h-full min-h-0 min-w-0 flex-col overflow-hidden bg-(--ui-editor-surface-background)">
         <LoopPanelTabBar
@@ -2844,8 +2850,8 @@ export function LoopPanel({
                 <div className="grid min-w-0 max-w-full gap-3">
                   <LoopTaskDetails
                     backLabel={null}
-                    detail={mergedDetail}
                     commentsError={selectedTaskCommentsError}
+                    detail={mergedDetail}
                     onAddComment={onAddTaskComment}
                     onOpenArtifactTab={openArtifactTab}
                     onSelectTaskId={selectRelatedTask}
@@ -2878,9 +2884,9 @@ export function LoopPanel({
               <div className="grid min-w-0 max-w-full gap-3">
                 <LoopTaskDetails
                   backLabel={detailBackLabel}
+                  commentsError={selectedTaskCommentsError}
                   detail={mergedDetail}
                   detailError={selectedTaskDetailError}
-                  commentsError={selectedTaskCommentsError}
                   onAddComment={onAddTaskComment}
                   onBack={detailBack}
                   onOpenArtifactTab={openArtifactTab}

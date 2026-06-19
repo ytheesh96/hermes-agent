@@ -54,8 +54,8 @@ import {
   $gatewayState,
   $messages,
   $messagingSessions,
-  $resumeFailedSessionId,
   $resumeExhaustedSessionId,
+  $resumeFailedSessionId,
   $selectedStoredSessionId,
   $sessions,
   $workingSessionIds,
@@ -90,12 +90,13 @@ import { ChatView } from './chat'
 import { requestComposerFocus, requestComposerInsert } from './chat/composer/focus'
 import { useComposerActions } from './chat/hooks/use-composer-actions'
 import {
-  ChatPreviewRail,
-  PREVIEW_RAIL_MAX_WIDTH,
-  PREVIEW_RAIL_MIN_WIDTH,
-  PREVIEW_RAIL_PANE_WIDTH
+  ChatWorkRail,
+  WORK_RAIL_MAX_WIDTH,
+  WORK_RAIL_MIN_WIDTH,
+  WORK_RAIL_PANE_WIDTH
 } from './chat/right-rail'
 import { ChatSidebar } from './chat/sidebar'
+import { useLoopPanelController } from './chat/use-loop-panel-controller'
 import { CommandPalette } from './command-palette'
 import { useGatewayBoot } from './gateway/hooks/use-gateway-boot'
 import { useGatewayRequest } from './gateway/hooks/use-gateway-request'
@@ -754,6 +755,15 @@ export function DesktopController() {
     requestGateway
   })
 
+  const loopSourceSessionId = selectedStoredSessionId || activeSessionId || routedSessionId || ''
+
+  const loopPanel = useLoopPanelController({
+    activeSessionId,
+    gatewayOpen: gatewayState === 'open' && currentView === 'chat',
+    loopSourceSessionId,
+    onAddContextRef: composer.addContextRefAttachment
+  })
+
   const branchInNewChat = useCallback(
     async (messageId?: string) => {
       const branched = await branchCurrentSession(messageId)
@@ -1121,6 +1131,7 @@ export function DesktopController() {
       }}
       onDismissError={dismissError}
       onEdit={editMessage}
+      onOpenKanbanTask={loopPanel.onSelectTaskId}
       onPasteClipboardImage={() => void composer.pasteClipboardImage()}
       onPickFiles={() => void composer.pickContextPaths('file')}
       onPickFolders={() => void composer.pickContextPaths('folder')}
@@ -1142,19 +1153,32 @@ export function DesktopController() {
   const sidebarSide = panesFlipped ? 'right' : 'left'
   const railSide = panesFlipped ? 'left' : 'right'
 
-  const previewPane = (
+  const previewOpen = Boolean(previewTarget || filePreviewTarget)
+  const loopRailOpen = Boolean(loopPanel.state && loopPanel.open && !loopPanel.hidden)
+  const workRailOpen = previewOpen || loopRailOpen
+  const previewRailTarget = filePreviewTarget || previewTarget
+
+  const workRailPane = (
     <Pane
-      disabled={!chatOpen || (!previewTarget && !filePreviewTarget)}
+      disabled={!chatOpen || !workRailOpen}
       id="preview"
       key="preview"
-      maxWidth={PREVIEW_RAIL_MAX_WIDTH}
-      minWidth={PREVIEW_RAIL_MIN_WIDTH}
+      maxWidth={WORK_RAIL_MAX_WIDTH}
+      minWidth={WORK_RAIL_MIN_WIDTH}
       resizable
       side={railSide}
-      width={PREVIEW_RAIL_PANE_WIDTH}
+      width={WORK_RAIL_PANE_WIDTH}
     >
       {chatOpen ? (
-        <ChatPreviewRail onRestartServer={restartPreviewServer} setTitlebarToolGroup={setTitlebarToolGroup} />
+        <ChatWorkRail
+          artifactSourceBaseDir={currentCwd}
+          loop={loopPanel}
+          onRestartServer={restartPreviewServer}
+          previewKey={previewRailTarget?.url}
+          previewLabel={previewRailTarget?.label}
+          previewOpen={previewOpen}
+          setTitlebarToolGroup={setTitlebarToolGroup}
+        />
       ) : null}
     </Pane>
   )
@@ -1207,7 +1231,7 @@ export function DesktopController() {
       mainOverlays={mainOverlays}
       onOpenSettings={openSettings}
       overlays={overlays}
-      previewPaneOpen={chatOpen && Boolean(previewTarget || filePreviewTarget)}
+      previewPaneOpen={chatOpen && workRailOpen}
       statusbarItems={statusbarItems}
       terminalPaneOpen={terminalSidebarOpen}
       titlebarTools={titlebarToolGroups.flat.right}
@@ -1272,7 +1296,7 @@ export function DesktopController() {
         adjacent to the chat.
       */}
       {panesFlipped ? fileBrowserPane : terminalPane}
-      {previewPane}
+      {workRailPane}
       {panesFlipped ? terminalPane : fileBrowserPane}
     </AppShell>
   )
