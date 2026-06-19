@@ -283,6 +283,58 @@ describe('deriveLoopPanelState', () => {
     })
   })
 
+  it('preserves orchestrator review routing and foreground fork metadata on Loop rows', () => {
+    const state = deriveLoopPanelStateFromTenantSource({
+      session_id: 'sess-fork',
+      root_task_id: 't_root',
+      tenant: 'tenant-a',
+      tasks: [
+        {
+          id: 't_review',
+          title: 'Orchestrator blocker triage',
+          status: 'review',
+          assignee: 'orchestrator',
+          tenant: 'tenant-a',
+          review_kind: 'blocker_triage',
+          resume_mode: 'fork',
+          review_subject_assignee: 'peacock',
+          foreground_parent_session_id: 'sess-parent',
+          foreground_fork_session_id: 'sess-fork',
+          loop_handoffs: [
+            {
+              id: 9,
+              task_id: 't_review',
+              root_task_id: 't_root',
+              handoff_kind: 'blocked_waiting',
+              state: 'batched',
+              verification_state: 'needs-user',
+              reviewer_session_id: 'sess-reviewer'
+            }
+          ],
+          included_parent_ids: ['t_root'],
+          included_child_ids: []
+        },
+        {
+          id: 't_root',
+          title: 'Root task',
+          status: 'running',
+          tenant: 'tenant-a',
+          included_parent_ids: [],
+          included_child_ids: ['t_review']
+        }
+      ]
+    })
+
+    expect(state?.rows[0]).toMatchObject({
+      reviewKind: 'blocker_triage',
+      resumeMode: 'fork',
+      reviewSubjectAssignee: 'peacock',
+      foregroundParentSessionId: 'sess-parent',
+      foregroundForkSessionId: 'sess-fork',
+      loopHandoffs: [expect.objectContaining({ handoff_kind: 'blocked_waiting', reviewer_session_id: 'sess-reviewer' })]
+    })
+  })
+
   it('prefers an explicit visible root_task_id over newer lineage session children', () => {
     const state = deriveLoopPanelStateFromTenantSource({
       session_id: 'sess-current',
@@ -492,6 +544,71 @@ describe('LoopPanel', () => {
     expect(screen.queryByRole('button', { name: /show debug json/i })).toBeNull()
     expect(screen.queryByText(/"nodes"/)).toBeNull()
   }, 15_000)
+
+  it('renders orchestrator fork lineage and task-attached foreground handoffs in the drawer', () => {
+    const state = deriveLoopPanelStateFromTenantSource({
+      session_id: 'sess-parent',
+      root_task_id: 't_root',
+      tenant: 'tenant-a',
+      latest_event_id: 206,
+      tasks: [
+        {
+          id: 't_root',
+          title: 'Root Task',
+          status: 'running',
+          tenant: 'tenant-a',
+          included_child_ids: ['t_review'],
+          included_parent_ids: []
+        },
+        {
+          id: 't_review',
+          title: 'Orchestrator triage active',
+          status: 'review',
+          tenant: 'tenant-a',
+          assignee: 'orchestrator',
+          review_kind: 'blocker_triage',
+          resume_mode: 'fork',
+          review_subject_assignee: 'peacock',
+          foreground_parent_session_id: 'sess-parent',
+          foreground_fork_session_id: 'sess-fork',
+          loop_handoffs: [
+            {
+              id: 4,
+              root_task_id: 't_root',
+              task_id: 't_review',
+              handoff_kind: 'blocked_waiting',
+              state: 'batched',
+              attention: 'needs-user',
+              verification_state: 'needs-user',
+              summary: 'Foreground owner must choose the recovery path.',
+              review_task_id: 't_review',
+              reviewer_session_id: 'sess-reviewer'
+            }
+          ],
+          included_child_ids: [],
+          included_parent_ids: ['t_root']
+        }
+      ]
+    })
+
+    render(<LoopPanel open selectedTaskId="t_review" state={state} />)
+
+    const handoffCard = screen.getByTestId('loop-foreground-handoff-card')
+    expect(within(handoffCard).getByRole('heading', { name: /Foreground \/ review handoff/i })).toBeTruthy()
+    expect(within(handoffCard).getByText('Orchestrator review active')).toBeTruthy()
+    expect(within(handoffCard).getByText(/attached to task t_review/i)).toBeTruthy()
+    expect(within(handoffCard).getByText('Review kind')).toBeTruthy()
+    expect(within(handoffCard).getByText('Blocker Triage')).toBeTruthy()
+    expect(within(handoffCard).getByText('Resume mode')).toBeTruthy()
+    expect(within(handoffCard).getByText('Fork')).toBeTruthy()
+    expect(within(handoffCard).getByText('Parent session')).toBeTruthy()
+    expect(within(handoffCard).getByText('sess-parent')).toBeTruthy()
+    expect(within(handoffCard).getByText('Fork session')).toBeTruthy()
+    expect(within(handoffCard).getByText('sess-fork')).toBeTruthy()
+    expect(within(handoffCard).getByText(/Blocked Waiting · Batched · Needs User/i)).toBeTruthy()
+    expect(within(handoffCard).getByText(/Foreground owner must choose/i)).toBeTruthy()
+    expect(within(handoffCard).getByText(/reviewer sess-reviewer/i)).toBeTruthy()
+  })
 
   it('renders compact flat rows plus read-only drawer sections from real tenant task data', () => {
     const state = deriveLoopPanelStateFromTenantSource({
@@ -878,7 +995,6 @@ describe('LoopPanel', () => {
     expect(screen.queryByRole('tab', { name: /Review child/i })).toBeNull()
     expect(screen.getByRole('heading', { name: /Root Task/i })).toBeTruthy()
   })
-
 
   it('keeps a decomposed draft root anchored as the root overview even when children block the root', () => {
     const state = deriveLoopPanelStateFromTenantSource({

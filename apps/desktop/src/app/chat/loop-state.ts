@@ -90,6 +90,25 @@ export interface LoopWorkerCounts {
   total: number
 }
 
+export interface LoopTaskHandoff {
+  attention?: null | string
+  handoff_kind?: null | string
+  id?: number
+  reason?: null | string
+  review_run_id?: null | number
+  review_task_id?: null | string
+  reviewer_session_id?: null | string
+  root_task_id?: null | string
+  run_id?: null | number
+  state?: null | string
+  summary?: null | string
+  task_id?: null | string
+  verification_state?: null | string
+  verification_status?: null | string
+  worker_profile?: null | string
+  worker_session_id?: null | string
+}
+
 export interface CompactLoopTask {
   assignee?: null | string
   completed_at?: null | number
@@ -129,6 +148,7 @@ export interface TenantLoopTask {
   latest_run?: null | LoopLatestRun
   latest_summary?: null | string
   loop_intake?: null | LoopIntakeState
+  loop_handoffs?: LoopTaskHandoff[]
   links?: {
     children?: string[]
     parents?: string[]
@@ -138,6 +158,11 @@ export interface TenantLoopTask {
   priority?: number
   result?: null | string
   session_id?: null | string
+  review_kind?: null | string
+  resume_mode?: null | string
+  review_subject_assignee?: null | string
+  foreground_parent_session_id?: null | string
+  foreground_fork_session_id?: null | string
   started_at?: null | number
   status: string
   tenant?: null | string
@@ -226,12 +251,18 @@ export interface LoopRow {
   latestRun?: null | LoopLatestRun
   latestSummary?: null | string
   loopIntake?: null | LoopIntakeState
+  loopHandoffs?: LoopTaskHandoff[]
   parentCount: number
   parents: string[]
   priority?: number
   rawTask?: TenantLoopTask
+  reviewKind?: null | string
+  resumeMode?: null | string
+  reviewSubjectAssignee?: null | string
   result?: null | string
   sourceSessionId?: null | string
+  foregroundParentSessionId?: null | string
+  foregroundForkSessionId?: null | string
   status: string
   taskId: string
   tenant?: null | string
@@ -474,7 +505,10 @@ function orderedSessionLineageIds(source: TenantLoopSource): string[] {
   )
 }
 
-export function inferLoopRootTaskIdFromTenantSource(source: TenantLoopSource, tasks: readonly TenantLoopTask[] = source.tasks || []): string {
+export function inferLoopRootTaskIdFromTenantSource(
+  source: TenantLoopSource,
+  tasks: readonly TenantLoopTask[] = source.tasks || []
+): string {
   if (source.root_task_id && tasks.some(task => task.id === source.root_task_id)) {
     return source.root_task_id
   }
@@ -583,12 +617,18 @@ function tenantRowFromTask(
     latestSummary:
       task.latest_summary || workerActivity?.summary || workerActivity?.summary_preview || latestRun?.summary || null,
     loopIntake: task.loop_intake || null,
+    loopHandoffs: task.loop_handoffs || [],
     parentCount: parents.length || task.parent_count || task.parents_count || 0,
     parents,
     priority: task.priority,
     rawTask: task,
+    reviewKind: task.review_kind,
+    resumeMode: task.resume_mode,
+    reviewSubjectAssignee: task.review_subject_assignee,
     result: task.result,
     sourceSessionId: task.session_id,
+    foregroundParentSessionId: task.foreground_parent_session_id,
+    foregroundForkSessionId: task.foreground_fork_session_id,
     status,
     taskId: task.id,
     tenant: task.tenant,

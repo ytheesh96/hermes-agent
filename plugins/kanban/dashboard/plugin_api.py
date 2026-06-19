@@ -184,6 +184,59 @@ def _task_dict(
     return d
 
 
+_LOOP_HANDOFF_TASK_FIELDS = (
+    "id",
+    "root_task_id",
+    "task_id",
+    "run_id",
+    "handoff_kind",
+    "state",
+    "attention",
+    "verification_state",
+    "verification_status",
+    "worker_profile",
+    "worker_session_id",
+    "summary",
+    "reason",
+    "review_task_id",
+    "review_run_id",
+    "reviewer_session_id",
+)
+
+
+def _compact_loop_handoff_for_task(row: dict[str, Any]) -> dict[str, Any]:
+    """Small task-attached handoff payload for Loop/desktop drawers."""
+    return {key: row.get(key) for key in _LOOP_HANDOFF_TASK_FIELDS if row.get(key) is not None}
+
+
+def _loop_handoffs_by_task(
+    conn: sqlite3.Connection,
+    task_ids: list[str],
+    *,
+    root_task_id: Optional[str] = None,
+    tenant: Optional[str] = None,
+) -> dict[str, list[dict[str, Any]]]:
+    """Return durable Loop handoffs keyed by the task they are attached to."""
+    if not task_ids:
+        return {}
+    task_id_set = set(task_ids)
+    kwargs: dict[str, Any] = {}
+    if root_task_id:
+        kwargs["root_task_id"] = root_task_id
+    if tenant:
+        kwargs["tenant"] = tenant
+    rows = kanban_db.list_loop_handoffs(conn, **kwargs)
+    grouped: dict[str, list[dict[str, Any]]] = {task_id: [] for task_id in task_ids}
+    for row in rows:
+        attached_task_id = str(row.get("task_id") or "")
+        review_task_id = str(row.get("review_task_id") or "")
+        for candidate in (attached_task_id, review_task_id):
+            if candidate in task_id_set:
+                grouped.setdefault(candidate, []).append(_compact_loop_handoff_for_task(row))
+                break
+    return {task_id: handoffs for task_id, handoffs in grouped.items() if handoffs}
+
+
 def _normalized_loop_intake_payload(payload: Any) -> Optional[dict[str, Any]]:
     if not isinstance(payload, dict):
         return None
@@ -1038,6 +1091,11 @@ def get_session_source(
 
         intake_states = _loop_intake_states_for_tasks(conn, task_ids)
         root_task_id = _session_source_root_task_id(conn, tasks, included_links)
+        loop_handoffs = _loop_handoffs_by_task(
+            conn,
+            task_ids,
+            tenant=explicit_tenant or (inferred_tenants[0] if len(inferred_tenants) == 1 else None),
+        )
         ordered_tasks = _topologically_order_tasks(tasks, included_links)
         payload_tasks: list[dict[str, Any]] = []
         for task in ordered_tasks:
@@ -1045,6 +1103,8 @@ def get_session_source(
             item = _task_dict(task, latest_summary=summary_map.get(task.id))
             if task.id in intake_states:
                 item["loop_intake"] = intake_states[task.id]
+            if task.id in loop_handoffs:
+                item["loop_handoffs"] = loop_handoffs[task.id]
             item["is_container"] = False
             item["links"] = task_links
             item["included_parent_ids"] = [pid for pid in task_links["parents"] if pid in task_id_set]
@@ -1268,6 +1328,13 @@ def get_task(
         # a second round-trip. Cards on /board carry a 200-char preview.
         full_summary = kanban_db.latest_summary(conn, task_id)
         task_d = _task_dict_with_loop_intake(conn, task, latest_summary=full_summary)
+        task_loop_handoffs = _loop_handoffs_by_task(
+            conn,
+            [task_id],
+            tenant=task.tenant,
+        ).get(task_id)
+        if task_loop_handoffs:
+            task_d["loop_handoffs"] = task_loop_handoffs
         latest_runs = _latest_runs_for_tasks(conn, [task_id])
         worker_activity = _worker_activity_for_tasks(conn, [task_id], latest_runs, board=board).get(task_id)
         if worker_activity:

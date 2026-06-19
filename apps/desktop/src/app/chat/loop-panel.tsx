@@ -30,6 +30,7 @@ import type {
   LoopRow,
   LoopTaskComment,
   LoopTaskDetail,
+  LoopTaskHandoff,
   LoopWorkerActivity,
   TenantLoopTask
 } from './loop-state'
@@ -90,7 +91,8 @@ function loopRowStatusIndicator(row: LoopRow): StatusIndicatorKind {
   const runStatus = normalizedLoopValue(row.latestRun?.status)
   const runOutcome = normalizedLoopValue(row.latestRun?.outcome)
   const active = isActiveLoopRow(row) || row.active
-  const failed = FAILED_LOOP_STATUSES.has(status) || FAILED_LOOP_STATUSES.has(runStatus) || FAILED_LOOP_STATUSES.has(runOutcome)
+  const failed =
+    FAILED_LOOP_STATUSES.has(status) || FAILED_LOOP_STATUSES.has(runStatus) || FAILED_LOOP_STATUSES.has(runOutcome)
   const attention = attentionScore(row) > 0 && !failed
 
   if (attention) {
@@ -133,7 +135,16 @@ function completedLoopRows(rows: LoopRow[]): number {
 }
 
 const TERMINAL_LOOP_STATUSES = new Set(['archived', 'cancelled', 'complete', 'completed', 'done'])
-const FAILED_LOOP_STATUSES = new Set(['blocked', 'crashed', 'error', 'failed', 'failure', 'stale', 'timed_out', 'timeout'])
+const FAILED_LOOP_STATUSES = new Set([
+  'blocked',
+  'crashed',
+  'error',
+  'failed',
+  'failure',
+  'stale',
+  'timed_out',
+  'timeout'
+])
 
 function normalizedLoopValue(value?: null | string): string {
   return (value || '').trim().toLowerCase().replaceAll('-', '_')
@@ -149,11 +160,33 @@ function attentionText(row: LoopRow): string {
     row.latestRun?.error,
     row.latestRun?.outcome,
     row.latestRun?.status,
-    row.latestRun?.summary
+    row.latestRun?.summary,
+    row.reviewKind,
+    row.resumeMode,
+    row.reviewSubjectAssignee,
+    row.foregroundParentSessionId,
+    row.foregroundForkSessionId,
+    ...(row.loopHandoffs || []).flatMap(handoff => [
+      handoff.handoff_kind,
+      handoff.state,
+      handoff.attention,
+      handoff.verification_state,
+      handoff.summary,
+      handoff.reason
+    ])
   ]
     .filter((value): value is string => Boolean(value))
     .join(' ')
     .toLowerCase()
+}
+
+function isOrchestratorReviewRow(row: LoopRow): boolean {
+  const reviewKind = normalizedLoopValue(row.reviewKind)
+  const assignee = normalizedLoopValue(row.assignee)
+
+  return Boolean(
+    reviewKind && (assignee === 'orchestrator' || reviewKind.includes('foreground') || reviewKind.includes('triage'))
+  )
 }
 
 function attentionReason(row: LoopRow): string {
@@ -168,6 +201,10 @@ function attentionReason(row: LoopRow): string {
 
   if (FAILED_LOOP_STATUSES.has(status) || FAILED_LOOP_STATUSES.has(runStatus) || FAILED_LOOP_STATUSES.has(runOutcome)) {
     return 'Worker handoff failed'
+  }
+
+  if (isOrchestratorReviewRow(row)) {
+    return status === 'review' ? 'Orchestrator review active' : 'Orchestrator review'
   }
 
   if (text.includes('review-required') || text.includes('review required')) {
@@ -205,6 +242,8 @@ function attentionScore(row: LoopRow): number {
     FAILED_LOOP_STATUSES.has(runOutcome)
   ) {
     score = 88
+  } else if (isOrchestratorReviewRow(row)) {
+    score = 84
   } else if (text.includes('review-required') || text.includes('review required')) {
     score = 82
   } else if (text.includes('human approval') || text.includes('needs approval') || text.includes('user acceptance')) {
@@ -342,12 +381,18 @@ function detailRowFromTaskDetail(detail?: LoopTaskDetail | null, selectedTaskId?
     frontier: false,
     latestRun,
     latestSummary: task.latest_summary || latestRun?.summary || null,
+    loopHandoffs: task.loop_handoffs || [],
     parentCount: parents.length || task.parent_count || task.parents_count || 0,
     parents,
     priority: task.priority,
     rawTask: task,
+    reviewKind: task.review_kind,
+    resumeMode: task.resume_mode,
+    reviewSubjectAssignee: task.review_subject_assignee,
     result: task.result,
     sourceSessionId: task.session_id,
+    foregroundParentSessionId: task.foreground_parent_session_id,
+    foregroundForkSessionId: task.foreground_fork_session_id,
     status,
     taskId: task.id,
     tenant: task.tenant,
@@ -871,9 +916,7 @@ function LoopRootActions({
 
   const canSubmit = !decomposed && !TERMINAL_LOOP_STATUSES.has(status)
 
-  const submitTitle = intakeBlocksSubmit
-    ? 'Submit approves and dispatches this Loop intake row.'
-    : undefined
+  const submitTitle = intakeBlocksSubmit ? 'Submit approves and dispatches this Loop intake row.' : undefined
 
   return (
     <div className="flex flex-wrap gap-1.5" data-testid="loop-root-actions">
@@ -1587,6 +1630,125 @@ function loopAgentActivityLabel(row: LoopRow): string | undefined {
   return [profile, currentTool].filter(Boolean).join(' · ') || profile || currentTool
 }
 
+type LoopHandoffLine = { label: string; value: string }
+
+function loopMetadataLabel(value: string): string {
+  return loopToolLabel(value.replaceAll('-', '_'))
+}
+
+function loopHandoffLinesForRow(row: LoopRow): LoopHandoffLine[] {
+  const lines: LoopHandoffLine[] = []
+  const pushLine = (label: string, value?: null | number | string) => {
+    if (value === null || value === undefined || value === '') {
+      return
+    }
+    lines.push({ label, value: String(value) })
+  }
+
+  pushLine('Review kind', row.reviewKind ? loopMetadataLabel(row.reviewKind) : undefined)
+  pushLine('Resume mode', row.resumeMode ? loopMetadataLabel(row.resumeMode) : undefined)
+  pushLine('Review subject', row.reviewSubjectAssignee)
+  pushLine('Task session', row.sourceSessionId)
+  pushLine('Parent session', row.foregroundParentSessionId)
+  pushLine('Fork session', row.foregroundForkSessionId)
+
+  return lines
+}
+
+function loopHandoffSummary(handoff: LoopTaskHandoff): string {
+  return [
+    handoff.handoff_kind ? loopMetadataLabel(handoff.handoff_kind) : undefined,
+    handoff.state ? loopMetadataLabel(handoff.state) : undefined,
+    handoff.verification_state ? loopMetadataLabel(handoff.verification_state) : undefined,
+    handoff.attention ? loopMetadataLabel(handoff.attention) : undefined
+  ]
+    .filter(Boolean)
+    .join(' · ')
+}
+
+function LoopForegroundHandoffCard({ row }: { row: LoopRow }) {
+  const lines = loopHandoffLinesForRow(row)
+  const handoffs = row.loopHandoffs || []
+  const hasReviewRouting = Boolean(
+    row.reviewKind || row.resumeMode || row.foregroundParentSessionId || row.foregroundForkSessionId
+  )
+
+  if (!hasReviewRouting && handoffs.length === 0) {
+    return null
+  }
+
+  return (
+    <DetailSection testId="loop-foreground-handoff-card" title="Foreground / review handoff">
+      <div className="grid gap-2 text-[0.72rem] text-(--ui-text-secondary)">
+        {isOrchestratorReviewRow(row) ? (
+          <div className="flex items-start gap-2 rounded-md border border-(--ui-stroke-tertiary) bg-(--ui-fill-quaternary) px-2 py-1.5">
+            <StatusIndicator ariaLabel="Orchestrator review attention" kind="attention" />
+            <div className="grid min-w-0 gap-0.5">
+              <p className="m-0 font-medium text-(--ui-text-primary)">{attentionReason(row)}</p>
+              <p className="m-0 text-[0.66rem] text-(--ui-text-tertiary)">
+                This review lane remains attached to task {row.taskId}.
+              </p>
+            </div>
+          </div>
+        ) : null}
+
+        {lines.length > 0 ? (
+          <dl className="m-0 grid gap-1" data-testid="loop-foreground-lineage-list">
+            {lines.map(line => (
+              <div className="grid min-w-0 grid-cols-[6.5rem_minmax(0,1fr)] gap-2" key={`${line.label}:${line.value}`}>
+                <dt className="text-(--ui-text-tertiary)">{line.label}</dt>
+                <dd className="m-0 min-w-0 break-all font-mono text-[0.68rem] text-(--ui-text-secondary)">
+                  {line.value}
+                </dd>
+              </div>
+            ))}
+          </dl>
+        ) : null}
+
+        {handoffs.length > 0 ? (
+          <div className="grid gap-1" data-testid="loop-foreground-handoff-list">
+            <p className="m-0 text-[0.62rem] font-medium uppercase tracking-wide text-(--ui-text-tertiary)">
+              Task handoffs
+            </p>
+            {handoffs.map((handoff, index) => (
+              <div
+                className="grid min-w-0 gap-0.5 rounded-md border border-(--ui-stroke-tertiary) bg-(--ui-surface-background) px-2 py-1.5"
+                key={handoff.id ?? `${handoff.handoff_kind}:${handoff.run_id}:${index}`}
+              >
+                <div className="flex min-w-0 flex-wrap items-center gap-1.5">
+                  <span className="font-medium text-(--ui-text-primary)">
+                    {loopHandoffSummary(handoff) || 'Loop handoff'}
+                  </span>
+                  {handoff.review_task_id ? (
+                    <span className="rounded bg-(--ui-fill-quaternary) px-1.5 py-0.5 font-mono text-[0.62rem] text-(--ui-text-tertiary)">
+                      review {handoff.review_task_id}
+                    </span>
+                  ) : null}
+                </div>
+                {(handoff.summary || handoff.reason) && (
+                  <p className="m-0 whitespace-pre-wrap text-[0.68rem] leading-relaxed text-(--ui-text-secondary)">
+                    {handoff.summary || handoff.reason}
+                  </p>
+                )}
+                {handoff.worker_session_id || handoff.reviewer_session_id ? (
+                  <p className="m-0 break-all font-mono text-[0.64rem] text-(--ui-text-tertiary)">
+                    {[
+                      handoff.worker_session_id && `worker ${handoff.worker_session_id}`,
+                      handoff.reviewer_session_id && `reviewer ${handoff.reviewer_session_id}`
+                    ]
+                      .filter(Boolean)
+                      .join(' · ')}
+                  </p>
+                ) : null}
+              </div>
+            ))}
+          </div>
+        ) : null}
+      </div>
+    </DetailSection>
+  )
+}
+
 function loopOverviewItemState(row: LoopRow): StatusItemState {
   const status = normalizedLoopValue(row.status)
   const runStatus = normalizedLoopValue(row.latestRun?.status)
@@ -1906,6 +2068,8 @@ function LoopTaskDetails({
           <LoopTaskActions onTaskAction={onTaskAction} row={row} />
         </div>
       </section>
+      <LoopForegroundHandoffCard row={row} />
+
       {/* Child/parent agent rows for navigating the task execution graph. */}
       <LoopTaskAgentsCard onSelectTaskId={onSelectTaskId} row={row} rowById={rowById} />
 
@@ -1914,7 +2078,13 @@ function LoopTaskDetails({
         {row.body?.trim() ? <TaskDescription text={row.body} /> : <EmptyDetail>No description provided.</EmptyDetail>}
       </DetailSection>
 
-      <LoopTaskCommentsCard detail={detail} detailError={detailError} commentsError={commentsError} onAddComment={onAddComment} row={row} />
+      <LoopTaskCommentsCard
+        detail={detail}
+        detailError={detailError}
+        commentsError={commentsError}
+        onAddComment={onAddComment}
+        row={row}
+      />
 
       <LoopArtifactSourcesCard detail={detail} onOpenArtifactSource={onOpenArtifactTab} rows={[row]} />
 

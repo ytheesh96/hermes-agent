@@ -4116,6 +4116,7 @@ def start_loop_handoff_review_process(
 
 
 _ORCHESTRATOR_DISPATCH_SOURCE = "kanban-orchestrator-fork"
+_ORCHESTRATOR_PARENT_STUB_SOURCE = "kanban-orchestrator-parent"
 
 
 def _is_orchestrator_dispatch_task(task: Task) -> bool:
@@ -4168,6 +4169,39 @@ def _orchestrator_fork_session_id(task: Task, parent_session_id: str) -> str:
         f"{parent_session_id}\0{task.id}\0{run_part}".encode("utf-8")
     ).hexdigest()[:32]
     return f"kanban-orch-{digest}"
+
+
+def _ensure_orchestrator_parent_stub(
+    fork_session_db: Any,
+    parent_session_id: str,
+    task: Task,
+) -> None:
+    """Ensure ``parent_session_id`` exists in the DB that will store the fork.
+
+    SessionDB enforces ``sessions.parent_session_id`` as an intra-database
+    foreign key. Foreground parents may live in the foreground profile DB while
+    orchestrator workers read a different profile DB, so create a narrow local
+    parent row in the orchestrator DB before inserting the fork child. The real
+    lineage remains in ``_branched_from`` and ``_kanban_orchestrator_fork``.
+    """
+    try:
+        if fork_session_db.get_session(parent_session_id):
+            return
+    except Exception:
+        pass
+
+    model_config = {
+        "_external_foreground_parent_session": {
+            "session_id": parent_session_id,
+            "task_id": task.id,
+            "run_id": task.current_run_id,
+        }
+    }
+    fork_session_db.create_session(
+        parent_session_id,
+        _ORCHESTRATOR_PARENT_STUB_SOURCE,
+        model_config=model_config,
+    )
 
 
 def _compact_orchestrator_dispatch_packet(task: Task, parent_session_id: str, fork_session_id: str) -> str:
@@ -4241,6 +4275,7 @@ def ensure_orchestrator_fork_for_dispatch(conn: sqlite3.Connection, task: Task) 
             "fork_session_id": fork_session_id,
         },
     }
+    _ensure_orchestrator_parent_stub(fork_session_db, parent_session_id, task)
     fork_session_db.create_session(
         fork_session_id,
         _ORCHESTRATOR_DISPATCH_SOURCE,

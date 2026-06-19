@@ -610,13 +610,18 @@ def test_block_routes_to_orchestrator_triage(worker_env):
     try:
         task = kb.get_task(conn, worker_env)
         run = kb.latest_run(conn, worker_env)
+        assert task is not None
+        assert run is not None
         assert task.status == "review"
         assert task.assignee == "orchestrator"
         assert task.review_kind == "blocker_triage"
         assert task.review_subject_assignee == "test-worker"
+        assert task.claim_lock is None
+        assert task.current_run_id is None
         assert run.outcome == "review_requested"
         assert run.metadata["blocker_triage"] is True
         assert run.metadata["blocker_reason"] == "need repository access evidence"
+        assert kb.list_loop_handoffs(conn) == []
     finally:
         conn.close()
 

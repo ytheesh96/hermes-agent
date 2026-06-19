@@ -505,6 +505,71 @@ def test_loop_handoff_plugin_detail_and_safe_auto_action(client, tmp_path):
     assert status.json()["escalated_count"] == 0
 
 
+def test_session_source_attaches_orchestrator_fork_and_handoff_metadata(client):
+    conn = kb.connect()
+    try:
+        task_id = _loop_node(conn, session_id="sess-parent")
+        with kb.write_txn(conn):
+            conn.execute(
+                """
+                UPDATE tasks
+                   SET status = 'review',
+                       assignee = 'orchestrator',
+                       review_kind = 'blocker_triage',
+                       resume_mode = 'fork',
+                       review_subject_assignee = 'peacock',
+                       foreground_parent_session_id = 'sess-parent',
+                       foreground_fork_session_id = 'sess-fork'
+                 WHERE id = ?
+                """,
+                (task_id,),
+            )
+            kb._record_loop_handoff(
+                conn,
+                task_id,
+                root_task_id="t_looproot",
+                handoff_kind="blocked_waiting",
+                run_id=None,
+                summary="foreground owner must choose recovery path",
+                metadata={"worker_session_id": "worker-session-1"},
+            )
+    finally:
+        conn.close()
+
+    source = client.get("/api/plugins/kanban/session-source", params={"session_id": "sess-parent", "board": "default"})
+    assert source.status_code == 200, source.text
+    task = next(item for item in source.json()["tasks"] if item["id"] == task_id)
+    assert task["review_kind"] == "blocker_triage"
+    assert task["resume_mode"] == "fork"
+    assert task["review_subject_assignee"] == "peacock"
+    assert task["foreground_parent_session_id"] == "sess-parent"
+    assert task["foreground_fork_session_id"] == "sess-fork"
+    assert task["loop_handoffs"] == [
+        {
+            "id": task["loop_handoffs"][0]["id"],
+            "root_task_id": "t_looproot",
+            "task_id": task_id,
+            "handoff_kind": "blocked_waiting",
+            "state": "queued",
+            "attention": "needs-orchestrator",
+            "verification_state": "needs-orchestrator",
+            "verification_status": "unknown",
+            "worker_profile": "orchestrator",
+            "worker_session_id": "worker-session-1",
+            "summary": "foreground owner must choose recovery path",
+        }
+    ]
+
+    detail = client.get(f"/api/plugins/kanban/tasks/{task_id}", params={"board": "default"})
+    assert detail.status_code == 200, detail.text
+    detail_task = detail.json()["task"]
+    assert detail_task["review_kind"] == "blocker_triage"
+    assert detail_task["resume_mode"] == "fork"
+    assert detail_task["foreground_parent_session_id"] == "sess-parent"
+    assert detail_task["foreground_fork_session_id"] == "sess-fork"
+    assert detail_task["loop_handoffs"][0]["handoff_kind"] == "blocked_waiting"
+
+
 def test_loop_handoff_plugin_auto_action_escalation_is_explicit(client):
     conn = kb.connect()
     try:

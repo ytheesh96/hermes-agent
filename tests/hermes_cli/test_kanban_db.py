@@ -1579,6 +1579,7 @@ def test_dispatch_orchestrator_task_runs_in_foreground_session_fork(
 
         kb.dispatch_once(conn, spawn_fn=fake_spawn)
         task = kb.get_task(conn, task_id)
+        assert task is not None
         events = kb.list_events(conn, task_id)
 
     assert len(spawns) == 1
@@ -1603,6 +1604,57 @@ def test_dispatch_orchestrator_task_runs_in_foreground_session_fork(
     assert audit_events[0].payload["task_id"] == task_id
     assert audit_events[0].payload["parent_foreground_session_id"] == parent_session_id
     assert audit_events[0].payload["fork_session_id"] == task.foreground_fork_session_id
+
+
+def test_dispatch_orchestrator_task_forks_into_separate_profile_db(
+    kanban_home, all_assignees_spawnable
+):
+    """Cross-profile orchestrator forks must not violate session FK constraints."""
+    from hermes_state import SessionDB
+
+    orchestrator_home = kanban_home / "profiles" / "orchestrator"
+    orchestrator_home.mkdir(parents=True)
+    parent_session_id = "foreground-parent-cross-profile"
+    foreground_db = SessionDB()
+    foreground_db.create_session(parent_session_id, "cli")
+    foreground_db.append_message(parent_session_id, "user", "foreground transcript")
+    parent_before = foreground_db.get_messages(parent_session_id)
+    orchestrator_db = SessionDB(db_path=orchestrator_home / "state.db")
+    spawns = []
+
+    def fake_spawn(task, workspace):
+        spawns.append((task.id, task.foreground_parent_session_id, task.foreground_fork_session_id))
+
+    with kb.connect() as conn:
+        task_id = kb.create_task(
+            conn,
+            title="orchestrate from another profile",
+            body="Dispatch safely across profiles",
+            assignee="orchestrator",
+            session_id=parent_session_id,
+        )
+
+        kb.dispatch_once(conn, spawn_fn=fake_spawn)
+        task = kb.get_task(conn, task_id)
+        assert task is not None
+        events = kb.list_events(conn, task_id)
+
+    assert len(spawns) == 1
+    assert task.foreground_parent_session_id == parent_session_id
+    assert task.foreground_fork_session_id
+    fork = orchestrator_db.get_session(task.foreground_fork_session_id)
+    assert fork is not None
+    assert fork["parent_session_id"] == parent_session_id
+    parent_stub = orchestrator_db.get_session(parent_session_id)
+    assert parent_stub is not None
+    assert parent_stub["source"] == "kanban-orchestrator-parent"
+    assert task_id in (parent_stub["model_config"] or "")
+    fork_messages = orchestrator_db.get_messages(task.foreground_fork_session_id)
+    assert [m["role"] for m in fork_messages] == ["user", "user"]
+    assert fork_messages[0]["content"] == "foreground transcript"
+    assert "kanban_orchestrator_dispatch" in fork_messages[1]["content"]
+    assert foreground_db.get_messages(parent_session_id) == parent_before
+    assert [e.kind for e in events].count("orchestrator_fork_session") == 1
 
 
 def test_dispatch_orchestrator_review_task_reuses_single_fork_for_claimed_run(
@@ -3676,8 +3728,39 @@ def test_dispatch_review_spawns_with_correct_skills(
     assert spawned_tasks[0].skills == ["sdlc-review"]
 
 
-def test_dispatch_orchestrator_review_kind_does_not_force_sdlc_review(
+def test_dispatch_reviewer_qa_review_keeps_sdlc_review_path(
     kanban_home, all_assignees_spawnable,
+):
+    """Ordinary QA review rows still dispatch through reviewer-qa + sdlc-review."""
+    spawned_tasks = []
+
+    def capture_spawn(task, workspace, board=None):
+        spawned_tasks.append(task)
+        return 42
+
+    with kb.connect() as conn:
+        t = kb.create_task(conn, title="ordinary QA", assignee="implementer")
+        assert kb.request_review_task(
+            conn,
+            t,
+            reviewer="reviewer-qa",
+            summary="verify acceptance evidence",
+        )
+        res = kb.dispatch_once(conn, spawn_fn=capture_spawn)
+        task = kb.get_task(conn, t)
+        assert task is not None
+
+    assert len(res.spawned) == 1
+    assert len(spawned_tasks) == 1
+    assert task.status == "running"
+    assert spawned_tasks[0].assignee == "reviewer-qa"
+    assert spawned_tasks[0].review_kind is None
+    assert spawned_tasks[0].skills == ["sdlc-review"]
+
+
+@pytest.mark.parametrize("review_kind", ["blocker_triage", "foreground_judgment"])
+def test_dispatch_orchestrator_review_kind_does_not_force_sdlc_review(
+    kanban_home, all_assignees_spawnable, review_kind,
 ):
     """Orchestrator review kinds route to the orchestrator profile, not QA."""
     spawned_tasks = []
@@ -3692,7 +3775,7 @@ def test_dispatch_orchestrator_review_kind_does_not_force_sdlc_review(
             conn,
             t,
             reviewer="orchestrator",
-            review_kind="foreground_judgment",
+            review_kind=review_kind,
             resume_mode="fork",
             summary="foreground should judge next step",
         )
@@ -3701,7 +3784,7 @@ def test_dispatch_orchestrator_review_kind_does_not_force_sdlc_review(
     assert len(res.spawned) == 1
     assert len(spawned_tasks) == 1
     assert spawned_tasks[0].assignee == "orchestrator"
-    assert spawned_tasks[0].review_kind == "foreground_judgment"
+    assert spawned_tasks[0].review_kind == review_kind
     assert spawned_tasks[0].skills in (None, [])
 
 
