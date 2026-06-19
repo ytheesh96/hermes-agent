@@ -4896,6 +4896,102 @@ def test_prompt_submit_can_truncate_before_user_ordinal(monkeypatch):
         server._sessions.pop("sid", None)
 
 
+def test_prompt_submit_truncate_uses_display_history_when_live_history_compacted(monkeypatch):
+    """Desktop checkpoint restore should work when compaction pruned live history."""
+
+    seen = {}
+
+    class _Agent:
+        def run_conversation(
+            self, prompt, conversation_history=None, stream_callback=None
+        ):
+            seen["prompt"] = prompt
+            seen["history"] = conversation_history
+            return {
+                "final_response": "restored reply",
+                "messages": [
+                    *(conversation_history or []),
+                    {"role": "user", "content": prompt},
+                    {"role": "assistant", "content": "restored reply"},
+                ],
+            }
+
+    class _ImmediateThread:
+        def __init__(self, target=None, daemon=None):
+            self._target = target
+
+        def start(self):
+            self._target()
+
+    live_history = [
+        {"role": "user", "content": "[CONTEXT COMPACTION] summary"},
+        {"role": "assistant", "content": "summary acknowledged"},
+    ]
+    display_history = [
+        {"role": "user", "content": "first"},
+        {"role": "assistant", "content": "first reply"},
+        {"role": "user", "content": "second"},
+        {"role": "assistant", "content": "second reply"},
+        *live_history,
+    ]
+    server._sessions["sid"] = _session(
+        agent=_Agent(),
+        history=live_history,
+        session_key="tip-session",
+    )
+
+    class _StubDb:
+        def __init__(self):
+            self.detached = []
+            self.replaced = []
+
+        def get_messages_as_conversation(self, session_id, include_ancestors=False):
+            seen.setdefault("history_loads", []).append((session_id, include_ancestors))
+            return list(display_history if include_ancestors else live_history)
+
+        def detach_session_parent(self, session_id):
+            self.detached.append(session_id)
+            return True
+
+        def replace_messages(self, session_id, messages):
+            self.replaced.append((session_id, list(messages)))
+
+    stub_db = _StubDb()
+
+    try:
+        monkeypatch.setattr(server.threading, "Thread", _ImmediateThread)
+        monkeypatch.setattr(server, "_get_usage", lambda _a: {})
+        monkeypatch.setattr(server, "render_message", lambda _t, _c: "")
+        monkeypatch.setattr(server, "_emit", lambda *a: None)
+        monkeypatch.setattr(server, "_get_db", lambda: stub_db)
+
+        resp = server.handle_request(
+            {
+                "id": "1",
+                "method": "prompt.submit",
+                "params": {
+                    "session_id": "sid",
+                    "text": "edited second",
+                    "truncate_before_user_ordinal": 1,
+                },
+            }
+        )
+        assert resp.get("result"), f"got error: {resp.get('error')}"
+
+        assert seen["history_loads"][0] == ("tip-session", True)
+        assert seen["prompt"] == "edited second"
+        assert seen["history"] == display_history[:2]
+        assert stub_db.detached == ["tip-session"]
+        assert stub_db.replaced == [("tip-session", display_history[:2])]
+        assert server._sessions["sid"]["history"] == [
+            *display_history[:2],
+            {"role": "user", "content": "edited second"},
+            {"role": "assistant", "content": "restored reply"},
+        ]
+    finally:
+        server._sessions.pop("sid", None)
+
+
 # ---------------------------------------------------------------------------
 # session.interrupt must only cancel pending prompts owned by the calling
 # session — it must not blast-resolve clarify/sudo/secret prompts on

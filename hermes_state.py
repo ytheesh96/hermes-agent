@@ -2645,6 +2645,19 @@ class SessionDB:
 
         self._execute_write(_do)
 
+    def detach_session_parent(self, session_id: str) -> bool:
+        """Make *session_id* a standalone conversation by clearing its parent link."""
+
+        def _do(conn):
+            cursor = conn.execute(
+                "UPDATE sessions SET parent_session_id = NULL "
+                "WHERE id = ? AND parent_session_id IS NOT NULL",
+                (session_id,),
+            )
+            return cursor.rowcount > 0
+
+        return bool(self._execute_write(_do))
+
     def get_messages(
         self, session_id: str, include_inactive: bool = False
     ) -> List[Dict[str, Any]]:

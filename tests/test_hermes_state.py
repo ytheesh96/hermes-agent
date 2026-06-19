@@ -82,6 +82,14 @@ class TestSessionLifecycle:
     def test_get_nonexistent_session(self, db):
         assert db.get_session("nonexistent") is None
 
+    def test_detach_session_parent(self, db):
+        db.create_session(session_id="parent", source="cli")
+        db.create_session(session_id="child", source="cli", parent_session_id="parent")
+
+        assert db.detach_session_parent("child") is True
+        assert db.get_session("child")["parent_session_id"] is None
+        assert db.detach_session_parent("child") is False
+
     def test_end_session(self, db):
         db.create_session(session_id="s1", source="cli")
         db.end_session("s1", end_reason="user_exit")

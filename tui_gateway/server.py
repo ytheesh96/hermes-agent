@@ -5870,6 +5870,60 @@ def _(rid, params: dict) -> dict:
 # ── Methods: prompt ──────────────────────────────────────────────────
 
 
+def _user_message_indices(history: list[dict]) -> list[int]:
+    return [i for i, message in enumerate(history) if message.get("role") == "user"]
+
+
+def _conversation_display_history_for_restore(
+    session: dict, live_history: list[dict]
+) -> list[dict] | None:
+    prefix = session.get("display_history_prefix")
+    if isinstance(prefix, list) and prefix:
+        return [m for m in [*prefix, *live_history] if isinstance(m, dict)]
+
+    db = _get_db()
+    session_key = str(session.get("session_key") or "")
+    if db is None or not session_key:
+        return None
+
+    try:
+        display_history = db.get_messages_as_conversation(
+            session_key, include_ancestors=True
+        )
+    except TypeError:
+        try:
+            display_history = db.get_messages_as_conversation(session_key)
+        except Exception:
+            return None
+    except Exception:
+        return None
+
+    if not isinstance(display_history, list):
+        return None
+    return [m for m in display_history if isinstance(m, dict)]
+
+
+def _truncate_history_before_user_ordinal(
+    session: dict,
+    live_history: list[dict],
+    ordinal: int,
+) -> tuple[list[dict] | None, bool]:
+    live_user_indices = _user_message_indices(live_history)
+    display_history = _conversation_display_history_for_restore(session, live_history)
+
+    if display_history:
+        display_user_indices = _user_message_indices(display_history)
+        if len(display_user_indices) > len(live_user_indices):
+            if ordinal < len(display_user_indices):
+                return display_history[: display_user_indices[ordinal]], True
+            return None, False
+
+    if ordinal < len(live_user_indices):
+        return live_history[: live_user_indices[ordinal]], False
+
+    return None, False
+
+
 @method("prompt.submit")
 def _(rid, params: dict) -> dict:
     sid, text = params.get("session_id", ""), params.get("text", "")
@@ -5898,14 +5952,25 @@ def _(rid, params: dict) -> dict:
             except (TypeError, ValueError):
                 return _err(rid, 4004, "truncate_before_user_ordinal must be an integer")
             history = session.get("history", [])
-            user_indices = [i for i, m in enumerate(history) if m.get("role") == "user"]
-            if ordinal >= len(user_indices):
+            truncated, used_display_history = _truncate_history_before_user_ordinal(
+                session, history, ordinal
+            )
+            if truncated is None:
                 return _err(rid, 4018, "target user message is no longer in session history")
-            truncated = history[: user_indices[ordinal]]
             session["history"] = truncated
+            if used_display_history:
+                session["display_history_prefix"] = []
             session["history_version"] = int(session.get("history_version", 0)) + 1
             if (db := _get_db()) is not None:
                 try:
+                    if used_display_history and hasattr(db, "detach_session_parent"):
+                        try:
+                            db.detach_session_parent(session["session_key"])
+                        except Exception as exc:
+                            print(
+                                f"[tui_gateway] prompt.submit: detach_session_parent failed: {exc}",
+                                file=sys.stderr,
+                            )
                     db.replace_messages(session["session_key"], truncated)
                 except Exception as exc:
                     print(f"[tui_gateway] prompt.submit: replace_messages failed: {exc}", file=sys.stderr)
