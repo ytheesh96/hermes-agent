@@ -7753,6 +7753,7 @@ def heartbeat_worker(
     *,
     note: Optional[str] = None,
     expected_run_id: Optional[int] = None,
+    current_tool: Optional[str] = None,
 ) -> bool:
     """Record a ``heartbeat`` event + touch ``last_heartbeat_at``.
 
@@ -7765,6 +7766,7 @@ def heartbeat_worker(
     should be heartbeating (not running, or claim expired).
     """
     now = int(time.time())
+    current_tool_text = str(current_tool).strip() if current_tool else None
     with write_txn(conn):
         if expected_run_id is None:
             cur = conn.execute(
@@ -7786,13 +7788,39 @@ def heartbeat_worker(
             else _current_run_id(conn, task_id)
         )
         if run_id is not None:
-            conn.execute(
-                "UPDATE task_runs SET last_heartbeat_at = ? WHERE id = ?",
-                (now, run_id),
-            )
+            if current_tool_text:
+                row = conn.execute(
+                    "SELECT metadata FROM task_runs WHERE id = ?",
+                    (run_id,),
+                ).fetchone()
+                metadata: dict[str, Any] = {}
+                if row and row["metadata"]:
+                    try:
+                        parsed = json.loads(row["metadata"])
+                        if isinstance(parsed, dict):
+                            metadata.update(parsed)
+                    except Exception:
+                        metadata = {}
+                metadata["current_tool"] = current_tool_text
+                metadata["last_tool"] = current_tool_text
+                conn.execute(
+                    "UPDATE task_runs SET last_heartbeat_at = ?, metadata = ? WHERE id = ?",
+                    (now, json.dumps(metadata, ensure_ascii=False), run_id),
+                )
+            else:
+                conn.execute(
+                    "UPDATE task_runs SET last_heartbeat_at = ? WHERE id = ?",
+                    (now, run_id),
+                )
+        heartbeat_payload = {}
+        if note:
+            heartbeat_payload["note"] = note
+        if current_tool_text:
+            heartbeat_payload["current_tool"] = current_tool_text
+            heartbeat_payload["tool_name"] = current_tool_text
         _append_event(
             conn, task_id, "heartbeat",
-            {"note": note} if note else None,
+            heartbeat_payload or None,
             run_id=run_id,
         )
     return True

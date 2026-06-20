@@ -199,9 +199,10 @@ def _connect(board: Optional[str] = None):
 
 _AUTO_HEARTBEAT_MIN_INTERVAL_SECONDS = 60.0
 _auto_heartbeat_last_attempt: float = 0.0
+_auto_heartbeat_last_tool: Optional[str] = None
 
 
-def heartbeat_current_worker_from_env() -> bool:
+def heartbeat_current_worker_from_env(*, current_tool: Optional[str] = None) -> bool:
     """Best-effort: extend the kanban claim + bump board heartbeat for the
     current dispatcher-spawned worker, using identity from env vars.
 
@@ -218,19 +219,31 @@ def heartbeat_current_worker_from_env() -> bool:
         falls back to the default ``_claimer_id()`` for locally-driven
         workers that never went through the dispatcher path
 
+    ``current_tool`` is optional live-status metadata from the agent loop. A
+    changed tool bypasses the normal heartbeat rate limit so Loop/desktop rows
+    can show the active worker tool promptly without requiring the model to
+    call the explicit ``kanban_heartbeat`` tool.
+
     Rate-limited via the module-level ``_auto_heartbeat_last_attempt``
     timestamp (monotonic clock); not thread-safe in the strict sense, but
     the worst case is one extra DB write per race, which is harmless.
     """
-    global _auto_heartbeat_last_attempt
+    global _auto_heartbeat_last_attempt, _auto_heartbeat_last_tool
     tid = os.environ.get("HERMES_KANBAN_TASK")
     if not tid:
         return False
     import time as _time
     now = _time.monotonic()
-    if (now - _auto_heartbeat_last_attempt) < _AUTO_HEARTBEAT_MIN_INTERVAL_SECONDS:
+    tool_text = str(current_tool).strip() if current_tool else None
+    tool_changed = bool(tool_text and tool_text != _auto_heartbeat_last_tool)
+    if (
+        not tool_changed
+        and (now - _auto_heartbeat_last_attempt) < _AUTO_HEARTBEAT_MIN_INTERVAL_SECONDS
+    ):
         return False
     _auto_heartbeat_last_attempt = now
+    if tool_text:
+        _auto_heartbeat_last_tool = tool_text
     try:
         kb, conn = _connect()
         try:
@@ -246,7 +259,13 @@ def heartbeat_current_worker_from_env() -> bool:
             except (TypeError, ValueError):
                 run_id = None
             try:
-                kb.heartbeat_worker(conn, tid, note=None, expected_run_id=run_id)
+                kb.heartbeat_worker(
+                    conn,
+                    tid,
+                    note=None,
+                    expected_run_id=run_id,
+                    current_tool=tool_text,
+                )
             except Exception:
                 logger.debug("auto-heartbeat: heartbeat_worker failed", exc_info=True)
         finally:

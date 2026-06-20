@@ -261,6 +261,20 @@ def _worker_session_id(payload: Optional[dict], run: Any = None) -> Optional[str
     return None
 
 
+def _worker_current_tool(payload: Optional[dict] = None, run: Any = None) -> Optional[str]:
+    metadata = _metadata_from_run(run)
+    sources = (payload if isinstance(payload, dict) else {}, metadata)
+    for source in sources:
+        for key in ("current_tool", "currentTool", "current_tool_name", "tool_name", "last_tool"):
+            value = source.get(key) if isinstance(source, dict) else None
+            if value is None:
+                continue
+            text = str(value).strip()
+            if text:
+                return text
+    return None
+
+
 def _session_lineage_ids(session_id: Optional[str]) -> list[str]:
     sid = str(session_id or "").strip()
     if not sid:
@@ -479,6 +493,8 @@ def _worker_row_payload(
         row["workspace_kind"] = worker_payload["workspace_kind"]
     if worker_payload.get("workspace_path_preview"):
         row["workspace_path_preview"] = worker_payload["workspace_path_preview"]
+    if worker_payload.get("current_tool"):
+        row["current_tool"] = worker_payload["current_tool"]
     row["board"] = _board_slug(board)
     return row
 
@@ -527,6 +543,7 @@ def _loopagent_worker_upsert_payload(
         ),
     }
     for key in (
+        "current_tool",
         "safe_summary",
         "safe_preview",
         "error_preview",
@@ -661,6 +678,9 @@ def _terminal_worker_payload(
     created_at: Optional[int],
 ) -> dict:
     out = _worker_base_payload(conn, task, event=event, board=board, run_id=run_id, created_at=created_at)
+    current_tool = _worker_current_tool(payload, _run_for_task(conn, run_id, task))
+    if current_tool:
+        out["current_tool"] = current_tool
     if kind == "completed":
         out["run_status"] = "completed"
         out["outcome"] = "completed"

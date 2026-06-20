@@ -482,15 +482,16 @@ export function reconcileKanbanSessionSource(sid: string, source: TenantLoopSour
   }
 
   const visibleTasks = (source.tasks || []).filter(task => task.id && normalized(task.status) !== 'archived')
-  const rootTasks = inferLoopRootTasksFromTenantSource(source, visibleTasks)
-  const tasks = rootTasks.map(kanbanTaskToItem)
 
-  const visibleRootTaskIds = new Set(rootTasks.map(task => task.id))
-
-  const agents = (source.workers || [])
-    .filter(worker => worker.task_id && Number.isFinite(worker.run_id) && !visibleRootTaskIds.has(worker.task_id))
+  const activeWorkers = (source.workers || [])
+    .filter(worker => worker.task_id && Number.isFinite(worker.run_id))
     .filter(worker => workerIsActive(worker) || workerNeedsForegroundAttention(worker))
-    .map(kanbanWorkerToItem)
+
+  const activeWorkerTaskIds = new Set(activeWorkers.map(worker => worker.task_id))
+  const rootTasks = inferLoopRootTasksFromTenantSource(source, visibleTasks)
+  const tasks = rootTasks.filter(task => !activeWorkerTaskIds.has(task.id)).map(kanbanTaskToItem)
+
+  const agents = activeWorkers.map(kanbanWorkerToItem)
 
   writeKanbanStatus(sid, [...tasks, ...agents])
 }
@@ -534,9 +535,23 @@ export const $statusItemsBySession = computed(
     }
 
     for (const sid of new Set([...Object.keys(kanban), ...Object.keys(loopagents)])) {
-      const liveItems = (loopagents[sid] ?? []).filter(loopagentVisibleInComposer).map(loopagentToItem)
+      const liveActivities = (loopagents[sid] ?? []).filter(loopagentVisibleInComposer)
+
+      const liveWorkerTaskIds = new Set(
+        liveActivities.filter(agent => agent.kind === 'worker').map(agent => agent.taskId)
+      )
+
+      const liveItems = liveActivities
+        .filter(agent => !(agent.kind === 'task' && liveWorkerTaskIds.has(agent.taskId)))
+        .map(loopagentToItem)
+
       const liveIds = new Set(liveItems.map(item => item.id))
-      const snapshotItems = (kanban[sid] ?? []).filter(item => !liveIds.has(item.id))
+
+      const snapshotItems = (kanban[sid] ?? []).filter(
+        item =>
+          !liveIds.has(item.id) &&
+          !(item.type === 'todo' && item.kanbanTaskId && liveWorkerTaskIds.has(item.kanbanTaskId))
+      )
 
       push(sid, [...snapshotItems, ...liveItems])
     }
