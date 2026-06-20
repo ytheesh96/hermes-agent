@@ -308,6 +308,14 @@ interface RootOverviewGroups {
   queued: LoopRow[]
 }
 
+interface LoopRootOrchestrationState {
+  activeRows: LoopRow[]
+  attentionRows: LoopRow[]
+  handoffRows: LoopRow[]
+  reviewingRows: LoopRow[]
+  waitingRows: LoopRow[]
+}
+
 function rootDescendantRows(state: LoopPanelState, root: LoopRow): LoopRow[] {
   const seen = new Set(loopConnectedTaskIds(state, root.taskId))
   seen.delete(root.taskId)
@@ -337,6 +345,29 @@ function rootOverviewGroups(state: LoopPanelState, root: LoopRow): RootOverviewG
     other: descendants.filter(row => !groupedIds.has(row.taskId)),
     completed
   }
+}
+
+function loopRootOrchestrationState(state: LoopPanelState, root: LoopRow): LoopRootOrchestrationState {
+  const rows = [root, ...rootDescendantRows(state, root)]
+
+  const activeRows = rows.filter(row => isActiveLoopRow(row))
+  const attentionRowsList = attentionRows(rows)
+
+  const handoffRows = rows.filter(row => {
+    const status = normalizedLoopValue(row.status)
+
+    return status === 'foreground_handoff' || status === 'review' || (row.loopHandoffs || []).length > 0
+  })
+
+  const reviewingRows = rows.filter(row => {
+    const text = attentionText(row)
+
+    return isOrchestratorReviewRow(row) || normalizedLoopValue(row.status) === 'review' || text.includes('review-required')
+  })
+
+  const waitingRows = rows.filter(row => isQueuedLoopRow(row) || normalizedLoopValue(row.status) === 'foreground_handoff')
+
+  return { activeRows, attentionRows: attentionRowsList, handoffRows, reviewingRows, waitingRows }
 }
 
 function idsFromTask(task: TenantLoopTask, key: 'children' | 'parents'): string[] {
@@ -895,6 +926,90 @@ function LoopTaskActions({
         </Button>
       )}
     </div>
+  )
+}
+
+function loopPlural(count: number, singular: string, plural = `${singular}s`): string {
+  return `${count} ${count === 1 ? singular : plural}`
+}
+
+function loopDisplayStatus(value?: null | string): string {
+  const status = normalizedLoopValue(value)
+
+  if (status === 'triage') {
+    return 'Draft'
+  }
+
+  if (status === 'foreground_handoff') {
+    return 'Foreground handoff'
+  }
+
+  return status ? loopMetadataLabel(status) : 'Unknown'
+}
+
+function LoopRootStateChip({ count, label, tone = 'neutral' }: { count: number; label: string; tone?: 'active' | 'attention' | 'neutral' | 'waiting' }) {
+  if (count <= 0) {
+    return null
+  }
+
+  return (
+    <span
+      className={cn(
+        'rounded border px-2 py-1 text-[0.66rem] font-medium',
+        tone === 'active' && 'border-sky-500/30 bg-sky-500/10 text-sky-600 dark:text-sky-300',
+        tone === 'attention' && 'border-amber-500/30 bg-amber-500/10 text-amber-600 dark:text-amber-300',
+        tone === 'waiting' && 'border-violet-500/30 bg-violet-500/10 text-violet-600 dark:text-violet-300',
+        tone === 'neutral' && 'border-(--ui-stroke-tertiary) bg-(--ui-fill-quaternary) text-(--ui-text-tertiary)'
+      )}
+    >
+      {count} {label}
+    </span>
+  )
+}
+
+function LoopRootStateCard({ orchestration, root }: { orchestration: LoopRootOrchestrationState; root: LoopRow }) {
+  const activeCount = orchestration.activeRows.length
+  const waitingCount = orchestration.waitingRows.length
+  const handoffCount = orchestration.handoffRows.length
+  const reviewingCount = orchestration.reviewingRows.length
+  const attentionCount = orchestration.attentionRows.length
+  const status = normalizedLoopValue(root.status)
+
+  const activityMessage =
+    reviewingCount > 0
+      ? `Hermes is reviewing ${loopPlural(reviewingCount, 'task')}`
+      : activeCount > 0
+        ? `Hermes is coordinating ${loopPlural(activeCount, 'active task')}`
+        : waitingCount > 0 || handoffCount > 0
+          ? `Waiting on ${loopPlural(Math.max(waitingCount, handoffCount), 'worker handoff')}`
+          : isDoneLoopRow(root)
+            ? 'Loop root is complete'
+            : 'Loop orchestration is idle'
+
+  return (
+    <DetailSection testId="loop-root-state-card" title="Loop state">
+      <div className="grid gap-2 text-[0.72rem] text-(--ui-text-secondary)">
+        <div className="flex items-start gap-2 rounded-md border border-(--ui-stroke-tertiary) bg-(--ui-fill-quaternary) px-2 py-1.5">
+          <StatusIndicator
+            ariaLabel={`Root status: ${root.status}`}
+            kind={reviewingCount > 0 || handoffCount > 0 ? 'attention' : loopRowStatusIndicator(root)}
+          />
+          <div className="grid min-w-0 gap-0.5">
+            <p className="m-0 font-medium text-(--ui-text-primary)">{activityMessage}</p>
+            <p className="m-0 text-[0.66rem] text-(--ui-text-tertiary)">
+              Root {root.taskId} is {loopDisplayStatus(status)}.
+            </p>
+          </div>
+        </div>
+        <div className="flex flex-wrap gap-1.5" data-testid="loop-root-state-counts">
+          <LoopRootStateChip count={activeCount} label="active" tone="active" />
+          <LoopRootStateChip count={reviewingCount} label="reviewing" tone="attention" />
+          <LoopRootStateChip count={handoffCount} label="handoff" tone="attention" />
+          <LoopRootStateChip count={waitingCount} label="waiting" tone="waiting" />
+          <LoopRootStateChip count={attentionCount} label="attention" tone="attention" />
+        </div>
+      </div>
+    </DetailSection>
   )
 }
 
@@ -2640,6 +2755,7 @@ function LoopRootOverview({
   state: LoopPanelState
 }) {
   const groups = rootOverviewGroups(state, root)
+  const orchestration = loopRootOrchestrationState(state, root)
 
   const groupedCount =
     groups.active.length +
@@ -2671,6 +2787,8 @@ function LoopRootOverview({
           />
         </div>
       </section>
+
+      <LoopRootStateCard orchestration={orchestration} root={root} />
 
       {decomposed ? <LoopRootAgentsCard groups={groups} onOpenTaskTab={onOpenTaskTab} root={root} /> : null}
 
