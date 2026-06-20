@@ -1,6 +1,7 @@
-import { cleanup, fireEvent, render, screen, waitFor } from '@testing-library/react'
+import { cleanup, fireEvent, render, screen, waitFor, within } from '@testing-library/react'
 import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it, vi } from 'vitest'
 
+import { deriveLoopPanelStateFromTenantSource } from '@/app/chat/loop-state'
 import type { HermesReadDirResult } from '@/global'
 import {
   $filePreviewTabs,
@@ -119,6 +120,17 @@ describe('RightSidebarPane', () => {
     await waitFor(() =>
       expect(screen.getByRole('button', { name: 'Refresh tree' }).hasAttribute('disabled')).toBe(false)
     )
+    await screen.findByText('README.md')
+
+    fireEvent.click(screen.getByRole('button', { name: 'repo' }))
+
+    await waitFor(() => {
+      expect(screen.queryByText('README.md')).toBeNull()
+    })
+
+    fireEvent.click(screen.getByRole('button', { name: 'repo' }))
+
+    await screen.findByText('README.md')
 
     readDir.mockClear()
 
@@ -155,4 +167,141 @@ describe('RightSidebarPane', () => {
     })
     expect($filePreviewTarget.get()).toBeNull()
   })
+
+  it('shows Loop changed files as a collapsible tree and opens files in source mode', async () => {
+    const loopState = deriveLoopPanelStateFromTenantSource({
+      latest_event_id: 42,
+      session_id: 'session-1',
+      tasks: [
+        {
+          id: 't_loop',
+          title: 'Loop implementation',
+          status: 'done',
+          tenant: 'tenant-a',
+          workspace_kind: 'worktree',
+          workspace_path: '/worktrees/t_loop',
+          latest_run: {
+            id: 7,
+            metadata: {
+              changed_files: [
+                { path: 'src/app/chat/loop-panel.tsx', status: 'modified' },
+                { path: 'src/app/right-sidebar/index.tsx', status: 'added' },
+                { path: 'src/obsolete.ts', status: 'deleted' }
+              ]
+            },
+            status: 'done'
+          }
+        }
+      ],
+      tenant: 'tenant-a'
+    })
+
+    normalizePreviewTarget.mockImplementation(async target => htmlPreview(target))
+
+    render(
+      <RightSidebarPane
+        loopState={loopState}
+        onActivateFile={vi.fn()}
+        onActivateFolder={vi.fn()}
+        onChangeCwd={vi.fn()}
+      />
+    )
+
+    const section = screen.getByTestId('right-sidebar-changed-files')
+    const explorerFile = await screen.findByText('README.md')
+
+    expect(section).toBeTruthy()
+    expect(explorerFile.compareDocumentPosition(section) & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy()
+    expect(section.className).toContain('basis-[22rem]')
+    expect(section.className).toContain('max-h-[50%]')
+    expect(screen.getByText('Changed files')).toBeTruthy()
+    expect(screen.getByText('loop-panel.tsx')).toBeTruthy()
+    expect(screen.getByText('index.tsx')).toBeTruthy()
+    expect(screen.getByText('obsolete.ts')).toBeTruthy()
+    expect(screen.getByText('M')).toBeTruthy()
+    expect(screen.getByText('A')).toBeTruthy()
+    expect(screen.getByText('D')).toBeTruthy()
+    for (const statusBadge of ['M', 'A', 'D']) {
+      const badgeSlot = screen.getByText(statusBadge).parentElement
+      const badgeRow = badgeSlot?.parentElement
+
+      expect(badgeSlot?.className).toContain('w-4')
+      expect(badgeSlot?.className).toContain('justify-self-end')
+      expect(badgeRow?.className).toContain('grid')
+      expect(badgeRow?.className).toContain('overflow-hidden')
+      expect(badgeRow?.style.gridTemplateColumns).toBe('auto minmax(0, 1fr) 1rem')
+      expect(badgeRow?.style.width).toBeTruthy()
+      expect(badgeRow?.style.maxWidth).toBe(badgeRow?.style.width)
+    }
+
+    const showFlatButton = within(section).getByRole('button', { name: 'Show changed files as flat list' })
+    expect(showFlatButton.querySelector('.codicon-list-unordered')).toBeTruthy()
+
+    fireEvent.click(showFlatButton)
+
+    await screen.findByText('loop-panel.tsx')
+    expect(screen.queryByText('src/app/chat/loop-panel.tsx')).toBeNull()
+    expect(screen.queryByText('src/app/right-sidebar/index.tsx')).toBeNull()
+    expect(screen.queryByText('src/obsolete.ts')).toBeNull()
+    expect(screen.getByText('index.tsx')).toBeTruthy()
+    expect(screen.getByText('obsolete.ts')).toBeTruthy()
+    const showTreeButton = within(section).getByRole('button', { name: 'Show changed files as file tree' })
+    expect(showTreeButton.querySelector('.codicon-list-tree')).toBeTruthy()
+
+    fireEvent.click(screen.getByText('index.tsx'))
+
+    await waitFor(() => {
+      expect(normalizePreviewTarget).toHaveBeenCalledWith('/worktrees/t_loop/src/app/right-sidebar/index.tsx', '/repo')
+      expect($filePreviewTarget.get()).toMatchObject({
+        path: '/worktrees/t_loop/src/app/right-sidebar/index.tsx',
+        renderMode: 'source'
+      })
+    })
+
+    fireEvent.click(showTreeButton)
+
+    await screen.findByText('loop-panel.tsx')
+
+    fireEvent.click(screen.getByRole('button', { name: 'repo' }))
+
+    await waitFor(() => {
+      expect(screen.queryByText('README.md')).toBeNull()
+    })
+    expect(section.className).toContain('flex-1')
+    expect(section.className).not.toContain('basis-[22rem]')
+    expect(section.className).not.toContain('max-h-[50%]')
+
+    const changedFilesToggle = within(section).getByRole('button', { name: /Changed files/ })
+
+    fireEvent.click(changedFilesToggle)
+
+    await waitFor(() => {
+      expect(screen.queryByText('loop-panel.tsx')).toBeNull()
+    })
+
+    fireEvent.click(changedFilesToggle)
+
+    await screen.findByText('loop-panel.tsx')
+
+    fireEvent.click(screen.getByText('src'))
+
+    await waitFor(() => {
+      expect(screen.queryByText('index.tsx')).toBeNull()
+    })
+
+    fireEvent.click(screen.getByText('src'))
+
+    await screen.findByText('index.tsx')
+
+    fireEvent.click(screen.getByText('index.tsx'))
+
+    await waitFor(() => {
+      expect(normalizePreviewTarget).toHaveBeenCalledWith('/worktrees/t_loop/src/app/right-sidebar/index.tsx', '/repo')
+      expect($filePreviewTarget.get()).toMatchObject({
+        path: '/worktrees/t_loop/src/app/right-sidebar/index.tsx',
+        renderMode: 'source'
+      })
+    })
+    expect($previewTarget.get()).toBeNull()
+  }, 10000)
 })

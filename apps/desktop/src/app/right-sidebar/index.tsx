@@ -1,10 +1,13 @@
 import { useStore } from '@nanostores/react'
-import type { ReactNode } from 'react'
+import { useMemo, useState, type ReactNode } from 'react'
 
+import type { LoopPanelState, LoopRow } from '@/app/chat/loop-state'
 import { ErrorBoundary } from '@/components/error-boundary'
 import { Button } from '@/components/ui/button'
 import { Codicon } from '@/components/ui/codicon'
+import { DisclosureCaret } from '@/components/ui/disclosure-caret'
 import { Loader } from '@/components/ui/loader'
+import { Tip } from '@/components/ui/tooltip'
 import { useI18n } from '@/i18n'
 import { selectDesktopPaths } from '@/lib/desktop-fs'
 import { normalizeOrLocalPreviewTarget } from '@/lib/local-preview'
@@ -18,20 +21,24 @@ import { SidebarPanelLabel } from '../shell/sidebar-label'
 
 import { RemoteFolderPicker } from './files/remote-picker'
 import { ProjectTree } from './files/tree'
-import { useProjectTree } from './files/use-project-tree'
+import { useProjectTree, type TreeNode } from './files/use-project-tree'
 
 interface RightSidebarPaneProps {
+  loopState?: LoopPanelState | null
   onActivateFile: (path: string) => void
   onActivateFolder: (path: string) => void
   onChangeCwd: (path: string) => Promise<void> | void
 }
 
-export function RightSidebarPane({ onActivateFile, onActivateFolder, onChangeCwd }: RightSidebarPaneProps) {
+export function RightSidebarPane({ loopState, onActivateFile, onActivateFolder, onChangeCwd }: RightSidebarPaneProps) {
   const { t } = useI18n()
   const r = t.rightSidebar
   const panesFlipped = useStore($panesFlipped)
   const currentCwd = useStore($currentCwd).trim()
   const hasCwd = currentCwd.length > 0
+  const [changedFilesOpen, setChangedFilesOpen] = useState(true)
+  const [changedFilesView, setChangedFilesView] = useState<ChangedFilesView>('tree')
+  const [fileExplorerOpen, setFileExplorerOpen] = useState(true)
 
   const {
     collapseAll,
@@ -54,6 +61,7 @@ export function RightSidebarPane({ onActivateFile, onActivateFolder, onChangeCwd
     : r.noFolderSelected
 
   const canCollapse = Object.values(openState).some(Boolean)
+  const changedFiles = useMemo(() => changedFilesFromLoopState(loopState), [loopState])
 
   const chooseFolder = async () => {
     const selected = await selectDesktopPaths({
@@ -109,14 +117,398 @@ export function RightSidebarPane({ onActivateFile, onActivateFolder, onChangeCwd
         onActivateFolder={onActivateFolder}
         onChangeFolder={chooseFolder}
         onCollapseAll={collapseAll}
+        onOpenChange={setFileExplorerOpen}
         onLoadChildren={loadChildren}
         onNodeOpenChange={setNodeOpen}
         onPreviewFile={previewFile}
         onRefresh={() => void refreshRoot()}
         onViewSourceFile={path => void previewFile(path, 'source')}
+        open={fileExplorerOpen}
         openState={openState}
       />
+
+      <ChangedFilesSection
+        entries={changedFiles}
+        fillAvailable={!fileExplorerOpen}
+        onActivateFile={onActivateFile}
+        onOpenChange={setChangedFilesOpen}
+        onPreviewFile={path => void previewFile(path, 'source')}
+        onViewChange={setChangedFilesView}
+        open={changedFilesOpen}
+        view={changedFilesView}
+      />
     </aside>
+  )
+}
+
+type ChangedFileStatus = 'A' | 'D' | 'M'
+type ChangedFilesView = 'tree' | 'list'
+
+interface ChangedFileEntry {
+  absolutePath: string
+  id: string
+  name: string
+  relativePath: string
+  status: ChangedFileStatus
+}
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return Boolean(value && typeof value === 'object' && !Array.isArray(value))
+}
+
+function changedFileMetadataSources(row: LoopRow): unknown[] {
+  const sources = [
+    row.latestRun?.metadata,
+    ...(row.workerActivity?.recent_task_events || [])
+      .slice()
+      .reverse()
+      .map(event => event.payload)
+  ]
+
+  return sources.flatMap(source => {
+    const nested = isRecord(source) ? source.metadata : null
+
+    return nested ? [source, nested] : [source]
+  })
+}
+
+function changedFileValues(metadata: unknown): unknown[] {
+  if (!isRecord(metadata)) {
+    return []
+  }
+
+  const values = metadata.changed_files ?? metadata.changedFiles
+
+  if (Array.isArray(values)) {
+    return values
+  }
+
+  return values ? [values] : []
+}
+
+function textValue(value: unknown): string {
+  return typeof value === 'string' ? value.trim() : ''
+}
+
+function changedFilePath(value: unknown): string {
+  if (typeof value === 'string') {
+    return parseChangedFileString(value).path
+  }
+
+  if (!isRecord(value)) {
+    return ''
+  }
+
+  for (const key of ['path', 'file', 'filepath', 'target', 'source']) {
+    const candidate = textValue(value[key])
+
+    if (candidate) {
+      return candidate
+    }
+  }
+
+  return ''
+}
+
+function statusFromText(value: string): ChangedFileStatus {
+  const normalized = value.trim().toLowerCase()
+
+  if (/^(a|add|added|new|create|created|untracked|\?\?)$/.test(normalized)) {
+    return 'A'
+  }
+
+  if (/^(d|delete|deleted|remove|removed)$/.test(normalized)) {
+    return 'D'
+  }
+
+  return 'M'
+}
+
+function parseChangedFileString(value: string): { path: string; status: ChangedFileStatus } {
+  const trimmed = value.trim()
+  const porcelain = trimmed.match(/^([ MADRCU?!]{1,2})\s+(.+)$/)
+
+  if (!porcelain) {
+    return { path: trimmed, status: 'M' }
+  }
+
+  const rawStatus = porcelain[1]!.trim()
+  const rawPath = porcelain[2]!.replace(/^.+\s+->\s+/, '').trim()
+
+  return { path: rawPath, status: statusFromText(rawStatus) }
+}
+
+function changedFileStatus(value: unknown): ChangedFileStatus {
+  if (typeof value === 'string') {
+    return parseChangedFileString(value).status
+  }
+
+  if (!isRecord(value)) {
+    return 'M'
+  }
+
+  for (const key of ['status', 'change', 'change_type', 'changeType', 'kind']) {
+    const candidate = textValue(value[key])
+
+    if (candidate) {
+      return statusFromText(candidate)
+    }
+  }
+
+  const diff = textValue(value.inline_diff) || textValue(value.inlineDiff) || textValue(value.diff)
+
+  if (/\bdeleted file mode\b/.test(diff)) {
+    return 'D'
+  }
+
+  if (/\bnew file mode\b/.test(diff)) {
+    return 'A'
+  }
+
+  return 'M'
+}
+
+function isAbsolutePath(value: string): boolean {
+  return /^(?:\/|[a-z]:[\\/]|\\\\)/i.test(value)
+}
+
+function isUrlTarget(value: string): boolean {
+  return /^[a-z][a-z0-9+.-]*:/i.test(value)
+}
+
+function joinPath(base: string, target: string): string {
+  if (!base) {
+    return target
+  }
+
+  const separator = base.includes('\\') && !base.includes('/') ? '\\' : '/'
+
+  return `${base.replace(/[\\/]+$/, '')}${separator}${target.replace(/^\.?[\\/]+/, '')}`
+}
+
+function normalizeRelativePath(target: string): string {
+  return target.replace(/^[\\/]+/, '').replace(/\\/g, '/')
+}
+
+function changedFilesFromLoopState(loopState?: LoopPanelState | null): ChangedFileEntry[] {
+  const seen = new Set<string>()
+  const entries: ChangedFileEntry[] = []
+
+  for (const row of loopState?.rows || []) {
+    for (const metadata of changedFileMetadataSources(row)) {
+      for (const value of changedFileValues(metadata)) {
+        const rawPath = changedFilePath(value)
+
+        if (!rawPath) {
+          continue
+        }
+
+        const status = changedFileStatus(value)
+        const absolutePath =
+          isUrlTarget(rawPath) || isAbsolutePath(rawPath) ? rawPath : joinPath(row.workspacePath || '', rawPath)
+        const dedupeKey = absolutePath || rawPath
+
+        if (seen.has(dedupeKey)) {
+          continue
+        }
+
+        seen.add(dedupeKey)
+
+        const relativePath = normalizeRelativePath(rawPath)
+        const parts = relativePath.split('/').filter(Boolean)
+        const name = parts.pop() || relativePath
+
+        entries.push({
+          absolutePath,
+          id: `${row.taskId}:${dedupeKey}`,
+          name,
+          relativePath,
+          status
+        })
+      }
+    }
+  }
+
+  return entries.sort((a, b) => a.relativePath.localeCompare(b.relativePath))
+}
+
+function changedFileTreeFromEntries(entries: ChangedFileEntry[]): {
+  badgeByPath: Map<string, ChangedFileStatus>
+  data: TreeNode[]
+  openState: Record<string, boolean>
+} {
+  const rootNodes: TreeNode[] = []
+  const directories = new Map<string, TreeNode>()
+  const badgeByPath = new Map<string, ChangedFileStatus>()
+  const openState: Record<string, boolean> = {}
+
+  const directoryNode = (parts: string[]): TreeNode => {
+    const key = parts.join('/')
+    const existing = directories.get(key)
+
+    if (existing) {
+      return existing
+    }
+
+    const node: TreeNode = {
+      children: [],
+      id: `changed:${key}`,
+      isDirectory: true,
+      name: parts.at(-1) || key
+    }
+
+    directories.set(key, node)
+    openState[node.id] = true
+
+    if (parts.length === 1) {
+      rootNodes.push(node)
+    } else {
+      directoryNode(parts.slice(0, -1)).children!.push(node)
+    }
+
+    return node
+  }
+
+  for (const entry of entries) {
+    const parts = entry.relativePath.split('/').filter(Boolean)
+    const fileName = parts.pop() || entry.name
+    const fileNode: TreeNode = {
+      id: entry.absolutePath || entry.relativePath,
+      isDirectory: false,
+      name: fileName
+    }
+
+    badgeByPath.set(fileNode.id, entry.status)
+
+    if (parts.length === 0) {
+      rootNodes.push(fileNode)
+    } else {
+      directoryNode(parts).children!.push(fileNode)
+    }
+  }
+
+  return { badgeByPath, data: rootNodes, openState }
+}
+
+function changedFileFlatTreeFromEntries(entries: ChangedFileEntry[]): {
+  badgeByPath: Map<string, ChangedFileStatus>
+  data: TreeNode[]
+  openState: Record<string, boolean>
+} {
+  const badgeByPath = new Map<string, ChangedFileStatus>()
+
+  return {
+    badgeByPath,
+    data: entries.map(entry => {
+      const id = entry.absolutePath || entry.relativePath
+
+      badgeByPath.set(id, entry.status)
+
+      return {
+        id,
+        isDirectory: false,
+        name: entry.name
+      }
+    }),
+    openState: {}
+  }
+}
+
+function ChangedFilesSection({
+  entries,
+  fillAvailable,
+  onActivateFile,
+  onOpenChange,
+  onPreviewFile,
+  onViewChange,
+  open,
+  view
+}: {
+  entries: ChangedFileEntry[]
+  fillAvailable: boolean
+  onActivateFile: (path: string) => void
+  onOpenChange: (open: boolean) => void
+  onPreviewFile: (path: string) => void
+  onViewChange: (view: ChangedFilesView) => void
+  open: boolean
+  view: ChangedFilesView
+}) {
+  if (entries.length === 0) {
+    return null
+  }
+
+  const showingTree = view === 'tree'
+  const { badgeByPath, data, openState } = showingTree
+    ? changedFileTreeFromEntries(entries)
+    : changedFileFlatTreeFromEntries(entries)
+  const nextView = showingTree ? 'list' : 'tree'
+  const viewToggleLabel = showingTree ? 'Show changed files as flat list' : 'Show changed files as file tree'
+  const openChangedFile = (path: string) => {
+    if (badgeByPath.get(path) !== 'D') {
+      onPreviewFile(path)
+    }
+  }
+  const attachChangedFile = (path: string) => {
+    if (badgeByPath.get(path) !== 'D') {
+      onActivateFile(path)
+    }
+  }
+
+  return (
+    <section
+      aria-label="Changed files"
+      className={cn(
+        'relative flex w-full min-w-0 shrink-0 flex-col overflow-hidden p-0 pb-1',
+        open && (fillAvailable ? 'min-h-0 flex-1' : 'min-h-40 basis-[22rem] max-h-[50%]')
+      )}
+      data-testid="right-sidebar-changed-files"
+    >
+      <RightSidebarSectionHeader
+        label="Changed files"
+        meta={entries.length}
+        onToggle={() => onOpenChange(!open)}
+        open={open}
+      >
+        <div className="grid size-6 shrink-0 place-items-center">
+          <Tip label={viewToggleLabel}>
+            <Button
+              aria-label={viewToggleLabel}
+              className="text-(--ui-text-tertiary) opacity-70 hover:bg-(--ui-control-hover-background) hover:text-foreground hover:opacity-100 focus-visible:opacity-100"
+              onClick={event => {
+                event.stopPropagation()
+                onViewChange(nextView)
+              }}
+              size="icon-xs"
+              variant="ghost"
+            >
+              <Codicon name={showingTree ? 'list-unordered' : 'list-tree'} size="0.75rem" />
+            </Button>
+          </Tip>
+        </div>
+      </RightSidebarSectionHeader>
+      {open && (
+        <ProjectTree
+          collapseNonce={0}
+          cwd={`loop-changed-files:${view}`}
+          data={data}
+          getFileBadge={node => {
+            const badge = badgeByPath.get(node.id)
+
+            return badge ? (
+              <span aria-hidden className="font-mono text-[0.62rem] text-(--ui-text-quaternary)">
+                {badge}
+              </span>
+            ) : null
+          }}
+          onActivateFile={attachChangedFile}
+          onActivateFolder={() => undefined}
+          onLoadChildren={() => undefined}
+          onNodeOpenChange={() => undefined}
+          onPreviewFile={openChangedFile}
+          openState={openState}
+        />
+      )}
+    </section>
   )
 }
 
@@ -126,7 +518,9 @@ interface FilesystemTabProps extends FileTreeBodyProps {
   hasCwd: boolean
   onChangeFolder: () => Promise<void> | void
   onCollapseAll: () => void
+  onOpenChange: (open: boolean) => void
   onRefresh: () => void
+  open: boolean
 }
 
 // Sidebar palette + hover-reveal: header actions stay reachable while moving
@@ -149,27 +543,22 @@ function FilesystemTab({
   onActivateFolder,
   onChangeFolder,
   onCollapseAll,
+  onOpenChange,
   onLoadChildren,
   onNodeOpenChange,
   onPreviewFile,
   onRefresh,
+  open,
   openState
 }: FilesystemTabProps) {
   const { t } = useI18n()
   const r = t.rightSidebar
 
   return (
-    <div className="flex min-h-0 flex-1 flex-col">
-      <RightSidebarSectionHeader>
-        <div className="flex min-w-0 flex-1">
-          <button
-            className="flex w-full min-w-0 items-center rounded-md text-left hover:text-(--ui-text-secondary)"
-            onClick={() => void onChangeFolder()}
-            type="button"
-          >
-            <SidebarPanelLabel>{cwdName}</SidebarPanelLabel>
-          </button>
-        </div>
+    <div
+      className={cn('relative flex min-h-0 w-full min-w-0 flex-col overflow-hidden p-0', open ? 'flex-1' : 'shrink-0')}
+    >
+      <RightSidebarSectionHeader label={cwdName} onToggle={() => onOpenChange(!open)} open={open}>
         <Button
           aria-label={r.refreshTree}
           className={HEADER_ACTION_LABEL_REVEAL}
@@ -200,26 +589,61 @@ function FilesystemTab({
           <Codicon name="collapse-all" size="0.8125rem" />
         </Button>
       </RightSidebarSectionHeader>
-      <FileTreeBody
-        collapseNonce={collapseNonce}
-        cwd={cwd}
-        data={data}
-        error={error}
-        loading={loading}
-        onActivateFile={onActivateFile}
-        onActivateFolder={onActivateFolder}
-        onLoadChildren={onLoadChildren}
-        onNodeOpenChange={onNodeOpenChange}
-        onPreviewFile={onPreviewFile}
-        onRetry={onRefresh}
-        openState={openState}
-      />
+      {open && (
+        <FileTreeBody
+          collapseNonce={collapseNonce}
+          cwd={cwd}
+          data={data}
+          error={error}
+          loading={loading}
+          onActivateFile={onActivateFile}
+          onActivateFolder={onActivateFolder}
+          onLoadChildren={onLoadChildren}
+          onNodeOpenChange={onNodeOpenChange}
+          onPreviewFile={onPreviewFile}
+          onRetry={onRefresh}
+          openState={openState}
+        />
+      )}
     </div>
   )
 }
 
-export function RightSidebarSectionHeader({ children }: { children: ReactNode }) {
-  return <div className="group/project-header flex h-7 shrink-0 items-center px-2.5">{children}</div>
+export function RightSidebarSectionHeader({
+  children,
+  label,
+  meta,
+  onToggle,
+  open
+}: {
+  children?: ReactNode
+  label: ReactNode
+  meta?: ReactNode
+  onToggle: () => void
+  open: boolean
+}) {
+  return (
+    <div className="group/project-header group/section flex w-full min-w-0 shrink-0 items-center pb-1 pt-1.5">
+      <button
+        aria-expanded={open}
+        className="group/section-label flex min-w-0 shrink items-center gap-1 bg-transparent text-left leading-none"
+        onClick={onToggle}
+        type="button"
+      >
+        <SidebarPanelLabel>{label}</SidebarPanelLabel>
+        {meta != null && <RightSidebarCount>{meta}</RightSidebarCount>}
+        <DisclosureCaret
+          className="text-(--ui-text-tertiary) opacity-0 transition group-hover/section-label:opacity-100"
+          open={open}
+        />
+      </button>
+      {children && <div className="ml-auto flex shrink-0 items-center">{children}</div>}
+    </div>
+  )
+}
+
+function RightSidebarCount({ children }: { children: ReactNode }) {
+  return <span className="text-[0.6875rem] font-medium text-(--ui-text-quaternary)">{children}</span>
 }
 
 interface FileTreeBodyProps {

@@ -1,4 +1,4 @@
-import { useCallback, useRef, useState } from 'react'
+import { useCallback, useRef, useState, type ReactNode } from 'react'
 import { type NodeApi, type NodeRendererProps, Tree, type TreeApi } from 'react-arborist'
 
 import { PageLoader } from '@/components/page-loader'
@@ -20,6 +20,7 @@ interface ProjectTreeProps {
   collapseNonce: number
   cwd: string
   data: TreeNode[]
+  getFileBadge?: (node: TreeNode) => ReactNode
   onActivateFile: (path: string) => void
   onActivateFolder: (path: string) => void
   onLoadChildren: (id: string) => void | Promise<void>
@@ -33,6 +34,7 @@ export function ProjectTree({
   collapseNonce,
   cwd,
   data,
+  getFileBadge,
   onActivateFile,
   onActivateFolder,
   onLoadChildren,
@@ -116,10 +118,12 @@ export function ProjectTree({
           {props => (
             <ProjectTreeRow
               {...props}
+              getFileBadge={getFileBadge}
               onAttachFile={onActivateFile}
               onAttachFolder={onActivateFolder}
               onPreviewFile={onPreviewFile}
               onViewSourceFile={onViewSourceFile}
+              treeWidth={size.width}
             />
           )}
         </Tree>
@@ -138,17 +142,21 @@ function TreeSizingState() {
 
 function ProjectTreeRow({
   dragHandle,
+  getFileBadge,
   node,
   onAttachFile,
   onAttachFolder,
   onPreviewFile,
   onViewSourceFile,
-  style
+  style,
+  treeWidth
 }: NodeRendererProps<TreeNode> & {
+  getFileBadge?: (node: TreeNode) => ReactNode
   onAttachFile: (path: string) => void
   onAttachFolder: (path: string) => void
   onPreviewFile?: (path: string) => void
   onViewSourceFile?: (path: string) => void
+  treeWidth: number
 }) {
   const { t } = useI18n()
 
@@ -160,13 +168,16 @@ function ProjectTreeRow({
   const isPlaceholder = Boolean(node.data.placeholder)
   const isErrorPlaceholder = node.data.placeholder === 'error'
   const isHtmlFile = /\.(?:html?|xhtml)$/i.test(node.data.name)
+  const hasFileBadgeColumn = Boolean(getFileBadge)
+  const fileBadge = !isFolder && !isPlaceholder ? getFileBadge?.(node.data) : null
 
   const row = (
     <div
       aria-expanded={isFolder ? node.isOpen : undefined}
       aria-selected={node.isSelected}
       className={cn(
-        'group/row flex h-full cursor-pointer select-none items-center gap-1 border border-transparent px-3 text-xs font-normal leading-(--file-tree-row-height) text-(--ui-text-secondary) transition-colors hover:bg-(--ui-row-hover-background) hover:text-foreground',
+        'group/row h-full w-full min-w-0 cursor-pointer select-none items-center gap-1 overflow-hidden border border-transparent px-3 text-xs font-normal leading-(--file-tree-row-height) text-(--ui-text-secondary) transition-colors hover:bg-(--ui-row-hover-background) hover:text-foreground',
+        hasFileBadgeColumn ? 'grid' : 'flex',
         node.isSelected && 'bg-(--ui-row-active-background) text-foreground',
         isPlaceholder && 'pointer-events-none italic text-muted-foreground/70'
       )}
@@ -217,7 +228,17 @@ function ProjectTreeRow({
         paddingLeft:
           (typeof style.paddingLeft === 'number'
             ? style.paddingLeft
-            : Number.parseFloat(String(style.paddingLeft ?? 0)) || 0) + TREE_ROW_INSET
+            : Number.parseFloat(String(style.paddingLeft ?? 0)) || 0) + TREE_ROW_INSET,
+        boxSizing: 'border-box',
+        ...(hasFileBadgeColumn
+          ? {
+              gridTemplateColumns: 'auto minmax(0, 1fr) 1rem',
+              maxWidth: treeWidth,
+              width: treeWidth
+            }
+          : {
+              width: style.width ?? '100%'
+            })
       }}
     >
       {/* No chevron column — the folder icon (open/closed) already carries the
@@ -234,6 +255,11 @@ function ProjectTreeRow({
         )}
       </span>
       <span className="min-w-0 flex-1 truncate">{node.data.name}</span>
+      {hasFileBadgeColumn ? (
+        <span aria-hidden className="grid w-4 shrink-0 place-items-center justify-self-end">
+          {fileBadge}
+        </span>
+      ) : null}
     </div>
   )
 
