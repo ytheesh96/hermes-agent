@@ -39,6 +39,8 @@ export interface ComposerStatusItem {
   /** todo: the full four-state status driving the row's checkmark glyph. */
   todoStatus?: TodoStatus
   type: StatusItemType
+  /** assignee profile name (e.g. coder, researcher) */
+  profile?: string
 }
 
 // Writable source for background work, synced from the gateway's process
@@ -300,7 +302,8 @@ const kanbanWorkerActivityLabel = (worker: LoopWorkerActivity): string | undefin
 }
 
 const kanbanWorkerToItem = (worker: LoopWorkerActivity): ComposerStatusItem => ({
-  currentTool: kanbanWorkerActivityLabel(worker),
+  currentTool: kanbanWorkerCurrentTool(worker),
+  profile: textValue(worker.profile),
   id: `kanban-agent:${worker.task_id}:${worker.run_id}`,
   kanbanTaskId: worker.task_id,
   output:
@@ -432,7 +435,8 @@ const loopagentToItem = (agent: LoopagentActivity): ComposerStatusItem => {
   }
 
   return {
-    currentTool: loopagentActivityLabel(agent),
+    currentTool: agent.currentTool ? humanToolLabel(agent.currentTool) : undefined,
+    profile: textValue(agent.profile),
     id: `kanban-agent:${agent.taskId}:${agent.runId ?? agent.workerSessionId ?? 'activity'}`,
     kanbanTaskId: agent.taskId,
     output: agent.errorPreview || agent.summaryPreview,

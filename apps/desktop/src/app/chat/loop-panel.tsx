@@ -2,6 +2,7 @@ import {
   type KeyboardEvent as ReactKeyboardEvent,
   type ReactNode,
   type PointerEvent as ReactPointerEvent,
+  type WheelEvent as ReactWheelEvent,
   useCallback,
   useEffect,
   useMemo,
@@ -18,7 +19,9 @@ import { StatusSection } from '@/components/chat/status-section'
 import { Button } from '@/components/ui/button'
 import { Codicon } from '@/components/ui/codicon'
 import { LogView } from '@/components/ui/log-view'
+import { Tip } from '@/components/ui/tooltip'
 import { desktopGitDiff } from '@/lib/desktop-fs'
+import { GitBranch } from '@/lib/icons'
 import { normalizeOrLocalPreviewTarget } from '@/lib/local-preview'
 import { cn } from '@/lib/utils'
 import type { ComposerStatusItem, StatusItemState } from '@/store/composer-status'
@@ -92,8 +95,10 @@ function loopRowStatusIndicator(row: LoopRow): StatusIndicatorKind {
   const runStatus = normalizedLoopValue(row.latestRun?.status)
   const runOutcome = normalizedLoopValue(row.latestRun?.outcome)
   const active = isActiveLoopRow(row) || row.active
+
   const failed =
     FAILED_LOOP_STATUSES.has(status) || FAILED_LOOP_STATUSES.has(runStatus) || FAILED_LOOP_STATUSES.has(runOutcome)
+
   const attention = attentionScore(row) > 0 && !failed
 
   if (attention) {
@@ -136,6 +141,7 @@ function completedLoopRows(rows: LoopRow[]): number {
 }
 
 const TERMINAL_LOOP_STATUSES = new Set(['archived', 'cancelled', 'complete', 'completed', 'done'])
+
 const FAILED_LOOP_STATUSES = new Set([
   'blocked',
   'crashed',
@@ -316,6 +322,7 @@ function rootOverviewGroups(state: LoopPanelState, root: LoopRow): RootOverviewG
   const active = descendants.filter(row => !attentionIds.has(row.taskId) && isActiveLoopRow(row))
   const queued = descendants.filter(row => !attentionIds.has(row.taskId) && isQueuedLoopRow(row))
   const completed = descendants.filter(row => !attentionIds.has(row.taskId) && isDoneLoopRow(row))
+
   const groupedIds = new Set([
     ...attention.map(row => row.taskId),
     ...active.map(row => row.taskId),
@@ -604,11 +611,13 @@ interface LoopPanelProps {
 }
 
 function DetailSection({
+  action,
   children,
   className,
   testId,
   title
 }: {
+  action?: ReactNode
   children: ReactNode
   className?: string
   testId?: string
@@ -622,7 +631,12 @@ function DetailSection({
       )}
       data-testid={testId}
     >
-      <h3 className="m-0 mb-2 text-xs font-semibold uppercase tracking-wide text-(--ui-text-tertiary)">{title}</h3>
+      <div className="mb-2 flex min-w-0 items-center justify-between gap-2">
+        <h3 className="m-0 min-w-0 truncate text-xs font-semibold uppercase tracking-wide text-(--ui-text-tertiary)">
+          {title}
+        </h3>
+        {action ? <div className="shrink-0">{action}</div> : null}
+      </div>
       {children}
     </section>
   )
@@ -1620,6 +1634,575 @@ function loopAgentActivityLabel(row: LoopRow): string | undefined {
   return [profile, currentTool].filter(Boolean).join(' · ') || profile || currentTool
 }
 
+interface LoopTaskGraphEdge {
+  from: string
+  to: string
+}
+
+interface LoopTaskGraphNodeLayout {
+  depth: number
+  index: number
+  row: LoopRow
+  x: number
+  y: number
+}
+
+interface LoopTaskGraphLayout {
+  edges: LoopTaskGraphEdge[]
+  height: number
+  nodes: LoopTaskGraphNodeLayout[]
+  width: number
+}
+
+const LOOP_GRAPH_NODE_WIDTH = 168
+const LOOP_GRAPH_NODE_HEIGHT = 58
+const LOOP_GRAPH_COLUMN_GAP = 18
+const LOOP_GRAPH_ROW_GAP = 34
+const LOOP_GRAPH_PADDING = 12
+const LOOP_GRAPH_MIN_ZOOM = 0.6
+const LOOP_GRAPH_MAX_ZOOM = 2
+const LOOP_GRAPH_ZOOM_SENSITIVITY = 0.0015
+
+function clampLoopGraphZoom(zoom: number): number {
+  return Math.min(LOOP_GRAPH_MAX_ZOOM, Math.max(LOOP_GRAPH_MIN_ZOOM, zoom))
+}
+
+function loopTaskGraphAgent(row: LoopRow): string {
+  return (
+    loopTextValue(row.assignee) ||
+    loopTextValue(row.workerActivity?.profile) ||
+    loopTextValue(row.latestRun?.profile) ||
+    'Unassigned'
+  )
+}
+
+function loopTaskGraphAgentLabel(row: LoopRow): string | undefined {
+  const agent = loopTaskGraphAgent(row)
+
+  return agent === 'Unassigned' ? undefined : agent
+}
+
+function loopTaskGraphEdges(rows: LoopRow[], fallbackRootTaskId?: string): LoopTaskGraphEdge[] {
+  const rowById = new Map(rows.map(row => [row.taskId, row]))
+  const edgeKeys = new Set<string>()
+  const incomingTaskIds = new Set<string>()
+  const edges: LoopTaskGraphEdge[] = []
+
+  const addEdge = (from: string, to: string) => {
+    if (from === to || !rowById.has(from) || !rowById.has(to)) {
+      return
+    }
+
+    const key = `${from}:${to}`
+
+    if (edgeKeys.has(key)) {
+      return
+    }
+
+    edgeKeys.add(key)
+    incomingTaskIds.add(to)
+    edges.push({ from, to })
+  }
+
+  for (const row of rows) {
+    // Loop subtasks carry their parent task IDs; render those parents as owning this row in the graph.
+    for (const parentId of row.parents) {
+      addEdge(parentId, row.taskId)
+    }
+
+    for (const childId of row.children) {
+      addEdge(row.taskId, childId)
+    }
+  }
+
+  if (fallbackRootTaskId && rowById.has(fallbackRootTaskId)) {
+    for (const row of rows) {
+      if (row.taskId !== fallbackRootTaskId && !incomingTaskIds.has(row.taskId)) {
+        addEdge(fallbackRootTaskId, row.taskId)
+      }
+    }
+  }
+
+  return edges
+}
+
+function breakCyclesForLayout(
+  edges: LoopTaskGraphEdge[],
+  rootId?: string
+): { dagEdges: LoopTaskGraphEdge[]; backEdges: LoopTaskGraphEdge[] } {
+  const adj = new Map<string, string[]>()
+
+  for (const edge of edges) {
+    adj.set(edge.from, [...(adj.get(edge.from) || []), edge.to])
+  }
+
+  const visiting = new Set<string>()
+  const visited = new Set<string>()
+  const backEdgesSet = new Set<string>()
+
+  const dfs = (node: string) => {
+    visiting.add(node)
+
+    for (const neighbor of adj.get(node) || []) {
+      if (visiting.has(neighbor)) {
+        backEdgesSet.add(`${node}:${neighbor}`)
+      } else if (!visited.has(neighbor)) {
+        dfs(neighbor)
+      }
+    }
+
+    visiting.delete(node)
+    visited.add(node)
+  }
+
+  if (rootId) {
+    dfs(rootId)
+  }
+
+  for (const edge of edges) {
+    if (!visited.has(edge.from)) {
+      dfs(edge.from)
+    }
+
+    if (!visited.has(edge.to)) {
+      dfs(edge.to)
+    }
+  }
+
+  const dagEdges: LoopTaskGraphEdge[] = []
+  const backEdges: LoopTaskGraphEdge[] = []
+
+  for (const edge of edges) {
+    if (backEdgesSet.has(`${edge.from}:${edge.to}`)) {
+      backEdges.push(edge)
+    } else {
+      dagEdges.push(edge)
+    }
+  }
+
+  return { dagEdges, backEdges }
+}
+
+function loopTaskGraphLayout(rows: LoopRow[]): LoopTaskGraphLayout {
+  const root = rows[0]
+  const graphRows = rows
+  const rowIndexById = new Map(graphRows.map((row, index) => [row.taskId, index]))
+  const edges = loopTaskGraphEdges(graphRows, root?.taskId)
+  const { dagEdges } = breakCyclesForLayout(edges, root?.taskId)
+  const outgoing = new Map<string, string[]>()
+  const depthById = new Map<string, number>()
+
+  if (root) {
+    depthById.set(root.taskId, 0)
+  }
+
+  for (const edge of dagEdges) {
+    outgoing.set(edge.from, [...(outgoing.get(edge.from) || []), edge.to])
+  }
+
+  const queue = root ? [root.taskId] : []
+  const visitCounts = new Map<string, number>()
+
+  while (queue.length > 0) {
+    const taskId = queue.shift()!
+    const currentDepth = depthById.get(taskId) || 0
+    const nextVisitCount = (visitCounts.get(taskId) || 0) + 1
+
+    if (nextVisitCount > rows.length) {
+      continue
+    }
+
+    visitCounts.set(taskId, nextVisitCount)
+
+    for (const childId of outgoing.get(taskId) || []) {
+      const nextDepth = currentDepth + 1
+
+      if ((depthById.get(childId) ?? -1) < nextDepth) {
+        depthById.set(childId, nextDepth)
+        queue.push(childId)
+      }
+    }
+  }
+
+  for (const row of graphRows) {
+    if (!depthById.has(row.taskId)) {
+      depthById.set(row.taskId, Math.max(1, row.depth || 1))
+    }
+  }
+
+  const rowsByDepth = new Map<number, LoopRow[]>()
+
+  for (const row of graphRows) {
+    const depth = depthById.get(row.taskId) || 0
+    const depthRows = rowsByDepth.get(depth) || []
+
+    depthRows.push(row)
+    rowsByDepth.set(depth, depthRows)
+  }
+
+  for (const depthRows of rowsByDepth.values()) {
+    depthRows.sort((a, b) => (rowIndexById.get(a.taskId) || 0) - (rowIndexById.get(b.taskId) || 0))
+  }
+
+  const sortedDepths = Array.from(rowsByDepth.keys()).sort((a, b) => a - b)
+  const maxRowColumns = Math.max(1, ...Array.from(rowsByDepth.values()).map(depthRows => depthRows.length))
+  const graphRowCount = Math.max(1, sortedDepths.length)
+  const graphBodyWidth = maxRowColumns * LOOP_GRAPH_NODE_WIDTH + Math.max(0, maxRowColumns - 1) * LOOP_GRAPH_COLUMN_GAP
+  const width = LOOP_GRAPH_PADDING * 2 + Math.max(LOOP_GRAPH_NODE_WIDTH, graphBodyWidth)
+
+  const height = Math.max(
+    LOOP_GRAPH_PADDING * 2 + LOOP_GRAPH_NODE_HEIGHT,
+    LOOP_GRAPH_PADDING * 2 +
+      graphRowCount * LOOP_GRAPH_NODE_HEIGHT +
+      Math.max(0, graphRowCount - 1) * LOOP_GRAPH_ROW_GAP
+  )
+
+  const nodes: LoopTaskGraphNodeLayout[] = []
+
+  sortedDepths.forEach((depth, depthIndex) => {
+    const depthRows = rowsByDepth.get(depth) || []
+
+    const rowWidth =
+      depthRows.length * LOOP_GRAPH_NODE_WIDTH + Math.max(0, depthRows.length - 1) * LOOP_GRAPH_COLUMN_GAP
+
+    const rowX = LOOP_GRAPH_PADDING + Math.max(0, (graphBodyWidth - rowWidth) / 2)
+    const rowY = LOOP_GRAPH_PADDING + depthIndex * (LOOP_GRAPH_NODE_HEIGHT + LOOP_GRAPH_ROW_GAP)
+
+    depthRows.forEach((row, index) => {
+      nodes.push({
+        depth,
+        index,
+        row,
+        x: rowX + index * (LOOP_GRAPH_NODE_WIDTH + LOOP_GRAPH_COLUMN_GAP),
+        y: rowY
+      })
+    })
+  })
+
+  nodes.sort((a, b) => a.depth - b.depth || a.index - b.index)
+
+  return { edges, height, nodes, width }
+}
+
+function LoopTaskGraphNode({
+  layout,
+  onHover,
+  onOpen
+}: {
+  layout: LoopTaskGraphNodeLayout
+  onHover?: (taskId: null | string) => void
+  onOpen?: (row: LoopRow) => void
+}) {
+  const { row, x, y } = layout
+  const currentTool = loopWorkerCurrentTool(row)
+  const agent = loopTaskGraphAgentLabel(row)
+
+  return (
+    <button
+      aria-label={`Open ${row.title}`}
+      className={cn(
+        'absolute flex flex-col gap-1.5 rounded-md border border-(--ui-stroke-tertiary) bg-(--ui-surface-background) p-2 text-left shadow-none transition-colors hover:border-(--ui-stroke-primary) hover:bg-(--ui-row-hover-background) focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring/50',
+        onOpen ? 'cursor-pointer' : 'cursor-default',
+        isDoneLoopRow(row) && 'bg-(--ui-bg-secondary)/45'
+      )}
+      data-testid={`loop-task-graph-node-${row.taskId}`}
+      onClick={() => onOpen?.(row)}
+      onMouseEnter={() => onHover?.(row.taskId)}
+      onMouseLeave={() => onHover?.(null)}
+      style={{
+        height: LOOP_GRAPH_NODE_HEIGHT,
+        left: x,
+        top: y,
+        width: LOOP_GRAPH_NODE_WIDTH
+      }}
+      type="button"
+    >
+      <div className="flex min-w-0 items-start gap-2">
+        <LoopStatusIndicator row={row} />
+        <span className="min-w-0 flex-1 truncate text-[0.7rem] font-medium leading-4 text-(--ui-text-primary)">
+          {row.title}
+        </span>
+      </div>
+      {(agent || currentTool) && (
+        <div className="flex min-w-0 items-center gap-1.5">
+          {agent ? (
+            <span className="max-w-full truncate rounded-[0.2rem] bg-(--ui-bg-secondary) px-1.5 py-0.5 text-[0.62rem] text-(--ui-text-tertiary)">
+              {agent}
+            </span>
+          ) : null}
+          {currentTool ? (
+            <span className="min-w-0 truncate text-[0.62rem] text-(--ui-text-tertiary) leading-none">
+              {currentTool}
+            </span>
+          ) : null}
+        </div>
+      )}
+    </button>
+  )
+}
+
+function LoopTaskGraph({ rows, onOpenTaskTab }: { rows: LoopRow[]; onOpenTaskTab?: (row: LoopRow) => void }) {
+  const [zoom, setZoom] = useState(1)
+  const [hoveredTaskId, setHoveredTaskId] = useState<null | string>(null)
+  const layout = useMemo(() => loopTaskGraphLayout(rows), [rows])
+  const nodeById = useMemo(() => new Map(layout.nodes.map(node => [node.row.taskId, node])), [layout.nodes])
+
+  const gutterCandidates = useMemo(() => {
+    const rowsByDepth = new Map<number, number>()
+
+    for (const node of layout.nodes) {
+      rowsByDepth.set(node.depth, (rowsByDepth.get(node.depth) || 0) + 1)
+    }
+
+    const maxRowColumns = Math.max(1, ...Array.from(rowsByDepth.values()))
+
+    const candidates: number[] = []
+
+    for (let c = 0; c < maxRowColumns - 1; c++) {
+      const colRight = LOOP_GRAPH_PADDING + c * (LOOP_GRAPH_NODE_WIDTH + LOOP_GRAPH_COLUMN_GAP) + LOOP_GRAPH_NODE_WIDTH
+      const colLeftNext = LOOP_GRAPH_PADDING + (c + 1) * (LOOP_GRAPH_NODE_WIDTH + LOOP_GRAPH_COLUMN_GAP)
+      candidates.push((colRight + colLeftNext) / 2)
+    }
+
+    const leftmostColLeft = LOOP_GRAPH_PADDING
+    candidates.push(leftmostColLeft - 10)
+
+    const rightmostColRight =
+      LOOP_GRAPH_PADDING + maxRowColumns * (LOOP_GRAPH_NODE_WIDTH + LOOP_GRAPH_COLUMN_GAP) - LOOP_GRAPH_COLUMN_GAP
+
+    candidates.push(rightmostColRight + 10)
+
+    return candidates
+  }, [layout.nodes])
+
+  const edgesWithPaths = useMemo(() => {
+    return layout.edges
+      .map(edge => {
+        const from = nodeById.get(edge.from)
+        const to = nodeById.get(edge.to)
+
+        if (!from || !to) {
+          return null
+        }
+
+        const isFeedback = from.y > to.y
+
+        if (isFeedback) {
+          return null
+        }
+
+        const isSameRow = from.y === to.y
+
+        let startX: number, startY: number, endX: number, endY: number
+        let d: string
+        let isLongSpan = false
+
+        if (isSameRow) {
+          startX = from.x + LOOP_GRAPH_NODE_WIDTH
+          startY = from.y + LOOP_GRAPH_NODE_HEIGHT / 2
+          endX = to.x
+          endY = to.y + LOOP_GRAPH_NODE_HEIGHT / 2
+
+          const dx = Math.abs(endX - startX) / 2
+          d = `M ${startX} ${startY} C ${startX + dx} ${startY}, ${endX - dx} ${endY}, ${endX} ${endY}`
+        } else {
+          startX = from.x + LOOP_GRAPH_NODE_WIDTH / 2
+          startY = from.y + LOOP_GRAPH_NODE_HEIGHT
+          endX = to.x + LOOP_GRAPH_NODE_WIDTH / 2
+          endY = to.y
+
+          isLongSpan = (endY - startY) > (LOOP_GRAPH_NODE_HEIGHT + LOOP_GRAPH_ROW_GAP + 10)
+
+          if (isLongSpan) {
+            const Y1 = startY + LOOP_GRAPH_ROW_GAP / 2
+            const Y2 = endY - LOOP_GRAPH_ROW_GAP / 2
+
+            const fromDepth = from.depth
+            const toDepth = to.depth
+
+            const isXSafe = (x: number) => {
+              for (const node of layout.nodes) {
+                if (node.depth > fromDepth && node.depth < toDepth) {
+                  const left = node.x - 4
+                  const right = node.x + LOOP_GRAPH_NODE_WIDTH + 4
+
+                  if (x >= left && x <= right) {
+                    return false
+                  }
+                }
+              }
+
+              return true
+            }
+
+            const idealX = startX + (endX - startX) / 2
+            const safeCandidates = gutterCandidates.filter(isXSafe)
+
+            let gutterX: number
+
+            if (safeCandidates.length > 0) {
+              safeCandidates.sort((a, b) => {
+                const distA = Math.abs(a - idealX)
+                const distB = Math.abs(b - idealX)
+
+                if (Math.abs(distA - distB) < 1) {
+                  return Math.abs(a - layout.width / 2) - Math.abs(b - layout.width / 2)
+                }
+
+                return distA - distB
+              })
+              gutterX = safeCandidates[0]!
+            } else {
+              gutterX = idealX
+            }
+
+            const R = 8
+            const signX1 = gutterX > startX ? 1 : gutterX < startX ? -1 : 0
+            const signX2 = endX > gutterX ? 1 : endX < gutterX ? -1 : 0
+
+            d = `M ${startX} ${startY} ` +
+                `L ${startX} ${Y1 - R} ` +
+                `Q ${startX} ${Y1} ${startX + signX1 * R} ${Y1} ` +
+                `L ${gutterX - signX1 * R} ${Y1} ` +
+                `Q ${gutterX} ${Y1} ${gutterX} ${Y1 + R} ` +
+                `L ${gutterX} ${Y2 - R} ` +
+                `Q ${gutterX} ${Y2} ${gutterX + signX2 * R} ${Y2} ` +
+                `L ${endX - signX2 * R} ${Y2} ` +
+                `Q ${endX} ${Y2} ${endX} ${Y2 + R} ` +
+                `L ${endX} ${endY}`
+          } else {
+            const dy = (endY - startY) / 2
+            d = `M ${startX} ${startY} C ${startX} ${startY + dy}, ${endX} ${endY - dy}, ${endX} ${endY}`
+          }
+        }
+
+        return { d, edge, isLongSpan }
+      })
+      .filter(Boolean) as { d: string; edge: LoopTaskGraphEdge; isLongSpan: boolean }[]
+  }, [layout, nodeById, gutterCandidates])
+
+  // Render long-span edges first (behind), short edges second (on top)
+  const sortedEdges = useMemo(() => {
+    return [...edgesWithPaths].sort((a, b) => {
+      if (a.isLongSpan && !b.isLongSpan) {return -1}
+
+      if (!a.isLongSpan && b.isLongSpan) {return 1}
+
+      return 0
+    })
+  }, [edgesWithPaths])
+
+  const handleWheel = useCallback((event: ReactWheelEvent<HTMLDivElement>) => {
+    if (!event.ctrlKey) {
+      return
+    }
+
+    event.preventDefault()
+    setZoom(currentZoom => clampLoopGraphZoom(currentZoom * Math.exp(-event.deltaY * LOOP_GRAPH_ZOOM_SENSITIVITY)))
+  }, [])
+
+  return (
+    <div
+      className="max-h-80 min-h-48 overflow-auto rounded-md border border-(--ui-stroke-tertiary) bg-[radial-gradient(circle_at_1px_1px,color-mix(in_srgb,var(--ui-stroke-tertiary)_55%,transparent)_1px,transparent_0)] bg-[length:18px_18px] p-3"
+      data-testid="loop-task-graph"
+      data-zoom={zoom.toFixed(2)}
+      onWheel={handleWheel}
+    >
+      <div className="relative mx-auto" style={{ height: layout.height * zoom, width: layout.width * zoom }}>
+        <div
+          className="relative origin-top-left"
+          data-testid="loop-task-graph-surface"
+          style={{
+            height: layout.height,
+            transform: `scale(${zoom})`,
+            transformOrigin: '0 0',
+            width: layout.width
+          }}
+        >
+          <svg
+            aria-hidden
+            className="pointer-events-none absolute inset-0 text-(--ui-stroke-secondary)"
+            height={layout.height}
+            width={layout.width}
+          >
+            <defs>
+              <marker
+                id="loop-graph-arrow"
+                markerHeight="5"
+                markerWidth="5"
+                orient="auto"
+                refX="7"
+                refY="5"
+                viewBox="0 0 10 10"
+              >
+                <path d="M 0 1.5 L 7 5 L 0 8.5 z" fill="currentColor" />
+              </marker>
+              <marker
+                id="loop-graph-arrow-dim"
+                markerHeight="5"
+                markerWidth="5"
+                orient="auto"
+                refX="7"
+                refY="5"
+                viewBox="0 0 10 10"
+              >
+                <path d="M 0 1.5 L 7 5 L 0 8.5 z" fill="currentColor" opacity="0.3" />
+              </marker>
+            </defs>
+            {sortedEdges.map(({ d, edge, isLongSpan }) => {
+              const isConnectedToHovered =
+                hoveredTaskId != null && (edge.from === hoveredTaskId || edge.to === hoveredTaskId)
+
+              const highlighted = hoveredTaskId != null && isConnectedToHovered
+              const dimmed = hoveredTaskId != null && !isConnectedToHovered
+
+              let opacity: number
+
+              if (highlighted) {
+                opacity = 1
+              } else if (dimmed) {
+                opacity = 0.08
+              } else {
+                // No hover active: adjacent edges prominent, long-span edges subtle
+                opacity = isLongSpan ? 0.28 : 0.85
+              }
+
+              return (
+                <path
+                  d={d}
+                  data-testid={`loop-task-graph-edge-${edge.from}-${edge.to}`}
+                  fill="none"
+                  key={`${edge.from}:${edge.to}`}
+                  markerEnd={
+                    highlighted || (!hoveredTaskId && !isLongSpan)
+                      ? 'url(#loop-graph-arrow)'
+                      : 'url(#loop-graph-arrow-dim)'
+                  }
+                  opacity={opacity}
+                  stroke="currentColor"
+                  strokeDasharray={isLongSpan && !highlighted ? '4 3' : undefined}
+                  strokeLinecap="round"
+                  strokeLinejoin="round"
+                  strokeWidth={highlighted ? 1.8 : 1.35}
+                  style={{ transition: 'opacity 150ms ease, stroke-width 150ms ease' }}
+                />
+              )
+            })}
+          </svg>
+          {layout.nodes.map(node => (
+            <LoopTaskGraphNode
+              key={node.row.taskId}
+              layout={node}
+              onHover={setHoveredTaskId}
+              onOpen={onOpenTaskTab}
+            />
+          ))}
+        </div>
+      </div>
+    </div>
+  )
+}
+
 type LoopHandoffLine = { label: string; value: string }
 
 function loopMetadataLabel(value: string): string {
@@ -1628,10 +2211,12 @@ function loopMetadataLabel(value: string): string {
 
 function loopHandoffLinesForRow(row: LoopRow): LoopHandoffLine[] {
   const lines: LoopHandoffLine[] = []
+
   const pushLine = (label: string, value?: null | number | string) => {
     if (value === null || value === undefined || value === '') {
       return
     }
+
     lines.push({ label, value: String(value) })
   }
 
@@ -1659,6 +2244,7 @@ function loopHandoffSummary(handoff: LoopTaskHandoff): string {
 function LoopForegroundHandoffCard({ row }: { row: LoopRow }) {
   const lines = loopHandoffLinesForRow(row)
   const handoffs = row.loopHandoffs || []
+
   const hasReviewRouting = Boolean(
     row.reviewKind || row.resumeMode || row.foregroundParentSessionId || row.foregroundForkSessionId
   )
@@ -1762,10 +2348,12 @@ function loopOverviewItemState(row: LoopRow): StatusItemState {
 
 function loopOverviewStatusItem(row: LoopRow, options: { preferAssigneeForQueued?: boolean } = {}): ComposerStatusItem {
   const queued = isQueuedLoopRow(row)
-  const activityLabel = loopAgentActivityLabel(row)
+  const currentTool = loopWorkerCurrentTool(row)
+  const profile = loopTaskGraphAgentLabel(row)
 
   return {
-    currentTool: queued && !options.preferAssigneeForQueued ? 'Loop' : activityLabel || (queued ? 'Loop' : undefined),
+    currentTool: currentTool || (queued && !options.preferAssigneeForQueued ? 'Loop' : undefined),
+    profile,
     id: `kanban-agent:${row.taskId}:${row.workerActivity?.run_id ?? row.latestRun?.id ?? 'overview'}`,
     kanbanTaskId: row.taskId,
     runId: row.workerActivity?.run_id ?? row.latestRun?.id,
@@ -1829,8 +2417,12 @@ function loopTaskAgentCurrentTool(relation: LoopTaskAgentRelation, activity?: st
 }
 
 function loopTaskAgentStatusItem(row: LoopRow, relation: LoopTaskAgentRelation): ComposerStatusItem {
+  const currentTool = loopWorkerCurrentTool(row)
+  const profile = loopTaskGraphAgentLabel(row)
+
   return {
-    currentTool: loopTaskAgentCurrentTool(relation, loopAgentActivityLabel(row)),
+    currentTool: loopTaskAgentCurrentTool(relation, currentTool),
+    profile,
     id: `kanban-agent:${row.taskId}:${row.workerActivity?.run_id ?? row.latestRun?.id ?? 'relation'}`,
     kanbanTaskId: row.taskId,
     runId: row.workerActivity?.run_id ?? row.latestRun?.id,
@@ -1849,18 +2441,21 @@ function loopRelatedTaskAgentStatusItem(
   rowById: Map<string, LoopRow>
 ): ComposerStatusItem {
   const status = related?.status
+  const assignee = loopTextValue(related?.assignee)
 
   const activity =
-    loopTextValue(related?.assignee) ||
-    (normalizedLoopValue(status) === 'archived'
+    normalizedLoopValue(status) === 'archived'
       ? 'Archived'
       : related
         ? loopTextValue(status)
-        : 'Task details unavailable')
+        : 'Task details unavailable'
+
+  const showActivity = activity !== assignee ? activity : undefined
 
   return {
-    currentTool: loopTaskAgentCurrentTool(relation, activity),
-    id: `kanban-agent:${taskId}:relation`,
+    currentTool: loopTaskAgentCurrentTool(relation, showActivity),
+    profile: assignee,
+    id: `kanban-agent-relation:${taskId}`,
     kanbanTaskId: taskId,
     state: loopTaskAgentState(status),
     statusIndicator: loopStatusIndicatorFromStatus(status),
@@ -1878,12 +2473,44 @@ function LoopRootAgentsCard({
   onOpenTaskTab?: (row: LoopRow) => void
   root: LoopRow
 }) {
+  const [view, setView] = useState<'canvas' | 'list'>('list')
   const rows = [root, ...groups.active, ...groups.attention, ...groups.queued, ...groups.other, ...groups.completed]
+  const showCanvas = view === 'canvas'
+
+  useEffect(() => {
+    setView('list')
+  }, [root.taskId])
 
   return (
-    <DetailSection testId="loop-root-agents-card" title="Agents">
+    <DetailSection
+      action={
+        <Tip label={showCanvas ? 'Show agents list' : 'Show graph canvas'} side="left">
+          <Button
+            aria-label={showCanvas ? 'Show agents list' : 'Show graph canvas'}
+            className={cn(
+              '-my-1 text-muted-foreground/80 hover:text-foreground',
+              showCanvas && 'bg-(--ui-bg-secondary) text-(--ui-text-primary)'
+            )}
+            onClick={() => setView(value => (value === 'canvas' ? 'list' : 'canvas'))}
+            size="icon-xs"
+            type="button"
+            variant="ghost"
+          >
+            {showCanvas ? (
+              <Codicon name="list-unordered" size="0.875rem" />
+            ) : (
+              <GitBranch aria-hidden className="size-3.5" />
+            )}
+          </Button>
+        </Tip>
+      }
+      testId="loop-root-agents-card"
+      title={showCanvas ? 'Loop graph' : 'Agents'}
+    >
       {rows.length === 0 ? (
         <EmptyDetail>No agents yet.</EmptyDetail>
+      ) : showCanvas ? (
+        <LoopTaskGraph onOpenTaskTab={onOpenTaskTab} rows={rows} />
       ) : (
         <div className="flex flex-col gap-0.5" data-testid="loop-root-agents-list">
           {rows.map(row => (
@@ -1908,6 +2535,13 @@ function LoopTaskAgentsCard({
   row: LoopRow
   rowById: Map<string, LoopRow>
 }) {
+  const [view, setView] = useState<'canvas' | 'list'>('list')
+  const showCanvas = view === 'canvas'
+
+  useEffect(() => {
+    setView('list')
+  }, [row.taskId])
+
   const seen = new Set<string>()
 
   const taskRelations = [
@@ -1939,10 +2573,46 @@ function LoopTaskAgentsCard({
     ]
   })
 
+  const subgraphRows = useMemo(() => {
+    const ids = new Set<string>([row.taskId, ...row.parents, ...row.children])
+
+    return Array.from(rowById.values()).filter(r => ids.has(r.taskId))
+  }, [rowById, row.taskId, row.parents, row.children])
+
+  const showAction = items.length > 0
+
   return (
-    <DetailSection testId="loop-task-agents-card" title="Agents">
+    <DetailSection
+      action={
+        showAction ? (
+          <Tip label={showCanvas ? 'Show agents list' : 'Show graph canvas'} side="left">
+            <Button
+              aria-label={showCanvas ? 'Show agents list' : 'Show graph canvas'}
+              className={cn(
+                '-my-1 text-muted-foreground/80 hover:text-foreground',
+                showCanvas && 'bg-(--ui-bg-secondary) text-(--ui-text-primary)'
+              )}
+              onClick={() => setView(value => (value === 'canvas' ? 'list' : 'canvas'))}
+              size="icon-xs"
+              type="button"
+              variant="ghost"
+            >
+              {showCanvas ? (
+                <Codicon name="list-unordered" size="0.875rem" />
+              ) : (
+                <GitBranch aria-hidden className="size-3.5" />
+              )}
+            </Button>
+          </Tip>
+        ) : null
+      }
+      testId="loop-task-agents-card"
+      title={showCanvas ? 'Loop graph' : 'Agents'}
+    >
       {items.length === 0 ? (
         <EmptyDetail>No agents yet.</EmptyDetail>
+      ) : showCanvas ? (
+        <LoopTaskGraph onOpenTaskTab={targetRow => onSelectTaskId?.(targetRow.taskId)} rows={subgraphRows} />
       ) : (
         <div className="flex flex-col gap-0.5" data-testid="loop-task-agents-list">
           {items.map(({ item, taskId }) => (
@@ -1970,8 +2640,14 @@ function LoopRootOverview({
   state: LoopPanelState
 }) {
   const groups = rootOverviewGroups(state, root)
+
   const groupedCount =
-    groups.active.length + groups.attention.length + groups.queued.length + groups.other.length + groups.completed.length
+    groups.active.length +
+    groups.attention.length +
+    groups.queued.length +
+    groups.other.length +
+    groups.completed.length
+
   const childCount = Math.max(root.childCount, root.children.length, groupedCount)
   const decomposed = childCount > 0
   const archiveableTaskCount = state.rows.filter(row => normalizedLoopValue(row.status) !== 'archived').length
@@ -2345,11 +3021,13 @@ export function LoopPanel({
     if (!selectedTaskDetail && selectedTaskComments === undefined) {
       return selectedTaskDetail
     }
+
     // If comments query hasn't resolved yet (undefined), don't merge yet -
     // let the detail's own comments (likely undefined) drive the loading state.
     if (selectedTaskComments === undefined) {
       return selectedTaskDetail
     }
+
     return {
       ...selectedTaskDetail,
       comments: selectedTaskComments ?? selectedTaskDetail?.comments ?? []
@@ -2374,10 +3052,16 @@ export function LoopPanel({
   const rootRow = useMemo(() => rootLoopRow(state?.rows || [], stateRootTaskId), [state, stateRootTaskId])
   const rootRowIsAnchored = Boolean(rootRow && stateRootTaskId && rootRow.taskId === stateRootTaskId)
 
+  const rootDescendantCount = useMemo(
+    () => (state && rootRow ? rootDescendantRows(state, rootRow).length : 0),
+    [state, rootRow]
+  )
+
   const rootOverviewEligible = Boolean(
     rootRow &&
     (rootRow.children.length > 0 ||
       rootRow.childCount > 0 ||
+      rootDescendantCount > 0 ||
       (rootRowIsAnchored && (rootRow.parents.length > 0 || rootRow.parentCount > 0)) ||
       normalizedLoopValue(rootRow.status) === 'triage')
   )
@@ -2845,12 +3529,16 @@ export function LoopPanel({
               activeTaskTabRow ? (
                 <div className="grid min-w-0 max-w-full gap-3">
                   <LoopTaskDetails
-                    backLabel={embedded && activeTaskTabId === rootRow?.taskId && rootOverviewEligible ? 'root overview' : null}
+                    backLabel={
+                      embedded && activeTaskTabId === rootRow?.taskId && rootOverviewEligible ? 'root overview' : null
+                    }
                     commentsError={selectedTaskCommentsError}
                     detail={mergedDetail}
                     onAddComment={onAddTaskComment}
                     onBack={
-                      embedded && activeTaskTabId === rootRow?.taskId && rootOverviewEligible ? selectBaseTab : undefined
+                      embedded && activeTaskTabId === rootRow?.taskId && rootOverviewEligible
+                        ? selectBaseTab
+                        : undefined
                     }
                     onSelectTaskId={selectRelatedTask}
                     onTaskAction={onTaskAction}
