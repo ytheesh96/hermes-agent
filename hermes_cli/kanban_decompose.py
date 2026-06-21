@@ -41,7 +41,7 @@ import logging
 import os
 import re
 from dataclasses import dataclass
-from typing import Optional
+from typing import Any, Optional
 
 from hermes_cli import kanban_db as kb
 from hermes_cli import profiles as profiles_mod
@@ -84,6 +84,12 @@ Rules:
     them no parents so the dispatcher fans them out at once.
   - Use 2-6 tasks for normal work. Don't create 20 tiny tasks. Don't
     cram everything into 1 task.
+  - Preserve dynamic Loop workflows: do NOT pre-materialize every possible
+    epistemic decision subgraph up front. If the task body names unresolved
+    decisions or epistemic packets, create a minimal execution scaffold and
+    include on-demand expansion instructions in the relevant child body. A
+    worker/orchestrator should create an epistemic_subgraph only when that
+    uncertainty actually blocks safe progress.
   - Pick assignees from the roster by matching the task to the profile's
     DESCRIPTION (not just the name). When nothing matches well, use null
     and the system will route to the default_assignee.
@@ -122,6 +128,8 @@ Default assignee (used when no profile fits a task): {default_assignee}
 
 
 _FENCE_RE = re.compile(r"^```(?:json)?\s*|\s*```$", re.MULTILINE)
+_DEFAULT_MAX_TOKENS = 4000
+_RETRY_MAX_TOKENS = 12000
 
 
 @dataclass
@@ -140,6 +148,46 @@ def _truncate(text: str, limit: int) -> str:
     if len(text) <= limit:
         return text
     return text[: limit - 1] + "…"
+
+
+def _positive_int_env(name: str, default: int) -> int:
+    raw = os.environ.get(name)
+    if raw is None or not raw.strip():
+        return default
+    try:
+        value = int(raw)
+    except ValueError:
+        logger.warning("decompose: ignoring invalid %s=%r", name, raw)
+        return default
+    return max(1, value)
+
+
+def _max_token_attempts() -> list[int]:
+    """Return completion budgets for initial call and length retry."""
+    first = _positive_int_env(
+        "HERMES_KANBAN_DECOMPOSE_MAX_TOKENS",
+        _DEFAULT_MAX_TOKENS,
+    )
+    retry = _positive_int_env(
+        "HERMES_KANBAN_DECOMPOSE_RETRY_MAX_TOKENS",
+        _RETRY_MAX_TOKENS,
+    )
+    if retry <= first:
+        return [first]
+    return [first, retry]
+
+
+def _response_content_and_finish_reason(resp: Any) -> tuple[str, str | None]:
+    try:
+        choice = resp.choices[0]
+    except Exception:
+        return "", None
+    try:
+        raw = choice.message.content or ""
+    except Exception:
+        raw = ""
+    finish_reason = getattr(choice, "finish_reason", None)
+    return raw, finish_reason if isinstance(finish_reason, str) else None
 
 
 def _extract_json_blob(raw: str) -> Optional[dict]:
@@ -323,31 +371,49 @@ def decompose_task(
         default_assignee=default_assignee,
     )
 
-    try:
-        resp = client.chat.completions.create(
-            model=model,
-            messages=[
-                {"role": "system", "content": _SYSTEM_PROMPT},
-                {"role": "user", "content": user_msg},
-            ],
-            temperature=0.3,
-            max_tokens=4000,
-            timeout=timeout or 180,
-            extra_body=get_auxiliary_extra_body() or None,
-        )
-    except Exception as exc:
+    parsed = None
+    raw = ""
+    finish_reason: str | None = None
+    for max_tokens in _max_token_attempts():
+        try:
+            resp = client.chat.completions.create(
+                model=model,
+                messages=[
+                    {"role": "system", "content": _SYSTEM_PROMPT},
+                    {"role": "user", "content": user_msg},
+                ],
+                temperature=0.3,
+                max_tokens=max_tokens,
+                timeout=timeout or 180,
+                extra_body=get_auxiliary_extra_body() or None,
+            )
+        except Exception as exc:
+            logger.info(
+                "decompose: API call failed for %s (%s)", task_id, exc,
+            )
+            return DecomposeOutcome(task_id, False, f"LLM error: {type(exc).__name__}")
+
+        raw, finish_reason = _response_content_and_finish_reason(resp)
+        parsed = _extract_json_blob(raw)
+        if parsed is not None:
+            break
+        if finish_reason != "length" and raw.strip():
+            break
         logger.info(
-            "decompose: API call failed for %s (%s)", task_id, exc,
+            "decompose: empty/truncated LLM output for %s "
+            "(finish_reason=%r, max_tokens=%s)",
+            task_id,
+            finish_reason,
+            max_tokens,
         )
-        return DecomposeOutcome(task_id, False, f"LLM error: {type(exc).__name__}")
 
-    try:
-        raw = resp.choices[0].message.content or ""
-    except Exception:
-        raw = ""
-
-    parsed = _extract_json_blob(raw)
     if parsed is None:
+        if finish_reason == "length" or not raw.strip():
+            return DecomposeOutcome(
+                task_id,
+                False,
+                "LLM returned empty/truncated output before JSON",
+            )
         return DecomposeOutcome(task_id, False, "LLM returned malformed JSON")
 
     fanout = bool(parsed.get("fanout"))

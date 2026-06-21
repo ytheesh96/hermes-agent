@@ -1,8 +1,9 @@
 import { type QueryClient } from '@tanstack/react-query'
 import { useCallback } from 'react'
 
-import { getGlobalModelInfo } from '@/hermes'
+import { getGlobalModelInfo, getGlobalModelOptions } from '@/hermes'
 import { useI18n } from '@/i18n'
+import { repairStaleModelProviderSelection } from '@/lib/model-provider-compat'
 import { notifyError } from '@/store/notifications'
 import {
   $activeSessionId,
@@ -53,6 +54,25 @@ export function useModelControls({ activeSessionId, queryClient, requestGateway 
       }
 
       if (!force && $currentModel.get()) {
+        const currentModel = $currentModel.get().trim()
+        const currentProvider = $currentProvider.get().trim()
+
+        if (currentModel && currentProvider) {
+          const options = await getGlobalModelOptions()
+          const repaired = repairStaleModelProviderSelection(options, {
+            model: currentModel,
+            provider: currentProvider
+          })
+
+          if (repaired.model !== currentModel) {
+            setCurrentModel(repaired.model)
+          }
+
+          if (repaired.provider !== currentProvider) {
+            setCurrentProvider(repaired.provider)
+          }
+        }
+
         return
       }
 

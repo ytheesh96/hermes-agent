@@ -2782,6 +2782,31 @@ class TestConcurrentToolExecution:
         assert agent_runtime_owns_post_tool_hook(agent, "memory_extra") is True
         assert agent_runtime_owns_post_tool_hook(agent, "web_search") is False
 
+    def test_session_search_tool_forwards_profile_arg(self, agent):
+        """Profile-qualified parent-session refs must survive tool dispatch."""
+        sentinel_db = object()
+        agent._get_session_db_for_recall = lambda: sentinel_db
+        tool_call = _mock_tool_call(
+            name="session_search",
+            arguments=json.dumps({
+                "session_id": "foreground-parent",
+                "profile": "default",
+            }),
+            call_id="session-search-1",
+        )
+        mock_msg = _mock_assistant_msg(content="", tool_calls=[tool_call])
+        messages = []
+
+        with patch(
+            "tools.session_search_tool.session_search",
+            return_value='{"success": true}',
+        ) as mock_search:
+            agent._execute_tool_calls_sequential(mock_msg, messages, "task-1")
+
+        assert mock_search.call_args.kwargs["session_id"] == "foreground-parent"
+        assert mock_search.call_args.kwargs["profile"] == "default"
+        assert mock_search.call_args.kwargs["db"] is sentinel_db
+
     def test_blocked_memory_tool_does_not_reset_counter(self, agent, monkeypatch):
         """Blocked memory tool should not reset the nudge counter."""
         agent._turns_since_memory = 5

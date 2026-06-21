@@ -399,6 +399,75 @@ def _set_session_running(session: dict, running: bool) -> None:
         logger.debug("Failed to update active session running state", exc_info=True)
 
 
+def _drain_loop_handoff_review_at_idle(rid, sid: str, session: dict) -> bool:
+    """Claim and run one pending Loop foreground handoff at a true idle boundary.
+
+    Background Kanban dispatchers deliberately leave handoffs for live
+    foreground sessions unclaimed. The owning foreground runtime claims them
+    only after a turn has fully released its busy flag, then immediately
+    reacquires the same session slot before touching the queue. That ordering
+    prevents a separate reviewer subprocess from racing the live UI and keeps a
+    user prompt that arrives first ahead of the handoff.
+    """
+    if not session or session.get("_finalized"):
+        return False
+    agent = session.get("agent")
+    live_session_id = str(
+        getattr(agent, "session_id", None) or session.get("session_key") or sid or ""
+    ).strip()
+    if not live_session_id:
+        return False
+
+    with session["history_lock"]:
+        if session.get("running") or session.get("_finalized"):
+            return False
+        _set_session_running(session, True)
+
+    claimed = False
+
+    def _runner(batch):
+        nonlocal claimed
+        claimed = True
+        from hermes_cli import kanban_db as _kb
+
+        _run_prompt_submit(rid, sid, session, _kb._loop_handoff_review_runner_prompt(batch))
+        return {"ok": True, "outcome": "started", "mode": "foreground_idle_boundary"}
+
+    try:
+        from hermes_cli import kanban_db as _kb
+
+        db = _get_db()
+        if db is None:
+            return False
+        with _kb.connect() as conn:
+            batch = _kb.run_next_loop_handoff_review_batch(
+                conn,
+                session_db=db,
+                required_live_session_id=live_session_id,
+                # We already acquired this session's in-process running slot
+                # above. Treat any other live session as busy so this runtime
+                # cannot steal its foreground handoffs.
+                session_busy=lambda candidate: str(candidate or "") != live_session_id,
+                review_runner=_runner,
+            )
+        return bool(batch)
+    except Exception as exc:
+        print(
+            f"[tui_gateway] foreground handoff drain failed: "
+            f"{type(exc).__name__}: {exc}",
+            file=sys.stderr,
+        )
+        try:
+            _emit("error", sid, {"message": f"foreground handoff drain failed: {exc}"})
+        except Exception:
+            pass
+        return False
+    finally:
+        if not claimed:
+            with session["history_lock"]:
+                _set_session_running(session, False)
+
+
 def _finalize_session(session: dict | None, end_reason: str = "tui_close") -> None:
     """Best-effort finalize hook + memory commit for a session."""
     if not session or session.get("_finalized"):
@@ -1698,6 +1767,80 @@ def _resolve_startup_runtime() -> tuple[str, str | None]:
 _BARE_BILLING_PROVIDERS = {"auto", "openrouter", "custom"}
 
 
+def _model_provider_rows_for_repair() -> list[dict]:
+    try:
+        from hermes_cli.inventory import build_models_payload, load_picker_context
+
+        payload = build_models_payload(
+            load_picker_context(),
+            include_unconfigured=False,
+            picker_hints=True,
+            canonical_order=True,
+            max_models=200,
+        )
+        rows = payload.get("providers", [])
+        return rows if isinstance(rows, list) else []
+    except Exception:
+        logger.debug("failed to load model/provider rows for repair", exc_info=True)
+        return []
+
+
+def _row_model_match(row: dict, model: str) -> str:
+    wanted = str(model or "").strip().lower()
+    if not wanted:
+        return ""
+    for candidate in row.get("models") or []:
+        candidate_s = str(candidate or "").strip()
+        if candidate_s.lower() == wanted:
+            return candidate_s
+    return ""
+
+
+def _provider_supports_exact_model(provider: str, model: str) -> bool:
+    provider_l = str(provider or "").strip().lower()
+    if not provider_l:
+        return False
+    for row in _model_provider_rows_for_repair():
+        if str(row.get("slug") or "").strip().lower() == provider_l:
+            return bool(_row_model_match(row, model))
+    return False
+
+
+def _infer_provider_for_exact_model(model: str, *, avoid_provider: str = "") -> str:
+    avoid_l = str(avoid_provider or "").strip().lower()
+    for row in _model_provider_rows_for_repair():
+        slug = str(row.get("slug") or "").strip()
+        if not slug or slug.lower() == avoid_l:
+            continue
+        if row.get("authenticated") is False and not row.get("is_user_defined"):
+            continue
+        if _row_model_match(row, model):
+            return slug
+    return ""
+
+
+def _session_model_override_from_create(model: str, provider: str) -> dict | None:
+    create_model = str(model or "").strip()
+    create_provider = str(provider or "").strip()
+    if not create_model:
+        return None
+
+    repaired_provider = create_provider
+    if create_provider and not _provider_supports_exact_model(create_provider, create_model):
+        inferred = _infer_provider_for_exact_model(create_model, avoid_provider=create_provider)
+        if inferred:
+            logger.warning(
+                "repairing stale session.create model/provider pair: %s/%s -> %s/%s",
+                create_provider,
+                create_model,
+                inferred,
+                create_model,
+            )
+            repaired_provider = inferred
+
+    return {"model": create_model, "provider": repaired_provider or None}
+
+
 def _stored_session_runtime_overrides(row: dict | None) -> dict:
     """Return runtime fields persisted with a stored session.
 
@@ -1736,6 +1879,19 @@ def _stored_session_runtime_overrides(row: dict | None) -> dict:
     provider = explicit_provider
     if not provider and billing_provider.lower() not in _BARE_BILLING_PROVIDERS:
         provider = billing_provider
+    if provider and model and not _provider_supports_exact_model(provider, model):
+        inferred = _infer_provider_for_exact_model(model, avoid_provider=provider)
+        if inferred:
+            logger.warning(
+                "repairing stale stored session model/provider pair: %s/%s -> %s/%s",
+                provider,
+                model,
+                inferred,
+                model,
+            )
+            provider = inferred
+    elif not provider and model:
+        provider = _infer_provider_for_exact_model(model)
     base_url = str(model_config.get("base_url") or "").strip()
     api_mode = str(model_config.get("api_mode") or "").strip()
     reasoning_config = model_config.get("reasoning_config")
@@ -4182,10 +4338,9 @@ def _(rid, params: dict) -> dict:
     # for a new chat can't mutate the profile default. provider is optional
     # (resolved at build).
     create_model = str(params.get("model") or "").strip()
-    session_model_override = (
-        {"model": create_model, "provider": str(params.get("provider") or "").strip() or None}
-        if create_model
-        else None
+    session_model_override = _session_model_override_from_create(
+        create_model,
+        str(params.get("provider") or "").strip(),
     )
     create_reasoning_override = None
     if effort := str(params.get("reasoning_effort") or "").strip():
@@ -6616,6 +6771,13 @@ def _run_prompt_submit(rid, sid: str, session: dict, text: Any) -> None:
                 )
                 with session["history_lock"]:
                     _set_session_running(session, False)
+
+        # Drain one pending Loop foreground handoff only after this session is
+        # quiescent. If a user or goal continuation already took the running
+        # slot, the handoff remains queued for the next idle boundary.
+        if not goal_followup:
+            if _drain_loop_handoff_review_at_idle(rid, sid, session):
+                return
 
         # Drain completion notifications that arrived during this turn.
         # The background poller handles between-turn delivery; this is

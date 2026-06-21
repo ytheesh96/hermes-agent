@@ -848,6 +848,7 @@ class GatewayKanbanWatchersMixin:
                     review_batch = _kb.run_next_loop_handoff_review_batch(
                         conn,
                         session_busy=_foreground_session_busy,
+                        defer_live_foreground=True,
                         review_runner=lambda batch: _kb.start_loop_handoff_review_process(batch, board=slug),
                     )
                 except Exception:

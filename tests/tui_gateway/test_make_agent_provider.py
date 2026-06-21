@@ -60,6 +60,71 @@ def test_make_agent_passes_resolved_provider():
         assert call_kwargs.kwargs["api_mode"] == "anthropic_messages"
 
 
+def test_session_create_repairs_stale_provider_model_pair(monkeypatch):
+    from tui_gateway import server
+
+    monkeypatch.setattr(
+        server,
+        "_model_provider_rows_for_repair",
+        lambda: [
+            {"authenticated": True, "models": ["openai/gpt-5.5", "stepfun/step-3.7-flash:free"], "slug": "nous"},
+            {"authenticated": True, "models": ["gpt-5.5"], "slug": "openai-codex"},
+            {"authenticated": True, "models": ["gpt-5.5"], "slug": "copilot"},
+        ],
+    )
+
+    override = server._session_model_override_from_create("gpt-5.5", "nous")
+
+    assert override == {"model": "gpt-5.5", "provider": "openai-codex"}
+
+
+def test_stored_session_runtime_infers_provider_for_bare_model(monkeypatch):
+    from tui_gateway import server
+
+    monkeypatch.setattr(
+        server,
+        "_model_provider_rows_for_repair",
+        lambda: [
+            {"authenticated": True, "models": ["openai/gpt-5.5"], "slug": "nous"},
+            {"authenticated": True, "models": ["gpt-5.5"], "slug": "openai-codex"},
+        ],
+    )
+
+    overrides = server._stored_session_runtime_overrides(
+        {
+            "model": "gpt-5.5",
+            "model_config": '{"max_iterations": 90}',
+            "billing_provider": "",
+        }
+    )
+
+    assert overrides["model_override"]["provider"] == "openai-codex"
+
+
+def test_stored_session_runtime_repairs_stale_provider_model_pair(monkeypatch):
+    from tui_gateway import server
+
+    monkeypatch.setattr(
+        server,
+        "_model_provider_rows_for_repair",
+        lambda: [
+            {"authenticated": True, "models": ["openai/gpt-5.5"], "slug": "nous"},
+            {"authenticated": True, "models": ["gpt-5.5"], "slug": "openai-codex"},
+        ],
+    )
+
+    overrides = server._stored_session_runtime_overrides(
+        {
+            "model": "gpt-5.5",
+            "model_config": '{"model": "gpt-5.5", "provider": "nous"}',
+            "billing_provider": "nous",
+        }
+    )
+
+    assert overrides["model_override"]["provider"] == "openai-codex"
+    assert overrides["provider_override"] == "openai-codex"
+
+
 def test_make_agent_forwards_provider_routing():
     """Parity with the messaging gateway + CLI: ``provider_routing`` in
     config.yaml must reach AIAgent so OpenRouter honors the user's sort /

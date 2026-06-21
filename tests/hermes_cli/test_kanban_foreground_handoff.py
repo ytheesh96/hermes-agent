@@ -1213,6 +1213,121 @@ def test_scheduler_routes_originating_compression_root_to_live_tip(kanban_home, 
     assert tip_messages and "kanban_loop_handoff_review_batch" in tip_messages[0]["content"]
 
 
+def test_background_scheduler_defers_live_foreground_handoff_until_idle_boundary(kanban_home, monkeypatch):
+    import hermes_state
+    from hermes_state import SessionDB
+
+    monkeypatch.setattr(hermes_state, "DEFAULT_DB_PATH", kanban_home / "state.db")
+    session_db = SessionDB()
+    session_db.create_session("foreground-live", "tui", model="gpt-test")
+
+    with kb.connect() as conn:
+        task_id = _loop_node(
+            conn,
+            title="foreground-owned handoff",
+            tenant="tenant-a",
+            session_id="foreground-live",
+        )
+        assert kb.claim_task(conn, task_id, claimer="worker-host:123") is not None
+        assert kb.complete_task(conn, task_id, summary="ready for foreground owner")
+
+        deferred = kb.run_next_loop_handoff_review_batch(
+            conn,
+            session_db=session_db,
+            defer_live_foreground=True,
+            review_runner=lambda batch: pytest.fail("live foreground handoff should not spawn a reviewer subprocess"),
+        )
+        handoff_before_idle = kb.list_loop_handoffs(conn, task_id=task_id)[0]
+        calls = []
+        drained = kb.run_next_loop_handoff_review_batch(
+            conn,
+            session_db=session_db,
+            required_live_session_id="foreground-live",
+            session_busy=lambda candidate: str(candidate) != "foreground-live",
+            review_runner=lambda batch: calls.append(batch) or {"ok": True, "mode": "foreground_idle_boundary"},
+        )
+        handoff_after_idle = kb.list_loop_handoffs(conn, task_id=task_id)[0]
+
+    assert deferred is None
+    assert handoff_before_idle["state"] in {"recorded", "queued", "batched"}
+    assert drained is not None
+    assert drained["review_route"] == "foreground"
+    assert drained["reviewer_session_id"] == "foreground-live"
+    assert calls and calls[0]["reviewer_session_id"] == "foreground-live"
+    assert handoff_after_idle["state"] == "assigned"
+
+
+def test_background_scheduler_uses_durable_dedicated_route_after_origin_session_ends(kanban_home, monkeypatch):
+    import hermes_state
+    from hermes_state import SessionDB
+
+    monkeypatch.setattr(hermes_state, "DEFAULT_DB_PATH", kanban_home / "state.db")
+    session_db = SessionDB()
+    session_db.create_session("foreground-ended", "tui", model="gpt-test")
+    session_db.end_session("foreground-ended", "closed")
+
+    with kb.connect() as conn:
+        task_id = _loop_node(
+            conn,
+            title="ended foreground fallback",
+            tenant="tenant-a",
+            session_id="foreground-ended",
+        )
+        assert kb.claim_task(conn, task_id, claimer="worker-host:123") is not None
+        assert kb.complete_task(conn, task_id, summary="needs fallback reviewer")
+
+        calls = []
+        batch = kb.run_next_loop_handoff_review_batch(
+            conn,
+            session_db=session_db,
+            defer_live_foreground=True,
+            review_runner=lambda claimed: calls.append(claimed) or {"ok": True, "mode": "subprocess"},
+        )
+        events = [event for event in kb.list_events(conn, task_id) if event.kind == "loop_handoff_review_session"]
+        handoff = kb.list_loop_handoffs(conn, task_id=task_id)[0]
+
+    assert batch is not None
+    assert batch["review_route"] == "dedicated"
+    assert batch["reviewer_session_id"] == kb.loop_handoff_reviewer_session_id("tenant-a", "t_looproot")
+    assert calls and calls[0]["review_route"] == "dedicated"
+    assert handoff["reviewer_session_id"] == batch["reviewer_session_id"]
+    assert events
+    assert events[-1].payload is not None
+    assert events[-1].payload["review_route"] == "dedicated"
+
+
+def test_idle_boundary_does_not_claim_another_live_session_handoff(kanban_home, monkeypatch):
+    import hermes_state
+    from hermes_state import SessionDB
+
+    monkeypatch.setattr(hermes_state, "DEFAULT_DB_PATH", kanban_home / "state.db")
+    session_db = SessionDB()
+    session_db.create_session("foreground-a", "tui", model="gpt-test")
+    session_db.create_session("foreground-b", "tui", model="gpt-test")
+
+    with kb.connect() as conn:
+        task_id = _loop_node(
+            conn,
+            title="foreign foreground handoff",
+            tenant="tenant-a",
+            session_id="foreground-a",
+        )
+        assert kb.claim_task(conn, task_id, claimer="worker-host:123") is not None
+        assert kb.complete_task(conn, task_id, summary="belongs to session a")
+
+        result = kb.run_next_loop_handoff_review_batch(
+            conn,
+            session_db=session_db,
+            required_live_session_id="foreground-b",
+            session_busy=lambda candidate: str(candidate) != "foreground-b",
+            review_runner=lambda batch: pytest.fail("session b must not claim session a's handoff"),
+        )
+        handoff = kb.list_loop_handoffs(conn, task_id=task_id)[0]
+
+    assert result is None
+    assert handoff["state"] in {"recorded", "queued", "batched"}
+
+
 def test_review_runner_uses_claimed_reviewer_profile(monkeypatch, tmp_path):
     captured = {}
 
@@ -1367,6 +1482,79 @@ def test_autonomous_policy_escalates_prohibited_and_bounded_repair(kanban_home):
         "escalation_reason": "repeated_failed_auto_repair",
         "notification": {"level": "escalation", "state": "needs-user"},
     }
+
+
+@pytest.mark.parametrize(
+    "flag",
+    [
+        "ambiguous",
+        "destructive_side_effect",
+        "external_side_effect",
+        "failed_evidence_tradeoff",
+        "live_mutation",
+        "privacy_sensitive",
+        "product_decision",
+        "push",
+        "restart",
+        "secrets",
+        "unclear_acceptance_criteria",
+    ],
+)
+def test_autonomous_policy_escalates_every_boundary_flag_without_closing(kanban_home, flag):
+    with kb.connect() as conn:
+        parent_id = _loop_node(conn, title=f"loop parent {flag}", tenant="tenant-a")
+        child_id = _loop_node(conn, title=f"loop child {flag}", parents=(parent_id,), tenant="tenant-a")
+        assert kb.claim_task(conn, parent_id, claimer="worker-host:boundary") is not None
+        assert kb.complete_task(conn, parent_id, summary="done but boundary needs foreground decision")
+        handoff = kb.list_loop_handoffs(conn, task_id=parent_id)[0]
+
+        result = kb.review_loop_handoff_autonomous_action(
+            conn,
+            handoff["id"],
+            action="approve_release",
+            actor="reviewer-qa",
+            evidence_passed=True,
+            prohibited_flags=[flag],
+            reason=f"boundary flag {flag} must not auto-close",
+        )
+        reviewed = kb.list_loop_handoffs(conn, task_id=parent_id)[0]
+        child = kb.get_task(conn, child_id)
+
+    assert result["ok"] is False
+    assert result["outcome"] == "escalated"
+    assert flag in result["escalation_reason"]
+    assert reviewed["state"] == "escalated"
+    assert reviewed["attention"] == "needs-user"
+    assert reviewed["verification_state"] == "needs-user"
+    assert reviewed["verification_status"] == "unknown"
+    assert child is not None and child.status == "todo"
+
+
+@pytest.mark.parametrize("flag", ["unknown_flag", "typo-secret"])
+def test_autonomous_policy_escalates_unknown_boundary_flags_without_closing(kanban_home, flag):
+    with kb.connect() as conn:
+        task_id = _loop_node(conn, title=f"loop parent {flag}", tenant="tenant-a")
+        assert kb.claim_task(conn, task_id, claimer="worker-host:boundary") is not None
+        assert kb.complete_task(conn, task_id, summary="done but unknown boundary flag appears")
+        handoff = kb.list_loop_handoffs(conn, task_id=task_id)[0]
+
+        result = kb.review_loop_handoff_autonomous_action(
+            conn,
+            handoff["id"],
+            action="approve_release",
+            actor="reviewer-qa",
+            evidence_passed=True,
+            prohibited_flags=[flag],
+            reason=f"unknown boundary flag {flag} must still be safe",
+        )
+        reviewed = kb.list_loop_handoffs(conn, task_id=task_id)[0]
+
+    assert result["ok"] is False
+    assert result["outcome"] == "escalated"
+    assert flag in result["escalation_reason"]
+    assert reviewed["state"] == "escalated"
+    assert reviewed["attention"] == "needs-user"
+    assert reviewed["verification_state"] == "needs-user"
 
 
 def test_autonomous_action_after_escalation_is_rejected_without_promoting_downstream(kanban_home):

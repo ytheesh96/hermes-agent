@@ -27,16 +27,30 @@ def kanban_home(tmp_path, monkeypatch):
     return home
 
 
-def _fake_aux_response(content: str):
+def _fake_aux_response(content: str, *, finish_reason: str = "stop"):
     resp = MagicMock()
     resp.choices = [MagicMock()]
     resp.choices[0].message.content = content
+    resp.choices[0].finish_reason = finish_reason
     return resp
 
 
-def _mock_client_returning(content: str):
+def _mock_client_returning(content: str, *, finish_reason: str = "stop"):
     client = MagicMock()
-    client.chat.completions.create = MagicMock(return_value=_fake_aux_response(content))
+    client.chat.completions.create = MagicMock(
+        return_value=_fake_aux_response(content, finish_reason=finish_reason)
+    )
+    return client
+
+
+def _mock_client_returning_sequence(items: list[tuple[str, str]]):
+    client = MagicMock()
+    client.chat.completions.create = MagicMock(
+        side_effect=[
+            _fake_aux_response(content, finish_reason=finish_reason)
+            for content, finish_reason in items
+        ]
+    )
     return client
 
 
@@ -308,6 +322,79 @@ def test_decompose_handles_malformed_llm_json(kanban_home):
 
     assert outcome.ok is False
     assert "malformed JSON" in outcome.reason
+
+
+def test_decompose_retries_empty_length_output(kanban_home):
+    with kb.connect() as conn:
+        tid = kb.create_task(conn, title="dynamic loop work", triage=True)
+
+    llm_payload = jsonlib.dumps({
+        "fanout": True,
+        "rationale": "minimal dynamic scaffold",
+        "tasks": [
+            {
+                "title": "Implement dynamic scaffold",
+                "body": "Preserve epistemic packets as on-demand expansion points.",
+                "assignee": "engineer",
+                "parents": [],
+            },
+        ],
+    })
+
+    client = _mock_client_returning_sequence([
+        ("", "length"),
+        (llm_payload, "stop"),
+    ])
+    patches = _patch_list_profiles(["orchestrator", "engineer"])
+    for p in patches:
+        p.start()
+    try:
+        with patch(
+            "agent.auxiliary_client.get_text_auxiliary_client",
+            return_value=(client, "test-model"),
+        ), _patch_extra_body():
+            outcome = decomp.decompose_task(tid, author="me")
+    finally:
+        for p in patches:
+            p.stop()
+
+    assert outcome.ok, outcome.reason
+    assert outcome.child_ids and len(outcome.child_ids) == 1
+    max_tokens = [
+        call.kwargs["max_tokens"]
+        for call in client.chat.completions.create.call_args_list
+    ]
+    assert max_tokens == [4000, 12000]
+
+
+def test_decompose_reports_empty_truncated_output(kanban_home):
+    with kb.connect() as conn:
+        tid = kb.create_task(conn, title="x", triage=True)
+
+    client = _mock_client_returning_sequence([
+        ("", "length"),
+        ("", "length"),
+    ])
+    patches = _patch_list_profiles(["orchestrator"])
+    for p in patches:
+        p.start()
+    try:
+        with patch(
+            "agent.auxiliary_client.get_text_auxiliary_client",
+            return_value=(client, "test-model"),
+        ), _patch_extra_body():
+            outcome = decomp.decompose_task(tid, author="me")
+    finally:
+        for p in patches:
+            p.stop()
+
+    assert outcome.ok is False
+    assert "empty/truncated" in outcome.reason
+
+
+def test_decomposer_prompt_preserves_dynamic_epistemic_expansion():
+    assert "do NOT pre-materialize" in decomp._SYSTEM_PROMPT
+    assert "epistemic_subgraph only when" in decomp._SYSTEM_PROMPT
 
 
 def test_decompose_returns_false_when_task_not_triage(kanban_home):

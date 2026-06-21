@@ -2895,17 +2895,116 @@ def _append_event(
     return event_id
 
 
-def _loop_root_for_task(conn: sqlite3.Connection, task_id: str) -> Optional[str]:
-    """Return the Loop root id for a Loop-created task, else ``None``."""
+def _task_created_by(conn: sqlite3.Connection, task_id: str) -> Optional[str]:
     row = conn.execute("SELECT created_by FROM tasks WHERE id = ?", (task_id,)).fetchone()
     if row is None:
         return None
-    created_by = (row["created_by"] or "").strip()
+    return (row["created_by"] or "").strip()
+
+
+def _canonical_loop_created_by_root(created_by: Optional[str]) -> Optional[str]:
     prefix = "loop:"
+    created_by = (created_by or "").strip()
     if not created_by.startswith(prefix):
         return None
     root_task_id = created_by[len(prefix) :].strip()
     return root_task_id or None
+
+
+def _task_event_payloads(
+    conn: sqlite3.Connection,
+    task_id: str,
+    kind: str,
+) -> list[dict[str, Any]]:
+    rows = conn.execute(
+        "SELECT payload FROM task_events WHERE task_id = ? AND kind = ? ORDER BY id ASC",
+        (task_id, kind),
+    ).fetchall()
+    payloads: list[dict[str, Any]] = []
+    for row in rows:
+        payload = _decode_json_dict(row["payload"])
+        if payload:
+            payloads.append(payload)
+    return payloads
+
+
+def _legacy_foreground_loop_task(conn: sqlite3.Connection, task_id: str) -> bool:
+    return _task_created_by(conn, task_id) == "foreground"
+
+
+def _decomposition_event_mentions_child(
+    conn: sqlite3.Connection,
+    root_task_id: str,
+    child_task_id: Optional[str] = None,
+) -> bool:
+    for payload in _task_event_payloads(conn, root_task_id, "decomposed"):
+        child_ids_payload = [str(item).strip() for item in _json_list(payload.get("child_ids"))]
+        if child_task_id is None:
+            if child_ids_payload:
+                return True
+        elif child_task_id in child_ids_payload:
+            return True
+    return False
+
+
+def _legacy_loop_root_from_decomposition_lineage(
+    conn: sqlite3.Connection,
+    task_id: str,
+) -> Optional[str]:
+    """Infer legacy foreground Loop root provenance from decomposition edges.
+
+    Early Loop decomposition rows sometimes kept ``created_by='foreground'`` on
+    the root and children instead of canonical ``created_by='loop:<root>'``.
+    Treat those rows as Loop-backed only when the durable decomposition event or
+    closure dependency points unambiguously at one foreground-created root.
+    """
+    candidates: list[str] = []
+
+    def add(candidate: Any) -> None:
+        candidate_id = str(candidate or "").strip()
+        if candidate_id and candidate_id not in candidates:
+            candidates.append(candidate_id)
+
+    # The root itself: foreground-created task with a decomposition record.
+    if _legacy_foreground_loop_task(conn, task_id) and _decomposition_event_mentions_child(conn, task_id):
+        add(task_id)
+
+    # Child create events from newer decomposers may carry an explicit root id
+    # even if the task row itself was not rewritten to canonical loop:<root>.
+    for payload in _task_event_payloads(conn, task_id, "created"):
+        explicit_root = payload.get("loop_root_task_id")
+        if explicit_root:
+            add(explicit_root)
+        from_decompose_of = payload.get("from_decompose_of")
+        if (
+            from_decompose_of
+            and _legacy_foreground_loop_task(conn, str(from_decompose_of))
+            and _decomposition_event_mentions_child(conn, str(from_decompose_of), task_id)
+        ):
+            add(from_decompose_of)
+
+    # Closure dependency: decomposed children link to the root so the root wakes
+    # only after all children finish. That child->root edge is enough when the
+    # dependent root also records a matching decomposition payload.
+    for dependent_id in child_ids(conn, task_id):
+        if (
+            _legacy_foreground_loop_task(conn, dependent_id)
+            and _decomposition_event_mentions_child(conn, dependent_id, task_id)
+        ):
+            add(dependent_id)
+
+    return candidates[0] if len(candidates) == 1 else None
+
+
+def _loop_root_for_task(conn: sqlite3.Connection, task_id: str) -> Optional[str]:
+    """Return the Loop root id for a Loop-created task, else ``None``."""
+    task_id = str(task_id or "").strip()
+    if not task_id:
+        return None
+    canonical_root = _canonical_loop_created_by_root(_task_created_by(conn, task_id))
+    if canonical_root:
+        return canonical_root
+    return _legacy_loop_root_from_decomposition_lineage(conn, task_id)
 
 
 def _lineage_session_id(
@@ -3724,12 +3823,21 @@ def _loop_handoff_review_target(
     root_task_id: str,
     session_db: Any = None,
     session_busy: Optional[Callable[[str], bool]] = None,
+    defer_live_foreground: bool = False,
+    required_live_session_id: Optional[str] = None,
 ) -> Optional[tuple[Any, str, str, str]]:
     """Resolve where a foreground handoff batch should be injected.
 
     Prefer the live originating/root foreground session (or its compression
     tip). If none is live, create/resume the deterministic tenant-review
     session in the reviewer profile DB so the reviewer subprocess can resume it.
+
+    ``defer_live_foreground`` is used by background schedulers: a pending
+    handoff for a still-live foreground session must remain queued until that
+    foreground runtime reaches an idle boundary and can run the turn in-process.
+    ``required_live_session_id`` is used by that foreground runtime to claim
+    only handoffs that target its own live session; it never falls back to the
+    dedicated reviewer route.
     """
     from hermes_state import SessionDB
 
@@ -3749,10 +3857,18 @@ def _loop_handoff_review_target(
             ),
             session_busy=session_busy,
         )
+    required_live_session_id = str(required_live_session_id or "").strip() or None
     if live_session_busy:
         return None
     if live_session_id:
+        if required_live_session_id and live_session_id != required_live_session_id:
+            return None
+        if defer_live_foreground:
+            return None
         return default_session_db, live_session_id, _current_session_profile_name(), "foreground"
+
+    if required_live_session_id:
+        return None
 
     if session_db is not None:
         reviewer_session_id = _ensure_loop_handoff_review_session(
@@ -3778,6 +3894,8 @@ def claim_next_loop_handoff_review_batch(
     session_db: Any = None,
     limit: int = 10,
     session_busy: Optional[Callable[[str], bool]] = None,
+    defer_live_foreground: bool = False,
+    required_live_session_id: Optional[str] = None,
 ) -> Optional[dict[str, Any]]:
     """Scheduler entrypoint: claim one queued Loop handoff batch into a review session.
 
@@ -3797,6 +3915,8 @@ def claim_next_loop_handoff_review_batch(
             root_task_id=root_task_id,
             session_db=session_db,
             session_busy=session_busy,
+            defer_live_foreground=defer_live_foreground,
+            required_live_session_id=required_live_session_id,
         )
         if target is None:
             continue
@@ -3978,6 +4098,8 @@ def run_next_loop_handoff_review_batch(
     session_db: Any = None,
     limit: int = 10,
     session_busy: Optional[Callable[[str], bool]] = None,
+    defer_live_foreground: bool = False,
+    required_live_session_id: Optional[str] = None,
     review_runner: Any,
 ) -> Optional[dict[str, Any]]:
     """Claim one queued Loop handoff batch and execute its reviewer runner.
@@ -3994,6 +4116,8 @@ def run_next_loop_handoff_review_batch(
         session_db=session_db,
         limit=limit,
         session_busy=session_busy,
+        defer_live_foreground=defer_live_foreground,
+        required_live_session_id=required_live_session_id,
     )
     if not batch:
         return None
@@ -4175,6 +4299,7 @@ def _ensure_orchestrator_parent_stub(
     fork_session_db: Any,
     parent_session_id: str,
     task: Task,
+    parent_profile: str = "default",
 ) -> None:
     """Ensure ``parent_session_id`` exists in the DB that will store the fork.
 
@@ -4193,6 +4318,8 @@ def _ensure_orchestrator_parent_stub(
     model_config = {
         "_external_foreground_parent_session": {
             "session_id": parent_session_id,
+            "profile": parent_profile,
+            "session_ref": _profile_qualified_session_ref(parent_profile, parent_session_id),
             "task_id": task.id,
             "run_id": task.current_run_id,
         }
@@ -4204,10 +4331,22 @@ def _ensure_orchestrator_parent_stub(
     )
 
 
-def _compact_orchestrator_dispatch_packet(task: Task, parent_session_id: str, fork_session_id: str) -> str:
+def _profile_qualified_session_ref(profile: Optional[str], session_id: str) -> str:
+    profile_name = (str(profile or "").strip() or "default")
+    return f"{profile_name}/{session_id}"
+
+
+def _compact_orchestrator_dispatch_packet(
+    task: Task,
+    parent_session_id: str,
+    fork_session_id: str,
+    *,
+    parent_profile: str = "default",
+) -> str:
     body = task.body or ""
     if len(body) > 2000:
         body = body[:2000] + "…"
+    parent_session_ref = _profile_qualified_session_ref(parent_profile, parent_session_id)
     payload = {
         "kind": "kanban_orchestrator_dispatch",
         "task": {
@@ -4225,11 +4364,25 @@ def _compact_orchestrator_dispatch_packet(task: Task, parent_session_id: str, fo
             "task_id": task.id,
             "run_id": task.current_run_id,
             "parent_foreground_session_id": parent_session_id,
+            "parent_foreground_session_profile": parent_profile,
+            "parent_session_ref": parent_session_ref,
             "fork_session_id": fork_session_id,
         },
+        "context_refs": {
+            "parent_session": {
+                "profile": parent_profile,
+                "session_id": parent_session_id,
+                "session_ref": parent_session_ref,
+                "session_search": {
+                    "session_id": parent_session_ref,
+                },
+            },
+        },
         "instructions": [
-            "This is an isolated orchestrator fork of the foreground session.",
+            "This is an isolated compact orchestrator dispatch session.",
             "Do not mutate the live foreground parent transcript directly.",
+            "Do not assume the foreground transcript was copied into this session.",
+            f"If parent history is needed, call session_search with session_id={parent_session_ref!r} (or profile={parent_profile!r} and session_id={parent_session_id!r}).",
             "Use Kanban tools to route child work and record durable decisions.",
         ],
     }
@@ -4257,25 +4410,30 @@ def ensure_orchestrator_fork_for_dispatch(conn: sqlite3.Connection, task: Task) 
     parent_session_id = _orchestrator_parent_session_id(task, parent_session_db)
     if not parent_session_id:
         return task
+    parent_profile = _current_session_profile_name()
+    parent_session_ref = _profile_qualified_session_ref(parent_profile, parent_session_id)
 
     fork_session_id = _orchestrator_fork_session_id(task, parent_session_id)
     fork_session_db = _orchestrator_profile_session_db(task.assignee)
 
-    try:
-        parent_messages = parent_session_db.get_messages(parent_session_id)
-    except Exception:
-        parent_messages = []
-
     model_config = {
         "_branched_from": parent_session_id,
+        "_branched_from_ref": parent_session_ref,
         "_kanban_orchestrator_fork": {
             "task_id": task.id,
             "run_id": task.current_run_id,
             "parent_foreground_session_id": parent_session_id,
+            "parent_foreground_session_profile": parent_profile,
+            "parent_session_ref": parent_session_ref,
             "fork_session_id": fork_session_id,
         },
     }
-    _ensure_orchestrator_parent_stub(fork_session_db, parent_session_id, task)
+    _ensure_orchestrator_parent_stub(
+        fork_session_db,
+        parent_session_id,
+        task,
+        parent_profile=parent_profile,
+    )
     fork_session_db.create_session(
         fork_session_id,
         _ORCHESTRATOR_DISPATCH_SOURCE,
@@ -4284,12 +4442,15 @@ def ensure_orchestrator_fork_for_dispatch(conn: sqlite3.Connection, task: Task) 
     )
     try:
         if not fork_session_db.get_messages(fork_session_id):
-            if parent_messages:
-                fork_session_db.replace_messages(fork_session_id, parent_messages)
             fork_session_db.append_message(
                 fork_session_id,
                 "user",
-                _compact_orchestrator_dispatch_packet(task, parent_session_id, fork_session_id),
+                _compact_orchestrator_dispatch_packet(
+                    task,
+                    parent_session_id,
+                    fork_session_id,
+                    parent_profile=parent_profile,
+                ),
                 observed=True,
             )
     except Exception:
@@ -4303,6 +4464,8 @@ def ensure_orchestrator_fork_for_dispatch(conn: sqlite3.Connection, task: Task) 
         "task_id": task.id,
         "run_id": task.current_run_id,
         "parent_foreground_session_id": parent_session_id,
+        "parent_foreground_session_profile": parent_profile,
+        "parent_session_ref": parent_session_ref,
         "fork_session_id": fork_session_id,
         "session_source": _ORCHESTRATOR_DISPATCH_SOURCE,
     }
@@ -7003,6 +7166,14 @@ def decompose_triage_task(
             "parents": [0, 2],                 # indices into this same children list
         }
 
+    When ``auto_promote`` is false, child tasks are created as sticky
+    ``blocked`` rows instead of ordinary ``todo`` rows. Leaving parent-free
+    children as ``todo`` is not a durable hold because the dispatcher and
+    several read paths call ``recompute_ready()``, which promotes parent-free
+    ``todo`` tasks to ``ready``. A sticky blocked child requires explicit
+    operator unblocking and keeps planning-only decompositions from
+    accidentally dispatching.
+
     Returns the list of created child task ids (in input order) on
     success. Returns ``None`` when:
       - The root task does not exist
@@ -7098,10 +7269,13 @@ def decompose_triage_task(
         root_ws_kind = root_row["workspace_kind"] or "scratch"
         root_ws_path = root_row["workspace_path"]
 
-        # Create children. Status is 'todo' regardless of parents — we
-        # link them under the root AFTER creation so the dispatcher
-        # sees a coherent state, and recompute_ready() at the end
-        # promotes parent-free children to 'ready'.
+        child_initial_status = "todo" if auto_promote else "blocked"
+        # Create children. In activation mode, status is 'todo' regardless
+        # of parents — we link them under the root AFTER creation so the
+        # dispatcher sees a coherent state, and recompute_ready() at the end
+        # promotes parent-free children to 'ready'. In planning/hold mode,
+        # children must be sticky-blocked from the start; plain parent-free
+        # 'todo' rows are eligible for recompute_ready() in other processes.
         for idx, child in enumerate(children):
             new_id = _new_task_id()
             title = child["title"].strip()
@@ -7123,12 +7297,13 @@ def decompose_triage_task(
                 "INSERT INTO tasks "
                 "(id, title, body, assignee, status, workspace_kind, "
                 " workspace_path, tenant, created_at, created_by, session_id) "
-                "VALUES (?, ?, ?, ?, 'todo', ?, ?, ?, ?, ?, ?)",
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
                 (
                     new_id,
                     title,
                     body if isinstance(body, str) else None,
                     assignee,
+                    child_initial_status,
                     child_ws_kind,
                     child_ws_path,
                     tenant,
@@ -7137,13 +7312,28 @@ def decompose_triage_task(
                     child_session_id,
                 ),
             )
-            created_payload = {"by": author or "decomposer", "from_decompose_of": task_id}
+            created_payload = {
+                "by": author or "decomposer",
+                "from_decompose_of": task_id,
+                "status": child_initial_status,
+            }
             if root_loop_task_id:
                 created_payload["loop_root_task_id"] = root_loop_task_id
             _append_event(
                 conn, new_id, "created",
                 created_payload,
             )
+            if not auto_promote:
+                _append_event(
+                    conn,
+                    new_id,
+                    "blocked",
+                    {
+                        "reason": "decomposed graph parked for manual activation",
+                        "blocked_by": author or "decomposer",
+                        "from_decompose_of": task_id,
+                    },
+                )
             child_ids.append(new_id)
 
         # Link children to their sibling parents (within the decomposed graph).
@@ -7209,8 +7399,8 @@ def decompose_triage_task(
     # Outside the write_txn: promote parent-free children to 'ready'
     # so the dispatcher picks them up on its next tick. Same pattern
     # specify_triage_task uses.  When auto_promote is False children
-    # stay in 'todo' until the user manually promotes them — useful
-    # for manual-review-first workflows.
+    # are sticky-blocked and require explicit unblocking — useful for
+    # manual-review-first workflows.
     if auto_promote:
         recompute_ready(conn)
     return child_ids

@@ -200,7 +200,12 @@ def test_decompose_loop_root_children_keep_root_provenance_and_session(kanban_ho
 
     created_payloads = [ev.payload for ev in events if ev.kind == "created"]
     assert created_payloads == [
-        {"by": "foreground", "from_decompose_of": tid, "loop_root_task_id": tid}
+        {
+            "by": "foreground",
+            "from_decompose_of": tid,
+            "status": "todo",
+            "loop_root_task_id": tid,
+        }
     ]
 
 
@@ -250,8 +255,147 @@ def test_decompose_loop_child_triage_children_inherit_real_root_session(kanban_h
 
     created_payloads = [ev.payload for ev in events if ev.kind == "created"]
     assert created_payloads == [
-        {"by": "planner", "from_decompose_of": triage_id, "loop_root_task_id": root_id}
+        {
+            "by": "planner",
+            "from_decompose_of": triage_id,
+            "status": "todo",
+            "loop_root_task_id": root_id,
+        }
     ]
+
+
+def test_legacy_foreground_decomposed_root_completion_records_loop_handoff(kanban_home):
+    """Legacy foreground decomposed roots still emit final Loop handoffs."""
+    with kb.connect() as conn:
+        root_id = kb.create_task(
+            conn,
+            title="legacy foreground root",
+            assignee="foreground",
+            created_by="foreground",
+            tenant="loop-tenant",
+            triage=True,
+            session_id="foreground-session",
+        )
+        child_ids = kb.decompose_triage_task(
+            conn,
+            root_id,
+            root_assignee="orchestrator",
+            children=[{"title": "implementation", "assignee": "engineer"}],
+            author="foreground",
+        )
+        assert child_ids is not None
+        child_id = child_ids[0]
+
+        assert kb._loop_root_for_task(conn, root_id) == root_id
+        assert kb._loop_root_for_task(conn, child_id) == root_id
+        assert kb.claim_task(conn, child_id, claimer="worker-host:child") is not None
+        assert kb.complete_task(conn, child_id, summary="implementation done")
+        assert kb.claim_task(conn, root_id, claimer="worker-host:root") is not None
+        assert kb.complete_task(conn, root_id, summary="root closeout complete")
+
+        handoffs = kb.list_loop_handoffs(conn, task_id=root_id)
+        events = [
+            event for event in kb.list_events(conn, root_id)
+            if event.kind == "loop_foreground_handoff"
+        ]
+
+    assert len(handoffs) == 1
+    assert handoffs[0]["handoff_kind"] == "worker_completed"
+    assert handoffs[0]["root_task_id"] == root_id
+    assert handoffs[0]["task_id"] == root_id
+    assert handoffs[0]["state"] == "queued"
+    assert len(events) == 1
+    assert events[0].payload is not None
+    assert events[0].payload["root_task_id"] == root_id
+    assert events[0].payload["handoff_kind"] == "worker_completed"
+
+
+def test_legacy_foreground_decomposed_child_explicit_block_uses_same_root(kanban_home):
+    """Explicit child review boundaries retain the decomposed foreground root."""
+    with kb.connect() as conn:
+        root_id = kb.create_task(
+            conn,
+            title="legacy foreground root",
+            assignee="foreground",
+            created_by="foreground",
+            tenant="loop-tenant",
+            triage=True,
+            session_id="foreground-session",
+        )
+        child_ids = kb.decompose_triage_task(
+            conn,
+            root_id,
+            root_assignee="orchestrator",
+            children=[{"title": "implementation", "assignee": "engineer"}],
+            author="foreground",
+        )
+        assert child_ids is not None
+        child_id = child_ids[0]
+
+        assert kb._loop_root_for_task(conn, child_id) == root_id
+        assert kb.claim_task(conn, child_id, claimer="worker-host:child") is not None
+        assert kb.block_task(conn, child_id, reason="review-required: inspect implementation")
+
+        handoffs = kb.list_loop_handoffs(conn, task_id=child_id)
+        events = [
+            event for event in kb.list_events(conn, child_id)
+            if event.kind == "loop_foreground_handoff"
+        ]
+
+    assert len(handoffs) == 1
+    assert handoffs[0]["handoff_kind"] == "worker_blocked"
+    assert handoffs[0]["root_task_id"] == root_id
+    assert handoffs[0]["task_id"] == child_id
+    assert handoffs[0]["reason"] == "review-required: inspect implementation"
+    assert len(events) == 1
+    assert events[0].payload is not None
+    assert events[0].payload["root_task_id"] == root_id
+
+
+def test_loop_handoff_source_event_id_keeps_recording_idempotent(kanban_home):
+    """Duplicate source-event retries return the existing durable handoff row."""
+    with kb.connect() as conn:
+        root_id = kb.create_task(
+            conn,
+            title="Loop root",
+            assignee="foreground",
+            created_by="foreground",
+            tenant="loop-tenant",
+            triage=True,
+        )
+        child_ids = kb.decompose_triage_task(
+            conn,
+            root_id,
+            root_assignee="orchestrator",
+            children=[{"title": "implementation", "assignee": "engineer"}],
+            author="foreground",
+        )
+        assert child_ids is not None
+        source_event_id = kb._append_event(conn, root_id, "completed", {"summary": "done"})
+
+        first = kb._record_loop_handoff(
+            conn,
+            root_id,
+            root_task_id=root_id,
+            handoff_kind="worker_completed",
+            run_id=None,
+            source_event_id=source_event_id,
+            summary="first evidence wins",
+        )
+        second = kb._record_loop_handoff(
+            conn,
+            root_id,
+            root_task_id=root_id,
+            handoff_kind="worker_completed",
+            run_id=None,
+            source_event_id=source_event_id,
+            summary="duplicate retry should not overwrite",
+        )
+        handoffs = kb.list_loop_handoffs(conn, task_id=root_id)
+
+    assert len(handoffs) == 1
+    assert first["id"] == second["id"] == handoffs[0]["id"]
+    assert handoffs[0]["summary"] == "first evidence wins"
 
 
 def test_decompose_non_loop_children_keep_author_provenance(kanban_home):
@@ -277,7 +421,45 @@ def test_decompose_non_loop_children_keep_author_provenance(kanban_home):
         assert kb._loop_root_for_task(conn, child_ids[0]) is None
 
     created_payloads = [ev.payload for ev in events if ev.kind == "created"]
-    assert created_payloads == [{"by": "alice", "from_decompose_of": tid}]
+    assert created_payloads == [{"by": "alice", "from_decompose_of": tid, "status": "todo"}]
+
+
+def test_decompose_auto_promote_false_sticky_blocks_children(kanban_home):
+    """Planning-only fan-out must not leak parent-free children to dispatcher.
+
+    ``auto_promote=False`` used to leave children as ordinary ``todo`` rows.
+    Any later ``recompute_ready()`` call (dispatcher tick, list path, tool read)
+    promoted parent-free children to ``ready`` and could spawn them despite the
+    caller asking for a manual-review-first graph.
+    """
+    with kb.connect() as conn:
+        tid = _create_triage(conn, title="parked graph", tenant="loop-tenant")
+        child_ids = kb.decompose_triage_task(
+            conn,
+            tid,
+            root_assignee="orchestrator",
+            children=[
+                {"title": "parallel discovery", "assignee": "researcher", "parents": []},
+                {"title": "parallel criteria", "assignee": "designer", "parents": []},
+                {"title": "synthesis", "assignee": "engineer", "parents": [0, 1]},
+            ],
+            author="planner",
+            auto_promote=False,
+        )
+        assert child_ids is not None
+
+        # Simulate an arbitrary dispatcher/read-path recompute after the hold.
+        promoted = kb.recompute_ready(conn)
+        children = [kb.get_task(conn, cid) for cid in child_ids]
+        block_events = {
+            cid: [ev for ev in kb.list_events(conn, cid) if ev.kind == "blocked"]
+            for cid in child_ids
+        }
+
+    assert promoted == 0
+    assert all(child is not None for child in children)
+    assert [child.status for child in children] == ["blocked", "blocked", "blocked"]
+    assert all(block_events[cid] for cid in child_ids)
 
 
 def test_decompose_children_inherit_dir_workspace(kanban_home):

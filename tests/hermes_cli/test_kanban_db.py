@@ -1550,11 +1550,12 @@ def test_dispatch_promotes_ready_and_spawns(kanban_home, all_assignees_spawnable
 def test_dispatch_orchestrator_task_runs_in_foreground_session_fork(
     kanban_home, all_assignees_spawnable
 ):
-    """Ready orchestrator tasks must branch the owning foreground session.
+    """Ready orchestrator tasks must use a compact foreground-session ref.
 
-    The dispatcher should copy the active transcript into a fork session and
-    hand that fork to the spawned orchestrator worker. It must not append the
-    Kanban proof packet into the live parent foreground session.
+    The dispatcher should hand the spawned orchestrator worker an isolated
+    compact packet with a profile-qualified parent-session reference. It must
+    not copy the live foreground transcript into the fork or append the Kanban
+    proof packet into the live parent foreground session.
     """
     from hermes_state import SessionDB
 
@@ -1593,10 +1594,12 @@ def test_dispatch_orchestrator_task_runs_in_foreground_session_fork(
     assert '\"_branched_from\": \"foreground-parent\"' in (fork["model_config"] or "")
 
     fork_messages = session_db.get_messages(task.foreground_fork_session_id)
-    assert [m["role"] for m in fork_messages] == ["user", "user"]
-    assert fork_messages[0]["content"] == "original user message"
-    assert "kanban_orchestrator_dispatch" in fork_messages[1]["content"]
-    assert task_id in fork_messages[1]["content"]
+    assert [m["role"] for m in fork_messages] == ["user"]
+    packet = fork_messages[0]["content"]
+    assert "original user message" not in packet
+    assert "kanban_orchestrator_dispatch" in packet
+    assert '"parent_session_ref": "default/foreground-parent"' in packet
+    assert task_id in packet
 
     assert session_db.get_messages(parent_session_id) == parent_before
     audit_events = [e for e in events if e.kind == "orchestrator_fork_session"]
@@ -1617,7 +1620,7 @@ def test_dispatch_orchestrator_task_forks_into_separate_profile_db(
     parent_session_id = "foreground-parent-cross-profile"
     foreground_db = SessionDB()
     foreground_db.create_session(parent_session_id, "cli")
-    foreground_db.append_message(parent_session_id, "user", "foreground transcript")
+    foreground_db.append_message(parent_session_id, "user", "secret parent body")
     parent_before = foreground_db.get_messages(parent_session_id)
     orchestrator_db = SessionDB(db_path=orchestrator_home / "state.db")
     spawns = []
@@ -1650,9 +1653,11 @@ def test_dispatch_orchestrator_task_forks_into_separate_profile_db(
     assert parent_stub["source"] == "kanban-orchestrator-parent"
     assert task_id in (parent_stub["model_config"] or "")
     fork_messages = orchestrator_db.get_messages(task.foreground_fork_session_id)
-    assert [m["role"] for m in fork_messages] == ["user", "user"]
-    assert fork_messages[0]["content"] == "foreground transcript"
-    assert "kanban_orchestrator_dispatch" in fork_messages[1]["content"]
+    assert [m["role"] for m in fork_messages] == ["user"]
+    packet = fork_messages[0]["content"]
+    assert "secret parent body" not in packet
+    assert "kanban_orchestrator_dispatch" in packet
+    assert '"parent_session_ref": "default/foreground-parent-cross-profile"' in packet
     assert foreground_db.get_messages(parent_session_id) == parent_before
     assert [e.kind for e in events].count("orchestrator_fork_session") == 1
 

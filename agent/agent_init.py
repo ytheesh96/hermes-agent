@@ -1083,6 +1083,10 @@ def init_agent(
     agent._active_turn_persistence_history_len = 0  # DB boundary for in-flight checkpoints
     agent._session_db_created = False  # DB row deferred to run_conversation()
     agent._session_init_model_config = {
+        "model": agent.model,
+        "provider": agent.provider,
+        "base_url": agent.base_url,
+        "api_mode": getattr(agent, "api_mode", ""),
         "max_iterations": agent.max_iterations,
         "reasoning_config": reasoning_config,
         "max_tokens": max_tokens,

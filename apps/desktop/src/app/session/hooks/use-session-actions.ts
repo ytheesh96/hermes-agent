@@ -2,11 +2,12 @@ import type { MutableRefObject } from 'react'
 import { useCallback, useRef } from 'react'
 import type { NavigateFunction } from 'react-router-dom'
 
-import { deleteSession, getSession, getSessionMessages, setSessionArchived } from '@/hermes'
+import { deleteSession, getGlobalModelOptions, getSession, getSessionMessages, setSessionArchived } from '@/hermes'
 import { useI18n } from '@/i18n'
 import { type ChatMessage, chatMessageText, preserveLocalAssistantErrors, toChatMessages } from '@/lib/chat-messages'
 import { normalizePersonalityValue } from '@/lib/chat-runtime'
 import { embeddedImageUrls, textWithoutEmbeddedImages } from '@/lib/embedded-images'
+import { repairStaleModelProviderSelection } from '@/lib/model-provider-compat'
 import { setSessionYolo } from '@/lib/yolo-session'
 import { clearQueuedPrompts } from '@/store/composer-queue'
 import { $pinnedSessionIds } from '@/store/layout'
@@ -459,10 +460,32 @@ export function useSessionActions({
         // with every session.create so the new chat opens on whatever the picker
         // shows — applied as per-session overrides, never written to the profile
         // default (that lives in Settings → Model).
-        const uiModel = $currentModel.get().trim()
-        const uiProvider = $currentProvider.get().trim()
+        let uiModel = $currentModel.get().trim()
+        let uiProvider = $currentProvider.get().trim()
         const uiEffort = $currentReasoningEffort.get().trim()
         const uiFast = $currentFastMode.get()
+
+        if (uiModel && uiProvider) {
+          try {
+            const options = await getGlobalModelOptions()
+            const repaired = repairStaleModelProviderSelection(options, {
+              model: uiModel,
+              provider: uiProvider
+            })
+
+            if (repaired.model !== uiModel) {
+              setCurrentModel(repaired.model)
+              uiModel = repaired.model
+            }
+
+            if (repaired.provider !== uiProvider) {
+              setCurrentProvider(repaired.provider)
+              uiProvider = repaired.provider
+            }
+          } catch {
+            // Keep the user's explicit picker state if the options query fails.
+          }
+        }
 
         const created = await requestGateway<SessionCreateResponse>('session.create', {
           cols: 96,
