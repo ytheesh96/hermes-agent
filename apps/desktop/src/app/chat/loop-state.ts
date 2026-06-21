@@ -95,6 +95,7 @@ export interface LoopTaskHandoff {
   handoff_kind?: null | string
   id?: number
   reason?: null | string
+  resolved_at?: null | number
   review_run_id?: null | number
   review_task_id?: null | string
   reviewer_session_id?: null | string

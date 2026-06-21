@@ -6,6 +6,7 @@ import { loopWorkerCounts, normalizeLoopWorkers } from '@/app/chat/loop-state'
 import type { CommandCenterSection } from '@/app/command-center'
 import { $terminalTakeover, setTerminalTakeover } from '@/app/right-sidebar/store'
 import { GatewayMenuPanel } from '@/app/shell/gateway-menu-panel'
+import { GlyphSpinner } from '@/components/ui/glyph-spinner'
 import { getLoopSessionSource } from '@/hermes'
 import { useI18n } from '@/i18n'
 import {
@@ -39,6 +40,7 @@ import {
   setYoloActive
 } from '@/store/session'
 import { $subagentsBySession, activeSubagentCount } from '@/store/subagents'
+import { $gatewayRestarting } from '@/store/system-actions'
 import {
   $backendUpdateApply,
   $backendUpdateStatus,
@@ -94,6 +96,7 @@ export function useStatusbarItems({
   const busy = useStore($busy)
   const currentUsage = useStore($currentUsage)
   const desktopActionTasks = useStore($desktopActionTasks)
+  const gatewayRestarting = useStore($gatewayRestarting)
   const previewServerRestartStatus = useStore($previewServerRestartStatus)
   const sessionStartedAt = useStore($sessionStartedAt)
   const turnStartedAt = useStore($turnStartedAt)
@@ -326,9 +329,15 @@ export function useStatusbarItems({
         variant: 'action'
       },
       {
-        className: gatewayClassName,
-        detail: gatewayDetail,
-        icon: inferenceReady ? <Activity className="size-3" /> : <AlertCircle className="size-3" />,
+        className: gatewayRestarting ? undefined : gatewayClassName,
+        detail: gatewayRestarting ? copy.gatewayRestarting : gatewayDetail,
+        icon: gatewayRestarting ? (
+          <GlyphSpinner ariaLabel={copy.gatewayRestarting} className="size-3" />
+        ) : inferenceReady ? (
+          <Activity className="size-3" />
+        ) : (
+          <AlertCircle className="size-3" />
+        ),
         id: 'gateway-health',
         label: copy.gateway,
         menuClassName: 'w-72',
@@ -375,6 +384,7 @@ export function useStatusbarItems({
       gatewayMenuContent,
       gatewayClassName,
       gatewayDetail,
+      gatewayRestarting,
       inferenceReady,
       inferenceStatus?.reason,
       openAgents,
