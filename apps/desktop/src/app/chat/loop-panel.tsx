@@ -390,11 +390,19 @@ function loopRootOrchestrationState(state: LoopPanelState, root: LoopRow): LoopR
   })
 
   const reviewingRows = rows.filter(row => {
+    const status = normalizedLoopValue(row.status)
     const text = attentionText(row)
+    const hasActiveReviewHandoff = (row.loopHandoffs || []).some(handoff => {
+      const state = normalizedLoopValue(handoff.state)
 
-    return (
-      isOrchestratorReviewRow(row) || normalizedLoopValue(row.status) === 'review' || text.includes('review-required')
-    )
+      return isPendingLoopHandoff(handoff) && (state === 'assigned' || state === 'reviewing')
+    })
+
+    if (isDoneLoopRow(row)) {
+      return hasActiveReviewHandoff
+    }
+
+    return isOrchestratorReviewRow(row) || status === 'review' || hasActiveReviewHandoff || text.includes('review-required')
   })
 
   const waitingRows = rows.filter(

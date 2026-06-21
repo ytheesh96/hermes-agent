@@ -1149,6 +1149,7 @@ describe('LoopPanel', () => {
           id: 't_child',
           title: 'Completed child with approved handoff',
           status: 'done',
+          latest_summary: 'review-required: stale prior blocker already approved',
           tenant: 'tenant-a',
           included_child_ids: [],
           included_parent_ids: ['t_root'],
@@ -1158,7 +1159,8 @@ describe('LoopPanel', () => {
               root_task_id: 't_root',
               task_id: 't_child',
               handoff_kind: 'blocked_waiting',
-              state: 'approved',
+              state: 'closed',
+              resolved_at: 1782002717,
               verification_state: 'approved',
               verification_status: 'approved',
               summary: 'review approved and released'
@@ -1174,6 +1176,7 @@ describe('LoopPanel', () => {
     const counts = within(stateCard).getByTestId('loop-root-state-counts')
 
     expect(within(stateCard).getByText('Loop root is complete')).toBeTruthy()
+    expect(within(counts).queryByText('1 reviewing')).toBeNull()
     expect(within(counts).queryByText('1 handoff')).toBeNull()
     expect(within(counts).queryByText('1 waiting')).toBeNull()
     expect(within(stateCard).queryByText(/Waiting on worker handoff/i)).toBeNull()
