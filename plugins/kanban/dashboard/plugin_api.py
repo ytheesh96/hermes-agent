@@ -558,6 +558,83 @@ def _session_compression_lineage(session_id: Optional[str]) -> list[str]:
             pass
 
 
+_SESSION_SOURCE_LOOP_TOOL_NAMES = {
+    "loop_block",
+    "loop_create",
+    "loop_request_review",
+    "loop_status",
+    "loop_update",
+}
+
+
+def _append_unique_task_id(out: list[str], seen: set[str], value: Any) -> None:
+    task_id = str(value or "").strip()
+    if not task_id or task_id in seen:
+        return
+    seen.add(task_id)
+    out.append(task_id)
+
+
+def _loop_task_ids_from_tool_result(result: Any) -> list[str]:
+    if not isinstance(result, dict):
+        return []
+    out: list[str] = []
+    seen: set[str] = set()
+
+    for key in ("loop_item_id", "task_id"):
+        _append_unique_task_id(out, seen, result.get(key))
+
+    for key in ("item", "task"):
+        nested = result.get(key)
+        if isinstance(nested, dict):
+            _append_unique_task_id(out, seen, nested.get("id"))
+
+    return out
+
+
+def _loop_tool_task_ids_for_sessions(session_ids: list[str]) -> list[str]:
+    if not session_ids:
+        return []
+    try:
+        from hermes_state import DEFAULT_DB_PATH, SessionDB
+    except Exception:
+        return []
+    try:
+        if not DEFAULT_DB_PATH.exists():
+            return []
+        session_db = SessionDB(read_only=True)
+    except Exception:
+        return []
+
+    out: list[str] = []
+    seen: set[str] = set()
+    try:
+        for session_id in session_ids:
+            try:
+                messages = session_db.get_messages(session_id)
+            except Exception:
+                continue
+            for message in messages:
+                tool_name = str(message.get("tool_name") or "").strip()
+                if tool_name not in _SESSION_SOURCE_LOOP_TOOL_NAMES:
+                    continue
+                content = message.get("content")
+                if not isinstance(content, str):
+                    continue
+                try:
+                    result = json.loads(content)
+                except json.JSONDecodeError:
+                    continue
+                for task_id in _loop_task_ids_from_tool_result(result):
+                    _append_unique_task_id(out, seen, task_id)
+    finally:
+        try:
+            session_db.close()
+        except Exception:
+            pass
+    return out
+
+
 def _infer_session_source_tenants(
     conn: sqlite3.Connection,
     lineage_session_ids: list[str],
@@ -622,6 +699,7 @@ def _query_session_source_rows(
     *,
     explicit_tenant: Optional[str],
     include_archived: bool,
+    referenced_task_ids: Optional[list[str]] = None,
 ) -> tuple[list[sqlite3.Row], list[str], list[str]]:
     inferred_tenants: list[str] = []
     tenant_scope_only = False
@@ -631,16 +709,36 @@ def _query_session_source_rows(
         inferred_tenants, tenant_scope_only = _infer_session_source_tenants(conn, lineage_session_ids)
         tenant_filters = inferred_tenants
 
-    params: list[Any] = []
+    referenced_task_ids = [
+        task_id
+        for index, task_id in enumerate(referenced_task_ids or [])
+        if task_id and task_id not in (referenced_task_ids or [])[:index]
+    ]
+
+    primary_where: list[str]
+    primary_params: list[Any] = []
     if tenant_filters and tenant_scope_only:
-        where = [f"tenant IN ({','.join('?' for _ in tenant_filters)})"]
-        params.extend(tenant_filters)
+        primary_where = [f"tenant IN ({','.join('?' for _ in tenant_filters)})"]
+        primary_params.extend(tenant_filters)
     else:
-        where = [f"session_id IN ({','.join('?' for _ in lineage_session_ids)})"]
-        params.extend(lineage_session_ids)
+        primary_where = [f"session_id IN ({','.join('?' for _ in lineage_session_ids)})"]
+        primary_params.extend(lineage_session_ids)
         if tenant_filters:
-            where.append(f"tenant IN ({','.join('?' for _ in tenant_filters)})")
-            params.extend(tenant_filters)
+            primary_where.append(f"tenant IN ({','.join('?' for _ in tenant_filters)})")
+            primary_params.extend(tenant_filters)
+
+    disjuncts = [f"({' AND '.join(primary_where)})"]
+    params: list[Any] = list(primary_params)
+
+    if lineage_session_ids:
+        disjuncts.append(f"foreground_parent_session_id IN ({','.join('?' for _ in lineage_session_ids)})")
+        params.extend(lineage_session_ids)
+
+    if referenced_task_ids:
+        disjuncts.append(f"id IN ({','.join('?' for _ in referenced_task_ids)})")
+        params.extend(referenced_task_ids)
+
+    where = [f"({' OR '.join(disjuncts)})"]
     if not include_archived:
         where.append("status != 'archived'")
 
@@ -990,6 +1088,7 @@ def get_session_source(
     tenant_filters: list[str] = []
 
     candidate_boards = _session_source_board_candidates(board)
+    referenced_task_ids = _loop_tool_task_ids_for_sessions(lineage_session_ids)
     for candidate_board in candidate_boards:
         candidate_conn = _conn(board=candidate_board)
         try:
@@ -998,6 +1097,7 @@ def get_session_source(
                 lineage_session_ids,
                 explicit_tenant=explicit_tenant,
                 include_archived=include_archived,
+                referenced_task_ids=referenced_task_ids,
             )
         except Exception:
             candidate_conn.close()
@@ -1021,6 +1121,7 @@ def get_session_source(
             lineage_session_ids,
             explicit_tenant=explicit_tenant,
             include_archived=include_archived,
+            referenced_task_ids=referenced_task_ids,
         )
 
     try:

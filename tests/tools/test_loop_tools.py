@@ -31,6 +31,20 @@ def _call(args):
     return json.loads(wt._handle_loop_graph(args))
 
 
+def _call_loop(tool_name: str, args: dict):
+    from tools import loop_tools as wt
+
+    handlers = {
+        "loop_create": wt._handle_loop_create,
+        "loop_status": wt._handle_loop_status,
+        "loop_list_queue": wt._handle_loop_list_queue,
+        "loop_update": wt._handle_loop_update,
+        "loop_block": wt._handle_loop_block,
+        "loop_request_review": wt._handle_loop_request_review,
+    }
+    return json.loads(handlers[tool_name](args))
+
+
 def test_loop_graph_tool_is_in_core_but_minimal_and_gated(monkeypatch, tmp_path):
     monkeypatch.delenv("HERMES_KANBAN_TASK", raising=False)
     home = tmp_path / ".hermes"
@@ -52,6 +66,223 @@ def test_loop_graph_tool_is_in_core_but_minimal_and_gated(monkeypatch, tmp_path)
     schema = registry.get_definitions(set(resolve_toolset("hermes-cli")), quiet=True)
     names = {s["function"].get("name") for s in schema if "function" in s}
     assert "loop_graph" not in names
+
+
+def test_loop_delegation_toolset_is_explicit_and_gated(monkeypatch, tmp_path):
+    monkeypatch.delenv("HERMES_KANBAN_TASK", raising=False)
+    home = tmp_path / ".hermes"
+    home.mkdir()
+    monkeypatch.setenv("HERMES_HOME", str(home))
+
+    import tools.loop_tools  # ensure registered
+    from tools.registry import invalidate_check_fn_cache, registry
+    from toolsets import resolve_toolset
+
+    expected = {
+        "loop_create",
+        "loop_status",
+        "loop_update",
+        "loop_block",
+        "loop_request_review",
+        "loop_list_queue",
+    }
+    assert set(resolve_toolset("loop_delegation")) == expected
+
+    invalidate_check_fn_cache()
+    schema = registry.get_definitions(set(resolve_toolset("loop_delegation")), quiet=True)
+    names = {s["function"].get("name") for s in schema if "function" in s}
+    assert names == expected
+
+    (home / "config.yaml").write_text("loop:\n  enabled: false\n")
+    invalidate_check_fn_cache()
+    schema = registry.get_definitions(set(resolve_toolset("loop_delegation")), quiet=True)
+    assert schema == []
+
+
+def test_loop_create_async_requires_activation_and_proof_packet(loop_env, monkeypatch):
+    monkeypatch.setenv("HERMES_SESSION_ID", "session-123")
+    denied = _call_loop(
+        "loop_create",
+        {
+            "objective": "Implement durable delegation",
+            "assignee": "worker-a",
+            "tenant": loop_env,
+            "proof_packet": {"summary": "user requested implementation"},
+        },
+    )
+    assert denied["ok"] is False
+    assert denied["error"] == "activation_required"
+
+    missing_proof = _call_loop(
+        "loop_create",
+        {
+            "objective": "Implement durable delegation",
+            "assignee": "worker-a",
+            "tenant": loop_env,
+            "activation": "explicit_user_request",
+        },
+    )
+    assert missing_proof["ok"] is False
+    assert missing_proof["error"] == "proof_packet_required"
+
+    created = _call_loop(
+        "loop_create",
+        {
+            "objective": "Implement durable delegation",
+            "acceptance_criteria": ["returns a stable Loop handle"],
+            "assignee": "worker-a",
+            "tenant": loop_env,
+            "activation": "explicit_user_request",
+            "proof_packet": {"summary": "user requested implementation"},
+            "idempotency_key": "loop-create-async",
+            "execution": {"mode": "async"},
+        },
+    )
+
+    assert created["ok"] is True
+    assert created["status"] == "ready"
+    assert created["execution"]["mode"] == "async"
+    assert created["foreground_reentry"] == "on_final_or_blocker"
+    assert created["approval_required"] is False
+    assert created["proof_packet"] == {"summary": "user requested implementation"}
+
+    from hermes_cli import kanban_db as kb
+
+    conn = kb.connect()
+    try:
+        task = kb.get_task(conn, created["loop_item_id"])
+        assert task is not None
+        assert task.title == "Implement durable delegation"
+        assert task.assignee == "worker-a"
+        assert task.tenant == loop_env
+        assert task.session_id == "session-123"
+        assert task.created_by == "loop_delegation:planner"
+        assert "returns a stable Loop handle" in (task.body or "")
+    finally:
+        conn.close()
+
+
+def test_loop_status_list_update_block_and_request_review(loop_env):
+    created = _call_loop(
+        "loop_create",
+        {
+            "objective": "Verify a durable workflow",
+            "assignee": "worker-a",
+            "tenant": loop_env,
+            "activation": "explicit_user_request",
+            "proof_packet": {"summary": "start workflow"},
+            "idempotency_key": "loop-status-flow",
+        },
+    )
+    task_id = created["loop_item_id"]
+
+    status = _call_loop("loop_status", {"loop_item_id": task_id})
+    assert status["ok"] is True
+    assert status["item"]["id"] == task_id
+    assert status["item"]["status"] == "ready"
+
+    listed = _call_loop("loop_list_queue", {"tenant": loop_env})
+    assert listed["ok"] is True
+    assert [item["id"] for item in listed["items"]] == [task_id]
+
+    updated = _call_loop(
+        "loop_update",
+        {
+            "loop_item_id": task_id,
+            "note": "bounded implementation note",
+            "activation": "explicit_user_request",
+            "proof_packet": {"summary": "recording status"},
+        },
+    )
+    assert updated["ok"] is True
+    assert updated["status"] == "ready"
+    assert updated["comment_id"] is not None
+
+    blocked = _call_loop(
+        "loop_block",
+        {
+            "loop_item_id": task_id,
+            "reason": "Waiting for proof packet review",
+            "activation": "explicit_user_request",
+            "proof_packet": {"summary": "block with evidence"},
+        },
+    )
+    assert blocked["ok"] is True
+    assert blocked["status"] == "blocked"
+
+    review = _call_loop(
+        "loop_request_review",
+        {
+            "loop_item_id": task_id,
+            "reviewer": "reviewer-qa",
+            "summary": "Ready for review",
+            "activation": "explicit_user_request",
+            "proof_packet": {"summary": "review with evidence"},
+        },
+    )
+    assert review["ok"] is True
+    assert review["status"] == "review"
+    assert review["reviewer"] == "reviewer-qa"
+
+
+def test_loop_create_sync_timeout_and_completion_wait(loop_env):
+    timed_out = _call_loop(
+        "loop_create",
+        {
+            "objective": "Long durable workflow",
+            "assignee": "worker-a",
+            "tenant": loop_env,
+            "activation": "explicit_user_request",
+            "proof_packet": {"summary": "bounded wait"},
+            "idempotency_key": "loop-sync-timeout",
+            "execution": {"mode": "sync", "wait_until": "done", "timeout_seconds": 0.01},
+        },
+    )
+    assert timed_out["ok"] is True
+    assert timed_out["status"] == "ready"
+    assert timed_out["foreground_reentry"] == "will_continue_async"
+    assert timed_out["warnings"] == ["sync wait timed out; durable Loop work continues asynchronously"]
+
+    from hermes_cli import kanban_db as kb
+
+    completed_title = "Completes while sync create waits"
+    done = threading.Event()
+
+    def complete_when_created():
+        deadline = time.time() + 3
+        while time.time() < deadline:
+            conn = kb.connect()
+            try:
+                matches = [t for t in kb.list_tasks(conn, tenant=loop_env) if t.title == completed_title]
+                if matches:
+                    kb.complete_task(conn, matches[0].id, summary="completed during sync wait")
+                    done.set()
+                    return
+            finally:
+                conn.close()
+            time.sleep(0.05)
+
+    thread = threading.Thread(target=complete_when_created)
+    thread.start()
+    completed = _call_loop(
+        "loop_create",
+        {
+            "objective": completed_title,
+            "assignee": "worker-a",
+            "tenant": loop_env,
+            "activation": "explicit_user_request",
+            "proof_packet": {"summary": "bounded wait completion"},
+            "idempotency_key": "loop-sync-completion",
+            "execution": {"mode": "sync", "wait_until": "done", "timeout_seconds": 3},
+        },
+    )
+    thread.join(timeout=3)
+
+    assert done.is_set()
+    assert completed["ok"] is True
+    assert completed["status"] == "done"
+    assert completed["foreground_reentry"] == "completed_in_tool_result"
+    assert completed["summary"] == "completed during sync wait"
 
 
 def test_patch_creates_real_triage_tasks_with_dependencies_and_compact_response(loop_env):

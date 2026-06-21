@@ -2,7 +2,7 @@ import { describe, expect, it } from 'vitest'
 
 import type { ComposerAttachment } from '@/store/composer'
 
-import { coerceThinkingText, optimisticAttachmentRef, parseCommandDispatch } from './chat-runtime'
+import { coerceThinkingText, optimisticAttachmentRef, parseCommandDispatch, parseSlashCommand } from './chat-runtime'
 
 const DATA_URL = 'data:image/png;base64,iVBORw0KGgoAAAANS'
 
@@ -50,6 +50,19 @@ describe('coerceThinkingText', () => {
         "◉_◉ processing... I don't see any current rewritten thinking or next thinking to process. Could you provide the thinking content you'd like me to rewrite?"
       )
     ).toBe('')
+  })
+})
+
+describe('parseSlashCommand', () => {
+  it('preserves multiline command arguments', () => {
+    const parsed = parseSlashCommand('/goal\n implement provenance graph\n\n- Solid arrows\n- Dashed arrows')
+
+    expect(parsed.name).toBe('goal')
+    expect(parsed.arg).toBe('implement provenance graph\n\n- Solid arrows\n- Dashed arrows')
+  })
+
+  it('keeps bare commands argument-less', () => {
+    expect(parseSlashCommand('/goal')).toEqual({ name: 'goal', arg: '' })
   })
 })
 

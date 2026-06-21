@@ -545,6 +545,107 @@ def test_structured_loop_child_block_metadata_emits_and_persists_handoff(kanban_
     assert runs[-1].metadata["handoff_kind"] == "blocked_waiting"
 
 
+def test_loop_child_decision_request_emits_handoff_without_blocking_worker(kanban_home):
+    with kb.connect() as conn:
+        root_id = _loop_root_node(conn, title="loop root")
+        child_id = _loop_node(conn, root_task_id=root_id, title="decision worker")
+        assert kb.claim_task(conn, child_id, claimer="worker-host:decision") is not None
+        run_id = kb.get_task(conn, child_id).current_run_id
+
+        result = kb.request_loop_foreground_decision(
+            conn,
+            child_id,
+            question="Which parser strategy should the worker implement?",
+            options=[
+                {"label": "Strict parser", "tradeoff": "More validation"},
+                {"label": "Lenient parser", "tradeoff": "Faster migration"},
+            ],
+            recommendation="Strict parser",
+            summary="Foreground must choose parser strategy.",
+            reason="The choice affects acceptance criteria.",
+            metadata={"changed_files": ["parser.py"], "worker_session_id": "worker-session-77"},
+            expected_run_id=run_id,
+        )
+
+        task = kb.get_task(conn, child_id)
+        handoffs = _handoff_events(conn, child_id)
+        durable_handoffs = kb.list_loop_handoffs(conn, task_id=child_id)
+        decision_events = [
+            event for event in kb.list_events(conn, child_id)
+            if event.kind == "loop_decision_requested"
+        ]
+
+    assert result["ok"] is True
+    assert task.status == "running"
+    assert task.current_run_id == run_id
+    assert len(decision_events) == 1
+    assert decision_events[0].payload["handoff_kind"] == "worker_decision_requested"
+    assert decision_events[0].payload["question"] == "Which parser strategy should the worker implement?"
+    assert len(handoffs) == 1
+    assert handoffs[0].payload["root_task_id"] == root_id
+    assert handoffs[0].payload["handoff_kind"] == "worker_decision_requested"
+    assert handoffs[0].payload["summary"] == "Foreground must choose parser strategy."
+    assert len(durable_handoffs) == 1
+    handoff = durable_handoffs[0]
+    assert handoff["id"] == result["handoff"]["id"]
+    assert handoff["state"] == "queued"
+    assert handoff["worker_metadata"]["decision_request"] is True
+    assert handoff["worker_metadata"]["question"] == "Which parser strategy should the worker implement?"
+    assert handoff["worker_metadata"]["options"][0]["label"] == "Strict parser"
+    assert handoff["worker_metadata"]["recommendation"] == "Strict parser"
+    assert handoff["changed_files"] == ["parser.py"]
+    assert handoff["worker_session_id"] == "worker-session-77"
+
+
+def test_record_decision_closes_decision_handoff_without_releasing_loop_root(kanban_home):
+    with kb.connect() as conn:
+        root_id = _loop_root_node(conn, title="loop root")
+        child_id = _loop_node(conn, root_task_id=root_id, title="decision worker")
+        assert kb.claim_task(conn, child_id, claimer="worker-host:decision") is not None
+        run_id = kb.get_task(conn, child_id).current_run_id
+        result = kb.request_loop_foreground_decision(
+            conn,
+            child_id,
+            question="Pick the implementation path.",
+            options=["Path A", "Path B"],
+            recommendation="Path B",
+            summary="Foreground decision needed.",
+            expected_run_id=run_id,
+        )
+        handoff_id = result["handoff"]["id"]
+
+        action = kb.review_loop_handoff_autonomous_action(
+            conn,
+            handoff_id,
+            action="record_decision",
+            actor="foreground-orchestrator",
+            reason="Choose Path B; it preserves the existing API contract.",
+        )
+        handoff = kb.list_loop_handoffs(conn, task_id=child_id)[0]
+        status = kb.loop_handoff_status(
+            conn,
+            tenant=handoff["tenant"],
+            root_task_id=root_id,
+        )
+        root = kb.get_task(conn, root_id)
+        child = kb.get_task(conn, child_id)
+
+    assert action["ok"] is True
+    assert action["outcome"] == "decision_recorded"
+    assert handoff["state"] == "closed"
+    assert handoff["verification_state"] == "decision-recorded"
+    assert handoff["verification_status"] == "passed"
+    assert handoff["decision_actor"] == "foreground-orchestrator"
+    assert handoff["decision_reason"] == "Choose Path B; it preserves the existing API contract."
+    assert status["approved_count"] == 0
+    assert status["decision_recorded_count"] == 1
+    assert status["resolved_count"] == 1
+    assert status["quiet_green"] is True
+    assert root.status == "ready"
+    assert child.status == "running"
+    assert child.current_run_id == run_id
+
+
 def test_blocked_waiting_prefix_loop_child_block_emits_foreground_handoff(kanban_home):
     with kb.connect() as conn:
         root_id = _loop_root_node(conn, title="loop root")
@@ -803,6 +904,73 @@ def test_claim_loop_handoff_batch_serializes_per_tenant_root_and_orders_dependen
     assert {handoff["reviewer_session_id"] for handoff in batch} == {"review-session-1"}
     assert blocked_by_active == []
     assert [handoff["task_id"] for handoff in other_batch] == [other_id]
+
+
+def test_root_completion_review_card_omits_duplicate_visible_summary(kanban_home):
+    with kb.connect() as conn:
+        root_id = _loop_root_node(conn, title="epistemic decision root", tenant="tenant-a")
+        assert kb.claim_task(conn, root_id, claimer="worker:root") is not None
+        assert kb.complete_task(
+            conn,
+            root_id,
+            summary="Root adjudication complete: choose C with tests passing",
+        )
+
+        batch = kb.claim_loop_handoff_batch(
+            conn,
+            tenant="tenant-a",
+            root_task_id=root_id,
+            reviewer_session_id="origin-session",
+            limit=10,
+        )
+
+    message = kb._render_loop_handoff_review_message(
+        tenant="tenant-a",
+        root_task_id=root_id,
+        batch_id="loop-review:tenant-a:root:1",
+        handoffs=batch,
+    )
+    payload = json.loads(message)
+
+    assert payload["visible_cards"] == [
+        {
+            "task_title": "epistemic decision root",
+            "summary": None,
+            "action": "Open drawer",
+            "payload_ref": f"loop_handoff:{batch[0]['id']}",
+        }
+    ]
+    assert batch[0]["summary"] == "Root adjudication complete: choose C with tests passing"
+    assert batch[0]["proof_packet"]["worker"]["summary"] == (
+        "Root adjudication complete: choose C with tests passing"
+    )
+
+
+def test_attention_review_card_keeps_visible_summary(kanban_home):
+    with kb.connect() as conn:
+        root_id = _loop_root_node(conn, title="loop root", tenant="tenant-a")
+        child_id = _loop_node(conn, root_task_id=root_id, title="needs attention", tenant="tenant-a")
+        assert kb.claim_task(conn, child_id, claimer="worker:child") is not None
+        assert kb.block_task(conn, child_id, reason="review-required: proof gap needs foreground")
+
+        batch = kb.claim_loop_handoff_batch(
+            conn,
+            tenant="tenant-a",
+            root_task_id=root_id,
+            reviewer_session_id="origin-session",
+            limit=10,
+        )
+
+    message = kb._render_loop_handoff_review_message(
+        tenant="tenant-a",
+        root_task_id=root_id,
+        batch_id="loop-review:tenant-a:root:1",
+        handoffs=batch,
+    )
+    payload = json.loads(message)
+
+    assert payload["visible_cards"][0]["task_title"] == "needs attention"
+    assert payload["visible_cards"][0]["summary"] == "review-required: proof gap needs foreground"
 
 
 def test_followup_created_child_handoff_does_not_block_later_foreground_handoff(kanban_home):

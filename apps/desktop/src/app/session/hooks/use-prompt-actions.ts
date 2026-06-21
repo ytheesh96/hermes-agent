@@ -734,16 +734,20 @@ export function usePromptActions({
       }
 
       try {
-        const syncedAttachments = await syncAttachmentsForSubmit(sessionId, attachments, {
-          updateComposerAttachments: usingComposerAttachments
-        })
+        const submitToSession = async (targetSessionId: string) => {
+          const syncedAttachments = await syncAttachmentsForSubmit(targetSessionId, attachments, {
+            updateComposerAttachments: usingComposerAttachments
+          })
 
-        // Rewrite the optimistic message + prompt text with the synced refs so
-        // the gateway receives @file: paths that resolve in its workspace.
-        // (Images keep their inline base64 preview — see optimisticAttachmentRef.)
-        attachmentRefs = syncedAttachments.map(optimisticAttachmentRef).filter((r): r is string => Boolean(r))
-        rewriteOptimistic(sessionId)
-        const text = buildContextText(syncedAttachments)
+          // Rewrite the optimistic message + prompt text with the synced refs so
+          // the gateway receives @file: paths that resolve in its workspace.
+          // (Images keep their inline base64 preview — see optimisticAttachmentRef.)
+          attachmentRefs = syncedAttachments.map(optimisticAttachmentRef).filter((r): r is string => Boolean(r))
+          rewriteOptimistic(targetSessionId)
+          const text = buildContextText(syncedAttachments)
+
+          await withSessionBusyRetry(() => requestGateway('prompt.submit', { session_id: targetSessionId, text }))
+        }
 
         // On sleep/wake the gateway's in-memory session may have been cleared
         // while the desktop app still holds the old session ID. Detect this,
@@ -751,21 +755,42 @@ export function usePromptActions({
         let submitErr: unknown = null
 
         try {
-          await withSessionBusyRetry(() => requestGateway('prompt.submit', { session_id: sessionId, text }))
+          await submitToSession(sessionId)
         } catch (firstErr) {
           if (isSessionNotFoundError(firstErr) && selectedStoredSessionIdRef.current) {
-            // Re-register the session in the gateway and get a fresh live ID.
-            const resumed = await requestGateway<{ session_id: string }>('session.resume', {
-              session_id: selectedStoredSessionIdRef.current
-            })
+            try {
+              // Re-register the session in the gateway and get a fresh live ID.
+              const resumed = await requestGateway<{ session_id: string }>('session.resume', {
+                session_id: selectedStoredSessionIdRef.current
+              })
 
-            const recoveredId = resumed?.session_id
+              const recoveredId = resumed?.session_id
 
-            if (recoveredId) {
-              activeSessionIdRef.current = recoveredId
-              await withSessionBusyRetry(() => requestGateway('prompt.submit', { session_id: recoveredId, text }))
-            } else {
-              submitErr = firstErr
+              if (recoveredId) {
+                activeSessionIdRef.current = recoveredId
+                sessionId = recoveredId
+                await submitToSession(recoveredId)
+              } else {
+                submitErr = firstErr
+              }
+            } catch (resumeErr) {
+              if (isSessionNotFoundError(resumeErr)) {
+                // The route points at a durable session that no longer exists
+                // (for example after deleting it in another window). Do not
+                // strand the composer on the dead id; send the user's draft as
+                // the first turn of a fresh chat.
+                const freshSessionId = await createBackendSessionForSend(visibleText)
+
+                if (freshSessionId) {
+                  sessionId = freshSessionId
+                  seedOptimistic(freshSessionId)
+                  await submitToSession(freshSessionId)
+                } else {
+                  submitErr = resumeErr
+                }
+              } else {
+                submitErr = resumeErr
+              }
             }
           } else {
             submitErr = firstErr
@@ -1006,9 +1031,30 @@ export function usePromptActions({
           }
 
           if (busyRef.current) {
+            if (dispatch.type === 'send') {
+              const notice = dispatch.notice?.trim()
+              const queued = enqueueQueuedPrompt(sessionId, { attachments: [], text: message })
+              renderSlashOutput(
+                [
+                  notice,
+                  queued
+                    ? 'Queued command prompt for when the current turn finishes.'
+                    : 'session busy — /interrupt the current turn before sending this command'
+                ]
+                  .filter(Boolean)
+                  .join('\n')
+              )
+
+              return
+            }
+
             renderSlashOutput('session busy — /interrupt the current turn before sending this command')
 
             return
+          }
+
+          if (dispatch.type === 'send' && dispatch.notice?.trim()) {
+            renderSlashOutput(dispatch.notice.trim())
           }
 
           await submitPromptText(message)
@@ -1417,12 +1463,6 @@ export function usePromptActions({
         const { name, arg } = parseSlashCommand(command)
 
         if (!name) {
-          const sessionId = await ensureSessionId(sessionHint)
-
-          if (sessionId) {
-            appendSessionTextMessage(sessionId, 'system', copy.emptySlashCommand)
-          }
-
           return
         }
 
@@ -1473,6 +1513,10 @@ export function usePromptActions({
     async (rawText: string, options?: SubmitTextOptions) => {
       const visibleText = rawText.trim()
       const attachments = options?.attachments ?? $composerAttachments.get()
+
+      if (!attachments.length && visibleText === '/') {
+        return false
+      }
 
       if (!attachments.length && SLASH_COMMAND_RE.test(visibleText)) {
         triggerHaptic('selection')

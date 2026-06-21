@@ -67,8 +67,10 @@ _HERMES_CORE_TOOLS = [
     # tools/kanban_tools.py.
     "kanban_show", "kanban_list",
     "kanban_complete", "kanban_block", "kanban_heartbeat",
-    "kanban_request_review", "kanban_resolve_blocker", "kanban_comment",
+    "kanban_request_decision", "kanban_request_review", "kanban_resolve_blocker", "kanban_comment",
+    "kanban_request_epistemic_workflow", "kanban_request_orchestrator_handoff",
     "kanban_create", "kanban_link", "kanban_unblock",
+    "kanban_decompose", "kanban_epistemic_decompose",
     # Loop graph editing — one compact tool, default-enabled but gated by
     # loop.enabled so users can remove the schema surface if needed.
     "loop_graph",
@@ -265,9 +267,24 @@ TOOLSETS = {
         ),
         "tools": [
             "kanban_show", "kanban_list", "kanban_complete", "kanban_block",
-            "kanban_request_review", "kanban_heartbeat", "kanban_comment",
-            "kanban_create", "kanban_link",
-            "kanban_unblock",
+            "kanban_request_decision", "kanban_request_review", "kanban_resolve_blocker",
+            "kanban_heartbeat", "kanban_comment",
+            "kanban_request_epistemic_workflow", "kanban_request_orchestrator_handoff",
+            "kanban_create", "kanban_link", "kanban_unblock",
+            "kanban_decompose", "kanban_epistemic_decompose",
+        ],
+        "includes": [],
+    },
+
+    "loop_delegation": {
+        "description": (
+            "Durable Loopagent delegation tools. Unlike delegate_task, these "
+            "create/read/update durable Loop/Kanban work and return stable "
+            "handles; sync mode is a bounded wait over the same durable row."
+        ),
+        "tools": [
+            "loop_create", "loop_status", "loop_update", "loop_block",
+            "loop_request_review", "loop_list_queue",
         ],
         "includes": [],
     },

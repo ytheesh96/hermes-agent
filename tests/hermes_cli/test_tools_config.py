@@ -91,6 +91,11 @@ def test_configurable_toolsets_include_context_engine():
     assert any(ts_key == "context_engine" for ts_key, _, _ in CONFIGURABLE_TOOLSETS)
 
 
+def test_configurable_toolsets_include_loop_delegation_default_off():
+    assert any(ts_key == "loop_delegation" for ts_key, _, _ in CONFIGURABLE_TOOLSETS)
+    assert "loop_delegation" in _DEFAULT_OFF_TOOLSETS
+
+
 def test_get_platform_tools_active_context_engine_is_enabled_for_explicit_config():
     config = {
         "context": {"engine": "lcm"},
@@ -1540,5 +1545,4 @@ def test_real_configurable_changes_still_reported_in_diff():
     # User adds 'vision' (configurable) — must still report as added.
     new_enabled2 = (current - {"kanban"}) | {"vision"}
     assert ((new_enabled2 - current) & universe) == {"vision"}
-
 

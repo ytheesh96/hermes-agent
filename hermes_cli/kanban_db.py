@@ -3095,6 +3095,7 @@ def _is_explicit_loop_foreground_boundary_reason(reason: Optional[str]) -> bool:
 
 _LOOP_FOREGROUND_HANDOFF_METADATA_KINDS = {
     "blocked_waiting",
+    "decision_request",
     "needs_user",
     "review_required",
     "safety_boundary",
@@ -3389,6 +3390,130 @@ def list_loop_handoffs(
     return [_loop_handoff_row_to_dict(row) for row in rows]
 
 
+def request_loop_foreground_decision(
+    conn: sqlite3.Connection,
+    task_id: str,
+    *,
+    question: str,
+    options: Optional[Iterable[Any]] = None,
+    recommendation: Optional[str] = None,
+    summary: Optional[str] = None,
+    reason: Optional[str] = None,
+    metadata: Optional[dict[str, Any]] = None,
+    expected_run_id: Optional[int] = None,
+) -> dict[str, Any]:
+    """Ask the Loop foreground/orchestrator for a mid-run decision.
+
+    Unlike ``block_task`` this keeps the worker row running. The worker can do
+    reversible prep while foreground review records a durable decision, then
+    re-read ``kanban_show``/handoff details before committing to the path.
+    """
+    question_text = str(question or "").strip()
+    if not question_text:
+        raise ValueError("question is required")
+
+    clean_options: list[Any] = []
+    for option in options or []:
+        if isinstance(option, str):
+            text = option.strip()
+            if text:
+                clean_options.append(text)
+        elif isinstance(option, dict):
+            clean_options.append(option)
+        elif option is not None:
+            clean_options.append(str(option))
+    if len(clean_options) < 2:
+        raise ValueError("at least two decision options are required")
+
+    now = int(time.time())
+    with write_txn(conn):
+        if expected_run_id is None:
+            task_row = conn.execute(
+                "SELECT * FROM tasks WHERE id = ? AND status = 'running'",
+                (task_id,),
+            ).fetchone()
+        else:
+            task_row = conn.execute(
+                "SELECT * FROM tasks WHERE id = ? AND status = 'running' AND current_run_id = ?",
+                (task_id, int(expected_run_id)),
+            ).fetchone()
+        if task_row is None:
+            raise ValueError(f"task {task_id} is not running or run id is stale")
+
+        root_task_id = _loop_root_for_task(conn, task_id)
+        if not root_task_id:
+            raise ValueError(f"task {task_id} is not part of a Loop")
+
+        run_id = (
+            int(expected_run_id)
+            if expected_run_id is not None
+            else task_row["current_run_id"]
+        )
+        md = dict(metadata or {})
+        md.update(
+            {
+                "foreground_handoff": True,
+                "handoff_kind": "decision_request",
+                "decision_request": True,
+                "question": question_text,
+                "options": clean_options,
+            }
+        )
+        if recommendation:
+            md["recommendation"] = str(recommendation).strip()
+
+        conn.execute(
+            "UPDATE tasks SET last_heartbeat_at = ? WHERE id = ?",
+            (now, task_id),
+        )
+        if run_id is not None:
+            conn.execute(
+                "UPDATE task_runs SET last_heartbeat_at = ? WHERE id = ?",
+                (now, run_id),
+            )
+
+        decision_payload: dict[str, Any] = {
+            "root_task_id": root_task_id,
+            "handoff_kind": "worker_decision_requested",
+            "question": question_text,
+            "options": clean_options,
+        }
+        if summary is not None:
+            decision_payload["summary"] = summary
+        if reason is not None:
+            decision_payload["reason"] = reason
+        if recommendation:
+            decision_payload["recommendation"] = str(recommendation).strip()
+        if run_id is not None:
+            decision_payload["run_id"] = run_id
+        source_event_id = _append_event(
+            conn,
+            task_id,
+            "loop_decision_requested",
+            decision_payload,
+            run_id=run_id,
+        )
+        handoff = _append_loop_foreground_handoff_event(
+            conn,
+            task_id,
+            root_task_id=root_task_id,
+            handoff_kind="worker_decision_requested",
+            run_id=run_id,
+            source_event_id=source_event_id,
+            summary=summary or question_text,
+            reason=reason,
+            metadata=md,
+        )
+        return {
+            "ok": True,
+            "task_id": task_id,
+            "root_task_id": root_task_id,
+            "run_id": run_id,
+            "source_event_id": source_event_id,
+            "handoff": handoff,
+        }
+
+
 def loop_handoff_status(
     conn: sqlite3.Connection,
     *,
@@ -3406,6 +3531,14 @@ def loop_handoff_status(
         if row["state"] in {"closed", "approved", "released"}
         and row.get("verification_state") == "approved"
     )
+    decision_recorded = sum(
+        1
+        for row in rows
+        if row["state"] == "closed"
+        and row.get("verification_state") == "decision-recorded"
+        and row.get("verification_status") == "passed"
+    )
+    resolved = approved + decision_recorded
     needs_attention = pending + active + escalated
     return {
         "tenant": tenant,
@@ -3415,9 +3548,11 @@ def loop_handoff_status(
         "terminal_count": terminal,
         "total_count": len(rows),
         "approved_count": approved,
+        "decision_recorded_count": decision_recorded,
+        "resolved_count": resolved,
         "escalated_count": escalated,
         "needs_attention_count": needs_attention,
-        "quiet_green": bool(rows) and needs_attention == 0 and approved == len(rows),
+        "quiet_green": bool(rows) and needs_attention == 0 and resolved == len(rows),
     }
 
 
@@ -3669,6 +3804,12 @@ def _ensure_loop_handoff_review_session(session_db: Any, *, tenant: Optional[str
 
 
 def _handoff_visible_summary(handoff: dict[str, Any]) -> Optional[str]:
+    if (
+        str(handoff.get("handoff_kind") or "").strip() == "worker_completed"
+        and str(handoff.get("task_id") or "").strip()
+        and str(handoff.get("task_id") or "").strip() == str(handoff.get("root_task_id") or "").strip()
+    ):
+        return None
     summary = str(handoff.get("summary") or handoff.get("reason") or "").strip()
     if not summary:
         return None
@@ -4881,7 +5022,7 @@ def review_loop_handoff_autonomous_action(
         escalation_reason = "repeated_failed_auto_repair"
     elif action == "approve_release" and not evidence_passed:
         escalation_reason = "evidence did not pass"
-    elif action not in {"approve_release", "create_followups"}:
+    elif action not in {"approve_release", "create_followups", "record_decision"}:
         escalation_reason = f"unsupported autonomous action: {action}"
     if escalation_reason:
         return _escalate_loop_handoff(conn, handoff, actor=actor, action=action, reason=reason, flags=flags, escalation_reason=escalation_reason)
@@ -4927,8 +5068,12 @@ def review_loop_handoff_autonomous_action(
          WHERE id = ? AND state IN ({placeholders})
         """,
         (
-            "followups-created" if action == "create_followups" and not evidence_passed else "approved",
-            "failed" if action == "create_followups" and not evidence_passed else "passed",
+            "decision-recorded"
+            if action == "record_decision"
+            else "followups-created" if action == "create_followups" and not evidence_passed else "approved",
+            "passed"
+            if action == "record_decision"
+            else "failed" if action == "create_followups" and not evidence_passed else "passed",
             actor,
             reason,
             reason,
@@ -4971,7 +5116,11 @@ def review_loop_handoff_autonomous_action(
         )
         created_cards.append(card_id)
 
-    outcome = "followups_created" if action == "create_followups" and not evidence_passed else "approved"
+    outcome = (
+        "decision_recorded"
+        if action == "record_decision"
+        else "followups_created" if action == "create_followups" and not evidence_passed else "approved"
+    )
     if outcome == "followups_created":
         root_repair_run_id = _keep_loop_root_running_for_followups(
             conn,
@@ -5017,7 +5166,7 @@ def _append_loop_foreground_handoff_event(
     reason: Optional[str] = None,
     metadata: Optional[dict] = None,
     created_cards: Optional[Iterable[str]] = None,
-) -> None:
+) -> dict[str, Any]:
     """Write compact foreground handoff state for Loop-backed worker rows.
 
     V1 stores this Loop-specific attention state in the existing task event log;
@@ -5050,7 +5199,7 @@ def _append_loop_foreground_handoff_event(
         cards = [str(card).strip() for card in created_cards if str(card).strip()]
         if cards:
             payload["created_cards"] = cards
-    _record_loop_handoff(
+    handoff = _record_loop_handoff(
         conn,
         task_id,
         root_task_id=root_task_id,
@@ -5063,6 +5212,7 @@ def _append_loop_foreground_handoff_event(
         created_cards=created_cards,
     )
     _append_event(conn, task_id, "loop_foreground_handoff", payload, run_id=run_id)
+    return handoff
 
 
 def _end_run(

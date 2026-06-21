@@ -7762,6 +7762,20 @@ def _loop_tasks_for_session_tenants(tenant_ids: List[str], board: Optional[str] 
                 for parent_id in parent_ids:
                     if parent_id in child_map:
                         child_map[parent_id].append(child_id)
+            root_by_task_id: Dict[str, str] = {}
+            for task in visible_tasks:
+                if task.created_by and str(task.created_by).startswith("loop:"):
+                    root_by_task_id[task.id] = str(task.created_by).split(":", 1)[1]
+            handoffs_by_task_id: Dict[str, List[Dict[str, Any]]] = {task.id: [] for task in visible_tasks}
+            root_ids = sorted({root_id for root_id in root_by_task_id.values() if root_id})
+            for root_task_id in root_ids:
+                try:
+                    for handoff in kb.list_loop_handoffs(conn, root_task_id=root_task_id):
+                        task_id = str(handoff.get("task_id") or "")
+                        if task_id in handoffs_by_task_id:
+                            handoffs_by_task_id[task_id].append(handoff)
+                except Exception:
+                    pass
             depth_cache: Dict[str, int] = {}
 
             def depth(task_id: str, visiting: Optional[set[str]] = None) -> int:
@@ -7777,9 +7791,7 @@ def _loop_tasks_for_session_tenants(tenant_ids: List[str], board: Optional[str] 
                 return value
 
             for task in visible_tasks:
-                root_task_id = None
-                if task.created_by and str(task.created_by).startswith("loop:"):
-                    root_task_id = str(task.created_by).split(":", 1)[1]
+                root_task_id = root_by_task_id.get(task.id)
                 handoff = graph.latest_handoff_for_task(conn, task.id, root_task_id) if root_task_id else None
                 node: Dict[str, Any] = {
                     "task_id": task.id,
@@ -7796,6 +7808,9 @@ def _loop_tasks_for_session_tenants(tenant_ids: List[str], board: Optional[str] 
                 }
                 if root_task_id:
                     node["root_task_id"] = root_task_id
+                task_handoffs = handoffs_by_task_id.get(task.id) or []
+                if task_handoffs:
+                    node["loop_handoffs"] = task_handoffs
                 if handoff:
                     node["attention"] = handoff.get("attention")
                     node["verification_state"] = handoff.get("verification_state")

@@ -8,6 +8,7 @@ REST surface without spinning up the whole dashboard.
 from __future__ import annotations
 
 import importlib.util
+import json
 import os
 import sys
 import time
@@ -694,6 +695,83 @@ def test_session_source_returns_non_archived_tenant_tasks_across_compression_lin
     assert child_payload["assignee"] == "peacock"
     assert child_payload["tenant"] == "20260612_145622_dc77fb"
     assert child_payload["session_id"] == "tip-session"
+
+
+def test_session_source_includes_loop_tool_referenced_worker_rows(client, kanban_home):
+    """Composer Loop rows should recover durable rows referenced by the chat.
+
+    ``loop_create``/``loop_status`` tool results are visible in the foreground
+    transcript even when the durable Kanban row is stamped with a worker session
+    id or a custom tenant. The session-source payload should include that row so
+    Desktop can render the Loop stack above the composer.
+    """
+    from hermes_state import SessionDB
+
+    session_db = SessionDB()
+    try:
+        session_db.create_session("foreground-session", "tui")
+    finally:
+        session_db.close()
+
+    conn = kb.connect()
+    try:
+        referenced = kb.create_task(
+            conn,
+            title="foreground-visible delegated row",
+            assignee="peacock",
+            created_by="loop_delegation:agent",
+            tenant="custom-loop-tenant",
+            session_id="worker-session",
+        )
+        foreground_parent = kb.create_task(
+            conn,
+            title="foreground-parent delegated row",
+            assignee="reviewer-qa",
+            created_by="loop_delegation:agent",
+            tenant="other-loop-tenant",
+            session_id="reviewer-session",
+        )
+        unrelated = kb.create_task(
+            conn,
+            title="unrelated worker row",
+            assignee="peacock",
+            created_by="loop_delegation:agent",
+            tenant="custom-loop-tenant",
+            session_id="worker-session",
+        )
+        with kb.write_txn(conn):
+            conn.execute(
+                "UPDATE tasks SET foreground_parent_session_id = ? WHERE id = ?",
+                ("foreground-session", foreground_parent),
+            )
+    finally:
+        conn.close()
+
+    session_db = SessionDB()
+    try:
+        session_db.append_message(
+            "foreground-session",
+            "tool",
+            json.dumps({"ok": True, "loop_item_id": referenced}),
+            tool_name="loop_create",
+        )
+    finally:
+        session_db.close()
+
+    r = client.get(
+        "/api/plugins/kanban/session-source",
+        params={"session_id": "foreground-session", "board": "default"},
+    )
+
+    assert r.status_code == 200, r.text
+    data = r.json()
+    task_ids = [task["id"] for task in data["tasks"]]
+    assert referenced in task_ids
+    assert foreground_parent in task_ids
+    assert unrelated not in task_ids
+    referenced_payload = next(task for task in data["tasks"] if task["id"] == referenced)
+    assert referenced_payload["session_id"] == "worker-session"
+    assert referenced_payload["tenant"] == "custom-loop-tenant"
 
 
 def test_session_source_recovers_overwritten_compression_parent(client, kanban_home):

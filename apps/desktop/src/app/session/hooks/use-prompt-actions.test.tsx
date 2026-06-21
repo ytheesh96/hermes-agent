@@ -3,7 +3,7 @@ import type { MutableRefObject } from 'react'
 import { useEffect, useRef } from 'react'
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 
-import { textPart } from '@/lib/chat-messages'
+import { chatMessageText, textPart } from '@/lib/chat-messages'
 import { $composerAttachments, type ComposerAttachment } from '@/store/composer'
 import { $queuedPromptsBySession, getQueuedPrompts } from '@/store/composer-queue'
 import { $kanbanStatusBySession } from '@/store/composer-status'
@@ -633,6 +633,7 @@ describe('usePromptActions desktop slash pickers', () => {
 describe('usePromptActions submit / queue drain semantics', () => {
   afterEach(() => {
     cleanup()
+    $queuedPromptsBySession.set({})
     vi.restoreAllMocks()
   })
 
@@ -661,6 +662,115 @@ describe('usePromptActions submit / queue drain semantics', () => {
       session_id: RUNTIME_SESSION_ID,
       text: 'hello after a stop'
     })
+  })
+
+  it('does not turn a bare slash into an empty slash-command transcript row', async () => {
+    const seeds: Record<string, unknown>[] = []
+    const requestGateway = vi.fn(async () => ({}) as never)
+
+    let handle: HarnessHandle | null = null
+    render(
+      <Harness
+        onReady={h => (handle = h)}
+        onSeedState={s => seeds.push(s)}
+        refreshSessions={async () => undefined}
+        requestGateway={requestGateway}
+      />
+    )
+
+    expect(await handle!.submitText('/')).toBe(false)
+    expect(requestGateway).not.toHaveBeenCalled()
+    expect(seeds).toEqual([])
+  })
+
+  it('preserves a multiline /goal body and submits the backend send directive', async () => {
+    const goalBody = [
+      'implement a provenance-aware Loop graph for Hermes Desktop.',
+      '',
+      '- Solid arrows = real Kanban dependency edges.',
+      '- Dashed arrows = provenance/context links.'
+    ].join('\n')
+    const calls: { method: string; params?: Record<string, unknown> }[] = []
+    const seeds: Record<string, unknown>[] = []
+    const requestGateway = vi.fn(async (method: string, params?: Record<string, unknown>) => {
+      calls.push({ method, params })
+
+      if (method === 'slash.exec') {
+        throw new Error('pending-input command: use command.dispatch for /goal')
+      }
+
+      if (method === 'command.dispatch') {
+        return {
+          type: 'send',
+          notice: '⊙ Goal set',
+          message: params?.arg
+        } as never
+      }
+
+      return {} as never
+    })
+
+    let handle: HarnessHandle | null = null
+    render(
+      <Harness
+        onReady={h => (handle = h)}
+        onSeedState={s => seeds.push(s)}
+        refreshSessions={async () => undefined}
+        requestGateway={requestGateway}
+      />
+    )
+
+    expect(await handle!.submitText(`/goal\n ${goalBody}`)).toBe(true)
+    expect(calls).toContainEqual({
+      method: 'command.dispatch',
+      params: {
+        session_id: RUNTIME_SESSION_ID,
+        name: 'goal',
+        arg: goalBody
+      }
+    })
+    expect(calls).toContainEqual({
+      method: 'prompt.submit',
+      params: {
+        session_id: RUNTIME_SESSION_ID,
+        text: goalBody
+      }
+    })
+
+    const renderedText = seeds.flatMap(state =>
+      Array.isArray(state.messages) ? state.messages.map(message => chatMessageText(message as never)) : []
+    )
+
+    expect(renderedText.some(text => text.includes('⊙ Goal set'))).toBe(true)
+  })
+
+  it('queues backend send directives while the current turn is busy', async () => {
+    const busyRef = { current: true }
+    const requestGateway = vi.fn(async (method: string) => {
+      if (method === 'slash.exec') {
+        throw new Error('pending-input command: use command.dispatch for /goal')
+      }
+
+      if (method === 'command.dispatch') {
+        return { type: 'send', notice: '⊙ Goal set', message: 'build the graph' } as never
+      }
+
+      return {} as never
+    })
+
+    let handle: HarnessHandle | null = null
+    render(
+      <Harness
+        busyRef={busyRef}
+        onReady={h => (handle = h)}
+        refreshSessions={async () => undefined}
+        requestGateway={requestGateway}
+      />
+    )
+
+    expect(await handle!.submitText('/goal build the graph')).toBe(true)
+    expect(requestGateway).not.toHaveBeenCalledWith('prompt.submit', expect.anything())
+    expect(getQueuedPrompts(RUNTIME_SESSION_ID)[0]?.text).toBe('build the graph')
   })
 
   it('a fromQueue drain sends even when busyRef is still true on the settle edge', async () => {
@@ -1194,6 +1304,46 @@ describe('usePromptActions sleep/wake session recovery', () => {
     expect(calls.map(c => c.method)).toEqual(['prompt.submit', 'session.resume', 'prompt.submit'])
     expect(calls[1]?.params).toEqual({ session_id: STORED_SESSION_ID })
     expect(calls[2]?.params).toEqual({ session_id: RECOVERED_SESSION_ID, text: 'message after wake' })
+  })
+
+  it('starts a fresh chat when both the runtime and routed stored session are gone', async () => {
+    const calls: { method: string; params?: Record<string, unknown> }[] = []
+    const createBackendSessionForSend = vi.fn(async () => SECOND_RUNTIME_SESSION_ID)
+
+    const requestGateway = vi.fn(async (method: string, params?: Record<string, unknown>) => {
+      calls.push({ method, params })
+
+      if (method === 'prompt.submit' && params?.session_id === RUNTIME_SESSION_ID) {
+        throw new Error('session not found')
+      }
+
+      if (method === 'session.resume') {
+        throw new Error('404: {"detail":"Session not found"}')
+      }
+
+      return {} as never
+    })
+
+    let handle: HarnessHandle | null = null
+    render(
+      <Harness
+        createBackendSessionForSend={createBackendSessionForSend}
+        onReady={h => (handle = h)}
+        refreshSessions={async () => undefined}
+        requestGateway={requestGateway}
+        storedSessionId={STORED_SESSION_ID}
+      />
+    )
+
+    const ok = await handle!.submitText('message from stranded route')
+
+    expect(ok).toBe(true)
+    expect(createBackendSessionForSend).toHaveBeenCalledWith('message from stranded route')
+    expect(calls.map(c => c.method)).toEqual(['prompt.submit', 'session.resume', 'prompt.submit'])
+    expect(calls[2]?.params).toEqual({
+      session_id: SECOND_RUNTIME_SESSION_ID,
+      text: 'message from stranded route'
+    })
   })
 
   it('resumes the stored session and retries once when session.interrupt reports "session not found"', async () => {
