@@ -940,7 +940,7 @@ describe('LoopPanel', () => {
           tenant: 'tenant-a',
           assignee: 'reviewer-qa',
           included_child_ids: [],
-          included_parent_ids: ['t_review']
+          included_parent_ids: ['t_review', 't_root']
         },
         {
           id: 't_queued',
@@ -1033,6 +1033,7 @@ describe('LoopPanel', () => {
     expect(reviewFollowupEdge.getAttribute('d')).toMatch(/[LC]/)
     expect(rootReviewEdge.getAttribute('stroke-dasharray')).toBeNull()
     expect(reviewFollowupEdge.getAttribute('stroke-dasharray')).toBeNull()
+    expect(within(canvas).queryByTestId('loop-task-graph-edge-t_root-t_review_followup')).toBeNull()
     expect(canvas.className).not.toContain('radial-gradient')
     expect(within(canvas).getAllByText('reviewer-qa').length).toBeGreaterThan(0)
     expect(within(agentsCard).queryByTestId('loop-root-agents-list')).toBeNull()

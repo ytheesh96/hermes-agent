@@ -2104,34 +2104,6 @@ function LoopTaskGraph({ rows, onOpenTaskTab }: { rows: LoopRow[]; onOpenTaskTab
   const layout = useMemo(() => loopTaskGraphLayout(rows), [rows])
   const nodeById = useMemo(() => new Map(layout.nodes.map(node => [node.row.taskId, node])), [layout.nodes])
 
-  const gutterCandidates = useMemo(() => {
-    const rowsByDepth = new Map<number, number>()
-
-    for (const node of layout.nodes) {
-      rowsByDepth.set(node.depth, (rowsByDepth.get(node.depth) || 0) + 1)
-    }
-
-    const maxRowColumns = Math.max(1, ...Array.from(rowsByDepth.values()))
-
-    const candidates: number[] = []
-
-    for (let c = 0; c < maxRowColumns - 1; c++) {
-      const colRight = LOOP_GRAPH_PADDING + c * (LOOP_GRAPH_NODE_WIDTH + LOOP_GRAPH_COLUMN_GAP) + LOOP_GRAPH_NODE_WIDTH
-      const colLeftNext = LOOP_GRAPH_PADDING + (c + 1) * (LOOP_GRAPH_NODE_WIDTH + LOOP_GRAPH_COLUMN_GAP)
-      candidates.push((colRight + colLeftNext) / 2)
-    }
-
-    const leftmostColLeft = LOOP_GRAPH_PADDING
-    candidates.push(leftmostColLeft - 10)
-
-    const rightmostColRight =
-      LOOP_GRAPH_PADDING + maxRowColumns * (LOOP_GRAPH_NODE_WIDTH + LOOP_GRAPH_COLUMN_GAP) - LOOP_GRAPH_COLUMN_GAP
-
-    candidates.push(rightmostColRight + 10)
-
-    return candidates
-  }, [layout.nodes])
-
   const edgesWithPaths = useMemo(() => {
     return layout.edges
       .map(edge => {
@@ -2152,8 +2124,6 @@ function LoopTaskGraph({ rows, onOpenTaskTab }: { rows: LoopRow[]; onOpenTaskTab
 
         let startX: number, startY: number, endX: number, endY: number
         let d: string
-        let isLongSpan = false
-
         if (isSameRow) {
           startX = from.x + LOOP_GRAPH_NODE_WIDTH
           startY = from.y + LOOP_GRAPH_NODE_HEIGHT / 2
@@ -2168,91 +2138,20 @@ function LoopTaskGraph({ rows, onOpenTaskTab }: { rows: LoopRow[]; onOpenTaskTab
           endX = to.x + LOOP_GRAPH_NODE_WIDTH / 2
           endY = to.y
 
-          isLongSpan = endY - startY > LOOP_GRAPH_NODE_HEIGHT + LOOP_GRAPH_ROW_GAP + 10
+          const isLongSpan = endY - startY > LOOP_GRAPH_NODE_HEIGHT + LOOP_GRAPH_ROW_GAP + 10
 
           if (isLongSpan) {
-            const Y1 = startY + LOOP_GRAPH_ROW_GAP / 2
-            const Y2 = endY - LOOP_GRAPH_ROW_GAP / 2
-
-            const fromDepth = from.depth
-            const toDepth = to.depth
-
-            const isXSafe = (x: number) => {
-              for (const node of layout.nodes) {
-                if (node.depth > fromDepth && node.depth < toDepth) {
-                  const left = node.x - 4
-                  const right = node.x + LOOP_GRAPH_NODE_WIDTH + 4
-
-                  if (x >= left && x <= right) {
-                    return false
-                  }
-                }
-              }
-
-              return true
-            }
-
-            const idealX = startX + (endX - startX) / 2
-            const safeCandidates = gutterCandidates.filter(isXSafe)
-
-            let gutterX: number
-
-            if (safeCandidates.length > 0) {
-              safeCandidates.sort((a, b) => {
-                const distA = Math.abs(a - idealX)
-                const distB = Math.abs(b - idealX)
-
-                if (Math.abs(distA - distB) < 1) {
-                  return Math.abs(a - layout.width / 2) - Math.abs(b - layout.width / 2)
-                }
-
-                return distA - distB
-              })
-              gutterX = safeCandidates[0]!
-            } else {
-              gutterX = idealX
-            }
-
-            const R = 8
-            const signX1 = gutterX > startX ? 1 : gutterX < startX ? -1 : 0
-            const signX2 = endX > gutterX ? 1 : endX < gutterX ? -1 : 0
-
-            d =
-              `M ${startX} ${startY} ` +
-              `L ${startX} ${Y1 - R} ` +
-              `Q ${startX} ${Y1} ${startX + signX1 * R} ${Y1} ` +
-              `L ${gutterX - signX1 * R} ${Y1} ` +
-              `Q ${gutterX} ${Y1} ${gutterX} ${Y1 + R} ` +
-              `L ${gutterX} ${Y2 - R} ` +
-              `Q ${gutterX} ${Y2} ${gutterX + signX2 * R} ${Y2} ` +
-              `L ${endX - signX2 * R} ${Y2} ` +
-              `Q ${endX} ${Y2} ${endX} ${Y2 + R} ` +
-              `L ${endX} ${endY}`
+            return null
           } else {
             const dy = (endY - startY) / 2
             d = `M ${startX} ${startY} C ${startX} ${startY + dy}, ${endX} ${endY - dy}, ${endX} ${endY}`
           }
         }
 
-        return { d, edge, isLongSpan }
+        return { d, edge }
       })
-      .filter(Boolean) as { d: string; edge: LoopTaskGraphEdge; isLongSpan: boolean }[]
-  }, [layout, nodeById, gutterCandidates])
-
-  // Render long-span edges first (behind), short edges second (on top)
-  const sortedEdges = useMemo(() => {
-    return [...edgesWithPaths].sort((a, b) => {
-      if (a.isLongSpan && !b.isLongSpan) {
-        return -1
-      }
-
-      if (!a.isLongSpan && b.isLongSpan) {
-        return 1
-      }
-
-      return 0
-    })
-  }, [edgesWithPaths])
+      .filter(Boolean) as { d: string; edge: LoopTaskGraphEdge }[]
+  }, [layout.edges, nodeById])
 
   const handleWheel = useCallback((event: ReactWheelEvent<HTMLDivElement>) => {
     if (!event.ctrlKey) {
@@ -2311,7 +2210,7 @@ function LoopTaskGraph({ rows, onOpenTaskTab }: { rows: LoopRow[]; onOpenTaskTab
                 <path d="M 0 1.5 L 7 5 L 0 8.5 z" fill="currentColor" opacity="0.3" />
               </marker>
             </defs>
-            {sortedEdges.map(({ d, edge, isLongSpan }) => {
+            {edgesWithPaths.map(({ d, edge }) => {
               const isConnectedToHovered =
                 hoveredTaskId != null && (edge.from === hoveredTaskId || edge.to === hoveredTaskId)
 
@@ -2325,8 +2224,7 @@ function LoopTaskGraph({ rows, onOpenTaskTab }: { rows: LoopRow[]; onOpenTaskTab
               } else if (dimmed) {
                 opacity = 0.08
               } else {
-                // No hover active: adjacent edges prominent, long-span edges subtle
-                opacity = isLongSpan ? 0.28 : 0.85
+                opacity = 0.85
               }
 
               return (
@@ -2335,11 +2233,7 @@ function LoopTaskGraph({ rows, onOpenTaskTab }: { rows: LoopRow[]; onOpenTaskTab
                   data-testid={`loop-task-graph-edge-${edge.from}-${edge.to}`}
                   fill="none"
                   key={`${edge.from}:${edge.to}`}
-                  markerEnd={
-                    highlighted || (!hoveredTaskId && !isLongSpan)
-                      ? 'url(#loop-graph-arrow)'
-                      : 'url(#loop-graph-arrow-dim)'
-                  }
+                  markerEnd={highlighted || !hoveredTaskId ? 'url(#loop-graph-arrow)' : 'url(#loop-graph-arrow-dim)'}
                   opacity={opacity}
                   stroke="currentColor"
                   strokeLinecap="round"
