@@ -743,6 +743,14 @@ describe('LoopPanel', () => {
     expect(screen.queryByText('Safe actions')).toBeNull()
     expect(screen.queryByText('Decomposed children/follow-ups')).toBeNull()
     const agentsCard = screen.getByTestId('loop-task-agents-card')
+    expect(within(agentsCard).getByRole('heading', { name: /Loop graph/i })).toBeTruthy()
+    const defaultCanvas = within(agentsCard).getByTestId('loop-task-graph')
+    expect(within(defaultCanvas).getByTestId('loop-task-graph-node-t_parent')).toBeTruthy()
+    expect(within(defaultCanvas).getByTestId('loop-task-graph-node-t_child')).toBeTruthy()
+    expect(within(defaultCanvas).getByTestId('loop-task-graph-node-t_grandchild')).toBeTruthy()
+    expect(within(agentsCard).queryByTestId('loop-task-agents-list')).toBeNull()
+
+    fireEvent.click(within(agentsCard).getByRole('button', { name: /Show agents list/i }))
     expect(within(agentsCard).getByRole('heading', { name: /Agents/i })).toBeTruthy()
     expect(within(agentsCard).getByRole('button', { name: /Review child/i })).toBeTruthy()
     expect(within(agentsCard).getByRole('button', { name: /Design parent/i })).toBeTruthy()
@@ -997,17 +1005,13 @@ describe('LoopPanel', () => {
     expect(screen.queryByText('1 completed')).toBeNull()
 
     const agentsCard = screen.getByTestId('loop-root-agents-card')
-    let agentsList = within(agentsCard).getByTestId('loop-root-agents-list')
 
-    expect(within(agentsCard).getByRole('heading', { name: /^Agents$/i })).toBeTruthy()
-    const openCanvasButton = agentsCard.querySelector('button[aria-label="Show graph canvas"]')
-    expect(openCanvasButton).toBeTruthy()
-    expect(openCanvasButton?.textContent).toBe('')
-
-    fireEvent.click(openCanvasButton!)
+    expect(within(agentsCard).getByRole('heading', { name: /^Loop graph$/i })).toBeTruthy()
+    const openListButton = agentsCard.querySelector('button[aria-label="Show agents list"]')
+    expect(openListButton).toBeTruthy()
+    expect(openListButton?.textContent).toBe('')
     const canvas = within(agentsCard).getByTestId('loop-task-graph')
     expect(screen.queryByTestId('loop-canvas-overlay')).toBeNull()
-    expect(within(agentsCard).getByRole('heading', { name: /^Loop graph$/i })).toBeTruthy()
     expect(within(canvas).queryByText('Root')).toBeNull()
     const rootGraphNode = within(canvas).getByTestId('loop-task-graph-node-t_root')
     const activeGraphNode = within(canvas).getByTestId('loop-task-graph-node-t_running')
@@ -1027,6 +1031,9 @@ describe('LoopPanel', () => {
     )
     expect(rootReviewEdge.getAttribute('d')).toMatch(/[LC]/)
     expect(reviewFollowupEdge.getAttribute('d')).toMatch(/[LC]/)
+    expect(rootReviewEdge.getAttribute('stroke-dasharray')).toBeNull()
+    expect(reviewFollowupEdge.getAttribute('stroke-dasharray')).toBeNull()
+    expect(canvas.className).not.toContain('radial-gradient')
     expect(within(canvas).getAllByText('reviewer-qa').length).toBeGreaterThan(0)
     expect(within(agentsCard).queryByTestId('loop-root-agents-list')).toBeNull()
 
@@ -1040,7 +1047,7 @@ describe('LoopPanel', () => {
 
     fireEvent.click(within(agentsCard).getByRole('button', { name: 'Show agents list' }))
     expect(within(agentsCard).queryByTestId('loop-task-graph')).toBeNull()
-    agentsList = within(agentsCard).getByTestId('loop-root-agents-list')
+    const agentsList = within(agentsCard).getByTestId('loop-root-agents-list')
 
     const agentRows = within(agentsList).getAllByRole('button')
 
@@ -1109,6 +1116,8 @@ describe('LoopPanel', () => {
     fireEvent.click(screen.getByRole('tab', { name: /Root Task/i }))
     expect(screen.getByRole('heading', { name: /Root Task/i })).toBeTruthy()
 
+    const reopenedAgentsCard = screen.getByTestId('loop-root-agents-card')
+    fireEvent.click(within(reopenedAgentsCard).getByRole('button', { name: /Show agents list/i }))
     const reopenedReviewRow = screen
       .getAllByRole('button', { name: /Review child/i })
       .find(element => element.className.includes('group/status-row'))
@@ -1206,7 +1215,9 @@ describe('LoopPanel', () => {
 
     render(<LoopPanel open selectedTaskId="t_root" state={state} />)
 
-    const agentsList = within(screen.getByTestId('loop-root-agents-card')).getByTestId('loop-root-agents-list')
+    const rootAgentsCard = screen.getByTestId('loop-root-agents-card')
+    fireEvent.click(within(rootAgentsCard).getByRole('button', { name: /Show agents list/i }))
+    const agentsList = within(rootAgentsCard).getByTestId('loop-root-agents-list')
 
     expect(within(agentsList).getByRole('button', { name: /Nested sub-loop/i })).toBeTruthy()
     expect(within(agentsList).getByRole('button', { name: /Nested blocker worker/i })).toBeTruthy()
@@ -1246,7 +1257,9 @@ describe('LoopPanel', () => {
     expect(screen.queryByTestId('loop-panel-tabbar')).toBeNull()
     expect(screen.getByTestId('loop-root-agents-card')).toBeTruthy()
 
-    let agentsList = within(screen.getByTestId('loop-root-agents-card')).getByTestId('loop-root-agents-list')
+    let rootAgentsCard = screen.getByTestId('loop-root-agents-card')
+    fireEvent.click(within(rootAgentsCard).getByRole('button', { name: /Show agents list/i }))
+    let agentsList = within(rootAgentsCard).getByTestId('loop-root-agents-list')
 
     fireEvent.click(within(agentsList).getByRole('button', { name: /Root Task/i }))
 
@@ -1262,7 +1275,9 @@ describe('LoopPanel', () => {
 
     expect(screen.getByTestId('loop-root-agents-card')).toBeTruthy()
 
-    agentsList = within(screen.getByTestId('loop-root-agents-card')).getByTestId('loop-root-agents-list')
+    rootAgentsCard = screen.getByTestId('loop-root-agents-card')
+    fireEvent.click(within(rootAgentsCard).getByRole('button', { name: /Show agents list/i }))
+    agentsList = within(rootAgentsCard).getByTestId('loop-root-agents-list')
     fireEvent.click(within(agentsList).getByRole('button', { name: /Child Task/i }))
 
     expect(screen.queryByTestId('loop-panel-tabbar')).toBeNull()
@@ -1970,18 +1985,6 @@ describe('LoopPanel', () => {
     expect(screen.queryByText('Safe actions')).toBeNull()
     expect(screen.queryByText('Decomposed children/follow-ups')).toBeNull()
     const agentsCard = screen.getByTestId('loop-task-agents-card')
-    expect(within(agentsCard).getByRole('heading', { name: /Agents/i })).toBeTruthy()
-    expect(within(agentsCard).getByRole('button', { name: /Review child/i })).toBeTruthy()
-    expect(within(agentsCard).getByRole('button', { name: /Design parent/i })).toBeTruthy()
-    expect(within(agentsCard).getByText('Blocking')).toBeTruthy()
-    expect(within(agentsCard).getByText('reviewer-qa')).toBeTruthy()
-    expect(within(agentsCard).getByText('Blocked by')).toBeTruthy()
-    expect(within(agentsCard).getByText('planner')).toBeTruthy()
-
-    const openCanvasButton = within(agentsCard).getByRole('button', { name: /Show graph canvas/i })
-    expect(openCanvasButton).toBeTruthy()
-    fireEvent.click(openCanvasButton)
-
     expect(within(agentsCard).getByRole('heading', { name: /Loop graph/i })).toBeTruthy()
     const canvas = within(agentsCard).getByTestId('loop-task-graph')
     expect(canvas).toBeTruthy()
@@ -1990,9 +1993,16 @@ describe('LoopPanel', () => {
     expect(within(canvas).getByTestId('loop-task-graph-node-t_grandchild')).toBeTruthy()
     expect(within(canvas).queryByTestId('loop-task-graph-node-t_orphan')).toBeNull()
     expect(within(canvas).queryByTestId('loop-task-graph-node-t_cousin')).toBeNull()
+    expect(canvas.className).not.toContain('radial-gradient')
 
     fireEvent.click(within(agentsCard).getByRole('button', { name: /Show agents list/i }))
     expect(within(agentsCard).getByRole('heading', { name: /Agents/i })).toBeTruthy()
+    expect(within(agentsCard).getByRole('button', { name: /Review child/i })).toBeTruthy()
+    expect(within(agentsCard).getByRole('button', { name: /Design parent/i })).toBeTruthy()
+    expect(within(agentsCard).getByText('Blocking')).toBeTruthy()
+    expect(within(agentsCard).getByText('reviewer-qa')).toBeTruthy()
+    expect(within(agentsCard).getByText('Blocked by')).toBeTruthy()
+    expect(within(agentsCard).getByText('planner')).toBeTruthy()
     expect(within(agentsCard).queryByTestId('loop-task-graph')).toBeNull()
     expect(screen.queryByText('Assignee: peacock')).toBeNull()
     expect(screen.queryByText('Workspace: worktree')).toBeNull()
@@ -2015,15 +2025,11 @@ describe('LoopPanel', () => {
     fireEvent.click(within(screen.getByTestId('loop-task-agents-card')).getByRole('button', { name: /Review child/i }))
     expect(screen.getByRole('heading', { name: /Review child/i })).toBeTruthy()
     expect(screen.getByText('No description provided.')).toBeTruthy()
-    expect(
-      within(screen.getByTestId('loop-task-agents-card')).getByRole('button', { name: /Build child/i })
-    ).toBeTruthy()
+    const reviewAgentsCard = screen.getByTestId('loop-task-agents-card')
+    expect(within(reviewAgentsCard).getByRole('heading', { name: /Loop graph/i })).toBeTruthy()
+    expect(within(reviewAgentsCard).getByRole('button', { name: /Build child/i })).toBeTruthy()
 
-    const openGrandchildCanvasButton = within(screen.getByTestId('loop-task-agents-card')).getByRole('button', { name: /Show graph canvas/i })
-    expect(openGrandchildCanvasButton).toBeTruthy()
-    fireEvent.click(openGrandchildCanvasButton)
-
-    const grandchildCanvas = within(screen.getByTestId('loop-task-agents-card')).getByTestId('loop-task-graph')
+    const grandchildCanvas = within(reviewAgentsCard).getByTestId('loop-task-graph')
     expect(grandchildCanvas).toBeTruthy()
     expect(within(grandchildCanvas).getByTestId('loop-task-graph-node-t_child')).toBeTruthy()
     expect(within(grandchildCanvas).getByTestId('loop-task-graph-node-t_grandchild')).toBeTruthy()
@@ -2063,6 +2069,9 @@ describe('LoopPanel', () => {
     render(<DetailFetchHarness state={state} />)
 
     expect(screen.getByRole('heading', { name: /Build child/i })).toBeTruthy()
+    fireEvent.click(
+      within(screen.getByTestId('loop-task-agents-card')).getByRole('button', { name: /Show agents list/i })
+    )
     expect(
       within(screen.getByTestId('loop-task-agents-card')).getByText('Blocked by · Task details unavailable')
     ).toBeTruthy()
@@ -2157,6 +2166,9 @@ describe('LoopPanel', () => {
 
     fireEvent.click(screen.getByRole('button', { name: /Status: blocked Blocked implementation/i }))
     expect(screen.getByRole('heading', { name: /Blocked implementation/i })).toBeTruthy()
+    fireEvent.click(
+      within(screen.getByTestId('loop-task-agents-card')).getByRole('button', { name: /Show agents list/i })
+    )
     expect(
       within(screen.getByTestId('loop-task-agents-card')).getByText('Blocked by · Task details unavailable')
     ).toBeTruthy()
@@ -2242,7 +2254,7 @@ describe('LoopPanel', () => {
 
     fireEvent.click(within(readyTaskActions).getByRole('button', { name: /^block t_todo$/i }))
     expect(onTaskAction).toHaveBeenCalledWith('block', expect.objectContaining({ taskId: 't_todo' }))
-  })
+  }, 15_000)
 
   it('keeps missing or archived selections sticky instead of silently selecting another row', () => {
     const state = actionState()

@@ -392,10 +392,14 @@ function loopRootOrchestrationState(state: LoopPanelState, root: LoopRow): LoopR
   const reviewingRows = rows.filter(row => {
     const text = attentionText(row)
 
-    return isOrchestratorReviewRow(row) || normalizedLoopValue(row.status) === 'review' || text.includes('review-required')
+    return (
+      isOrchestratorReviewRow(row) || normalizedLoopValue(row.status) === 'review' || text.includes('review-required')
+    )
   })
 
-  const waitingRows = rows.filter(row => isQueuedLoopRow(row) || normalizedLoopValue(row.status) === 'foreground_handoff')
+  const waitingRows = rows.filter(
+    row => isQueuedLoopRow(row) || normalizedLoopValue(row.status) === 'foreground_handoff'
+  )
 
   return { activeRows, attentionRows: attentionRowsList, handoffRows, reviewingRows, waitingRows }
 }
@@ -977,7 +981,15 @@ function loopDisplayStatus(value?: null | string): string {
   return status ? loopMetadataLabel(status) : 'Unknown'
 }
 
-function LoopRootStateChip({ count, label, tone = 'neutral' }: { count: number; label: string; tone?: 'active' | 'attention' | 'neutral' | 'waiting' }) {
+function LoopRootStateChip({
+  count,
+  label,
+  tone = 'neutral'
+}: {
+  count: number
+  label: string
+  tone?: 'active' | 'attention' | 'neutral' | 'waiting'
+}) {
   if (count <= 0) {
     return null
   }
@@ -2156,7 +2168,7 @@ function LoopTaskGraph({ rows, onOpenTaskTab }: { rows: LoopRow[]; onOpenTaskTab
           endX = to.x + LOOP_GRAPH_NODE_WIDTH / 2
           endY = to.y
 
-          isLongSpan = (endY - startY) > (LOOP_GRAPH_NODE_HEIGHT + LOOP_GRAPH_ROW_GAP + 10)
+          isLongSpan = endY - startY > LOOP_GRAPH_NODE_HEIGHT + LOOP_GRAPH_ROW_GAP + 10
 
           if (isLongSpan) {
             const Y1 = startY + LOOP_GRAPH_ROW_GAP / 2
@@ -2205,16 +2217,17 @@ function LoopTaskGraph({ rows, onOpenTaskTab }: { rows: LoopRow[]; onOpenTaskTab
             const signX1 = gutterX > startX ? 1 : gutterX < startX ? -1 : 0
             const signX2 = endX > gutterX ? 1 : endX < gutterX ? -1 : 0
 
-            d = `M ${startX} ${startY} ` +
-                `L ${startX} ${Y1 - R} ` +
-                `Q ${startX} ${Y1} ${startX + signX1 * R} ${Y1} ` +
-                `L ${gutterX - signX1 * R} ${Y1} ` +
-                `Q ${gutterX} ${Y1} ${gutterX} ${Y1 + R} ` +
-                `L ${gutterX} ${Y2 - R} ` +
-                `Q ${gutterX} ${Y2} ${gutterX + signX2 * R} ${Y2} ` +
-                `L ${endX - signX2 * R} ${Y2} ` +
-                `Q ${endX} ${Y2} ${endX} ${Y2 + R} ` +
-                `L ${endX} ${endY}`
+            d =
+              `M ${startX} ${startY} ` +
+              `L ${startX} ${Y1 - R} ` +
+              `Q ${startX} ${Y1} ${startX + signX1 * R} ${Y1} ` +
+              `L ${gutterX - signX1 * R} ${Y1} ` +
+              `Q ${gutterX} ${Y1} ${gutterX} ${Y1 + R} ` +
+              `L ${gutterX} ${Y2 - R} ` +
+              `Q ${gutterX} ${Y2} ${gutterX + signX2 * R} ${Y2} ` +
+              `L ${endX - signX2 * R} ${Y2} ` +
+              `Q ${endX} ${Y2} ${endX} ${Y2 + R} ` +
+              `L ${endX} ${endY}`
           } else {
             const dy = (endY - startY) / 2
             d = `M ${startX} ${startY} C ${startX} ${startY + dy}, ${endX} ${endY - dy}, ${endX} ${endY}`
@@ -2229,9 +2242,13 @@ function LoopTaskGraph({ rows, onOpenTaskTab }: { rows: LoopRow[]; onOpenTaskTab
   // Render long-span edges first (behind), short edges second (on top)
   const sortedEdges = useMemo(() => {
     return [...edgesWithPaths].sort((a, b) => {
-      if (a.isLongSpan && !b.isLongSpan) {return -1}
+      if (a.isLongSpan && !b.isLongSpan) {
+        return -1
+      }
 
-      if (!a.isLongSpan && b.isLongSpan) {return 1}
+      if (!a.isLongSpan && b.isLongSpan) {
+        return 1
+      }
 
       return 0
     })
@@ -2248,7 +2265,7 @@ function LoopTaskGraph({ rows, onOpenTaskTab }: { rows: LoopRow[]; onOpenTaskTab
 
   return (
     <div
-      className="max-h-80 min-h-48 overflow-auto rounded-md border border-(--ui-stroke-tertiary) bg-[radial-gradient(circle_at_1px_1px,color-mix(in_srgb,var(--ui-stroke-tertiary)_55%,transparent)_1px,transparent_0)] bg-[length:18px_18px] p-3"
+      className="max-h-80 min-h-48 overflow-auto rounded-md border border-(--ui-stroke-tertiary) p-3"
       data-testid="loop-task-graph"
       data-zoom={zoom.toFixed(2)}
       onWheel={handleWheel}
@@ -2325,7 +2342,6 @@ function LoopTaskGraph({ rows, onOpenTaskTab }: { rows: LoopRow[]; onOpenTaskTab
                   }
                   opacity={opacity}
                   stroke="currentColor"
-                  strokeDasharray={isLongSpan && !highlighted ? '4 3' : undefined}
                   strokeLinecap="round"
                   strokeLinejoin="round"
                   strokeWidth={highlighted ? 1.8 : 1.35}
@@ -2335,12 +2351,7 @@ function LoopTaskGraph({ rows, onOpenTaskTab }: { rows: LoopRow[]; onOpenTaskTab
             })}
           </svg>
           {layout.nodes.map(node => (
-            <LoopTaskGraphNode
-              key={node.row.taskId}
-              layout={node}
-              onHover={setHoveredTaskId}
-              onOpen={onOpenTaskTab}
-            />
+            <LoopTaskGraphNode key={node.row.taskId} layout={node} onHover={setHoveredTaskId} onOpen={onOpenTaskTab} />
           ))}
         </div>
       </div>
@@ -2618,12 +2629,12 @@ function LoopRootAgentsCard({
   onOpenTaskTab?: (row: LoopRow) => void
   root: LoopRow
 }) {
-  const [view, setView] = useState<'canvas' | 'list'>('list')
+  const [view, setView] = useState<'canvas' | 'list'>('canvas')
   const rows = [root, ...groups.active, ...groups.attention, ...groups.queued, ...groups.other, ...groups.completed]
   const showCanvas = view === 'canvas'
 
   useEffect(() => {
-    setView('list')
+    setView('canvas')
   }, [root.taskId])
 
   return (
@@ -2680,11 +2691,10 @@ function LoopTaskAgentsCard({
   row: LoopRow
   rowById: Map<string, LoopRow>
 }) {
-  const [view, setView] = useState<'canvas' | 'list'>('list')
-  const showCanvas = view === 'canvas'
+  const [view, setView] = useState<'canvas' | 'list'>('canvas')
 
   useEffect(() => {
-    setView('list')
+    setView('canvas')
   }, [row.taskId])
 
   const seen = new Set<string>()
@@ -2725,6 +2735,7 @@ function LoopTaskAgentsCard({
   }, [rowById, row.taskId, row.parents, row.children])
 
   const showAction = items.length > 0
+  const showCanvas = showAction && view === 'canvas'
 
   return (
     <DetailSection
