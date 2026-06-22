@@ -2230,11 +2230,10 @@ def test_create_subscribes_gateway_session(monkeypatch, worker_env):
     assert s["user_id"] == "user-9"
 
 
-def test_create_subscribes_tui_session_via_session_key(monkeypatch, worker_env):
-    """TUI / desktop sessions don't have a platform/chat_id (single
-    local channel), but the parent process exports HERMES_SESSION_KEY.
-    We should still auto-subscribe, with platform='tui' and
-    chat_id=<key>."""
+def test_create_does_not_claim_tui_subscription_without_consumer(monkeypatch, worker_env):
+    """TUI / desktop sessions expose HERMES_SESSION_KEY, but no TUI poller
+    consumes kanban_notify_subs rows yet. Do not return a misleading
+    subscribed=True until that delivery path exists."""
     from tools import kanban_tools as kt
     monkeypatch.delenv("HERMES_SESSION_PLATFORM", raising=False)
     monkeypatch.delenv("HERMES_SESSION_CHAT_ID", raising=False)
@@ -2250,12 +2249,9 @@ def test_create_subscribes_tui_session_via_session_key(monkeypatch, worker_env):
     d = json.loads(out)
     assert d["ok"] is True
     new_tid = d["task_id"]
-    assert d["subscribed"] is True, d
+    assert d["subscribed"] is False, d
 
-    subs = _sub_index(_list_subs_for_task(new_tid))
-    assert len(subs) == 1
-    assert subs[0]["platform"] == "tui"
-    assert subs[0]["chat_id"] == "tui-session-abc"
+    assert _list_subs_for_task(new_tid) == []
 
 
 def test_create_does_not_subscribe_in_cli_session(monkeypatch, worker_env):

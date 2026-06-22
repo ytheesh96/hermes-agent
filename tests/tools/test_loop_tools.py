@@ -162,7 +162,7 @@ def test_loop_create_async_requires_activation_and_proof_packet(loop_env, monkey
         conn.close()
 
 
-def test_loop_create_auto_subscribes_tui_session(loop_env, monkeypatch):
+def test_loop_create_does_not_claim_tui_subscription_without_consumer(loop_env, monkeypatch):
     monkeypatch.setenv("HERMES_SESSION_KEY", "loop-create-tui-session")
 
     created = _call_loop(
@@ -178,6 +178,38 @@ def test_loop_create_auto_subscribes_tui_session(loop_env, monkeypatch):
     )
 
     assert created["ok"] is True
+    assert created["subscribed"] is False
+
+    from hermes_cli import kanban_db as kb
+
+    conn = kb.connect()
+    try:
+        subs = kb.list_notify_subs(conn, created["loop_item_id"])
+    finally:
+        conn.close()
+
+    assert subs == []
+
+
+def test_loop_create_auto_subscribes_gateway_session(loop_env, monkeypatch):
+    monkeypatch.setenv("HERMES_SESSION_PLATFORM", "telegram")
+    monkeypatch.setenv("HERMES_SESSION_CHAT_ID", "chat-1")
+    monkeypatch.setenv("HERMES_SESSION_THREAD_ID", "thread-1")
+    monkeypatch.setenv("HERMES_SESSION_USER_ID", "user-1")
+
+    created = _call_loop(
+        "loop_create",
+        {
+            "objective": "Report durable result to gateway chat",
+            "assignee": "worker-a",
+            "tenant": loop_env,
+            "activation": "explicit_user_request",
+            "proof_packet": {"summary": "gateway durable routing"},
+            "idempotency_key": "loop-create-gateway-subscribe",
+        },
+    )
+
+    assert created["ok"] is True
     assert created["subscribed"] is True
 
     from hermes_cli import kanban_db as kb
@@ -188,9 +220,10 @@ def test_loop_create_auto_subscribes_tui_session(loop_env, monkeypatch):
     finally:
         conn.close()
 
-    assert [(s["platform"], s["chat_id"]) for s in subs] == [
-        ("tui", "loop-create-tui-session")
-    ]
+    assert [
+        (s["platform"], s["chat_id"], s["thread_id"], s["user_id"])
+        for s in subs
+    ] == [("telegram", "chat-1", "thread-1", "user-1")]
 
 
 def test_loop_status_list_update_block_and_request_review(loop_env):

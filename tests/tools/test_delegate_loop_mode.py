@@ -41,6 +41,13 @@ def test_delegate_task_loop_mode_creates_durable_loop_item(loop_delegate_env, mo
         raise AssertionError("loop mode should not build ephemeral child agents")
 
     monkeypatch.setattr(delegate_tool, "_build_child_agent", fail_child_build)
+    monkeypatch.setattr(
+        delegate_tool,
+        "_resolve_delegation_credentials",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            AssertionError("loop mode should not resolve subagent credentials")
+        ),
+    )
 
     out = json.loads(
         delegate_tool.delegate_task(
@@ -57,7 +64,8 @@ def test_delegate_task_loop_mode_creates_durable_loop_item(loop_delegate_env, mo
     assert out["count"] == 1
     assert out["assignee"] == "reviewer-qa"
     assert out["loop_item_id"].startswith("t_")
-    assert out["subscribed"] is True
+    assert out["subscribed"] is False
+    assert out["auto_reentry"] is False
 
     conn = kb.connect()
     try:
@@ -72,7 +80,7 @@ def test_delegate_task_loop_mode_creates_durable_loop_item(loop_delegate_env, mo
     assert task.session_id == "session-123"
     assert "Repo: /tmp/hermes-agent" in (task.body or "")
     assert "delegate_task_mode_loop" in (task.body or "")
-    assert [(s["platform"], s["chat_id"]) for s in subs] == [("tui", "tui-session-123")]
+    assert subs == []
 
 
 def test_delegate_task_loop_mode_uses_default_assignee(loop_delegate_env):
