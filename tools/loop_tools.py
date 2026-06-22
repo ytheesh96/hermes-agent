@@ -228,6 +228,7 @@ def _handle_loop_create(args: dict[str, Any], **_kwargs) -> str:
     if not isinstance(parents, (list, tuple)):
         return tool_error("parents must be a list of task ids")
     workspace_kind = str(args.get("workspace_kind") or "scratch")
+    triage = bool(args.get("triage", False))
     try:
         kb, conn = _connect(board=board)
         try:
@@ -248,7 +249,7 @@ def _handle_loop_create(args: dict[str, Any], **_kwargs) -> str:
                 tenant=tenant,
                 priority=int(args.get("priority") or 0),
                 parents=tuple(str(p).strip() for p in parents if str(p).strip()),
-                triage=bool(args.get("triage", False)),
+                triage=triage,
                 idempotency_key=args.get("idempotency_key"),
                 max_runtime_seconds=(int(args["max_runtime_seconds"]) if args.get("max_runtime_seconds") is not None else None),
                 skills=args.get("skills"),
@@ -258,6 +259,14 @@ def _handle_loop_create(args: dict[str, Any], **_kwargs) -> str:
                 session_id=session_id,
                 board=board,
             )
+            if triage:
+                with kb.write_txn(conn):
+                    conn.execute(
+                        "UPDATE tasks SET created_by = ? "
+                        "WHERE id = ? AND status = 'triage' "
+                        "AND created_by LIKE 'loop_delegation:%'",
+                        (f"loop:{task_id}", task_id),
+                    )
             task, completed = _wait_for_loop_item(kb, conn, task_id, execution)
             if task is None:
                 return tool_error(f"created task {task_id} could not be read back")

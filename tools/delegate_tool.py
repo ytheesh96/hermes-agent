@@ -2092,6 +2092,9 @@ def _loop_delegation_result(
     board,
     workspace_kind,
     workspace_path,
+    decompose=False,
+    goal_mode=False,
+    goal_max_turns=None,
 ) -> str:
     """Create durable Loop rows for delegate_task(mode='loop')."""
     from tools import loop_tools
@@ -2109,12 +2112,29 @@ def _loop_delegation_result(
                 "assignee is required for delegate_task(mode='loop') unless "
                 "loop.default_assignee or kanban.default_assignee is configured"
             )
+        task_decompose = (
+            task.get("decompose")
+            if task.get("decompose") is not None
+            else decompose
+        )
+        task_goal_mode = (
+            task.get("goal_mode")
+            if task.get("goal_mode") is not None
+            else goal_mode
+        )
+        task_goal_max_turns = (
+            task.get("goal_max_turns")
+            if task.get("goal_max_turns") is not None
+            else goal_max_turns
+        )
         proof_packet = {
             "source": "delegate_task_mode_loop",
             "goal": task_goal,
             "origin_profile": os.environ.get("HERMES_PROFILE") or "",
             "origin_session_id": os.environ.get("HERMES_SESSION_ID") or "",
             "session_key_present": bool(os.environ.get("HERMES_SESSION_KEY")),
+            "decompose": is_truthy_value(task_decompose, default=False),
+            "goal_mode": is_truthy_value(task_goal_mode, default=False),
         }
         raw = loop_tools._handle_loop_create(
             {
@@ -2128,6 +2148,9 @@ def _loop_delegation_result(
                 "activation": "explicit_user_request",
                 "proof_packet": proof_packet,
                 "execution": {"mode": "async"},
+                "triage": is_truthy_value(task_decompose, default=False),
+                "goal_mode": is_truthy_value(task_goal_mode, default=False),
+                "goal_max_turns": task_goal_max_turns,
             }
         )
         created = json.loads(raw)
@@ -2140,6 +2163,8 @@ def _loop_delegation_result(
                 "assignee": created["assignee"],
                 "foreground_reentry": created.get("foreground_reentry"),
                 "subscribed": bool(created.get("subscribed")),
+                "decompose": is_truthy_value(task_decompose, default=False),
+                "goal_mode": is_truthy_value(task_goal_mode, default=False),
             }
         )
 
@@ -2179,6 +2204,9 @@ def delegate_task(
     board: Optional[str] = None,
     workspace_kind: Optional[str] = None,
     workspace_path: Optional[str] = None,
+    decompose: bool = False,
+    goal_mode: bool = False,
+    goal_max_turns: Optional[int] = None,
     parent_agent=None,
 ) -> str:
     """
@@ -2297,6 +2325,9 @@ def delegate_task(
             board=board,
             workspace_kind=workspace_kind,
             workspace_path=workspace_path,
+            decompose=decompose,
+            goal_mode=goal_mode,
+            goal_max_turns=goal_max_turns,
         )
 
     # Resolve delegation credentials (provider:model pair).
@@ -3164,6 +3195,25 @@ DELEGATE_TASK_SCHEMA = {
                 "description": "Loop/durable mode workspace kind.",
             },
             "workspace_path": {"type": "string", "description": "Loop/durable mode workspace path."},
+            "decompose": {
+                "type": "boolean",
+                "description": (
+                    "Loop/durable mode only: create the Loop item in triage "
+                    "so the existing Kanban decomposer can fan it out. "
+                    "Applies to the root item only."
+                ),
+            },
+            "goal_mode": {
+                "type": "boolean",
+                "description": (
+                    "Loop/durable mode only: keep the worker/root going across "
+                    "goal-loop turns until acceptance criteria are met."
+                ),
+            },
+            "goal_max_turns": {
+                "type": "integer",
+                "description": "Loop/durable goal-mode turn budget.",
+            },
             "tasks": {
                 "type": "array",
                 "items": {
@@ -3177,6 +3227,18 @@ DELEGATE_TASK_SCHEMA = {
                         "assignee": {
                             "type": "string",
                             "description": "Per-task assignee for loop/durable mode.",
+                        },
+                        "decompose": {
+                            "type": "boolean",
+                            "description": "Per-task loop/durable decompose override.",
+                        },
+                        "goal_mode": {
+                            "type": "boolean",
+                            "description": "Per-task loop/durable goal-mode override.",
+                        },
+                        "goal_max_turns": {
+                            "type": "integer",
+                            "description": "Per-task loop/durable goal-mode turn budget.",
                         },
                         "toolsets": {
                             "type": "array",
@@ -3293,6 +3355,9 @@ registry.register(
         board=args.get("board"),
         workspace_kind=args.get("workspace_kind"),
         workspace_path=args.get("workspace_path"),
+        decompose=args.get("decompose", False),
+        goal_mode=args.get("goal_mode", False),
+        goal_max_turns=args.get("goal_max_turns"),
         background=_model_background_value(args, kw.get("parent_agent")),
         parent_agent=kw.get("parent_agent"),
     ),
