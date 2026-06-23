@@ -569,8 +569,13 @@ function taskChildren(task: TenantLoopTask): string[] {
   return Array.from(new Set([...explicit, ...external]))
 }
 
+const LOOP_DELEGATION_CREATED_BY_PREFIX = 'loop_delegation:'
+
+const isDelegatedLoopRootTask = (task: TenantLoopTask): boolean =>
+  Boolean(task.created_by?.startsWith(LOOP_DELEGATION_CREATED_BY_PREFIX)) && taskParents(task).length === 0
+
 const isSelfAnchoredLoopTask = (task: TenantLoopTask): boolean =>
-  task.created_by === `loop:${task.id}` || task.created_by === 'loop_delegation:agent'
+  task.created_by === `loop:${task.id}` || isDelegatedLoopRootTask(task)
 
 function taskNeighborMap(
   source: Omit<TenantLoopSource, 'tasks'> & { tasks?: readonly TenantLoopTask[] },

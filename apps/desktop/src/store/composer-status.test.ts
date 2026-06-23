@@ -16,7 +16,7 @@ const SID = 'sess-1'
 
 const delegatedLoopTask = (id: string, createdAt: number, title: string) => ({
   created_at: createdAt,
-  created_by: 'loop_delegation:agent',
+  created_by: 'loop_delegation:planner',
   id,
   included_child_ids: [],
   included_parent_ids: [],
@@ -389,6 +389,27 @@ describe('reconcileKanbanSessionSource', () => {
     expect(groups[0]!.items.map(item => [item.id, item.kanbanTaskId, item.title, item.todoStatus, item.currentTool])).toEqual([
       ['kanban-task:t_first_delegate', 't_first_delegate', 'First delegated Loop smoke', 'completed', 'Loop'],
       ['kanban-task:t_second_delegate', 't_second_delegate', 'Second delegated Loop smoke', 'completed', 'Loop']
+    ])
+  })
+
+  it('does not promote a parented delegated Loop task as an independent root', () => {
+    reconcileKanbanSessionSource(SID, {
+      session_id: SID,
+      tenant: SID,
+      tasks: [
+        {
+          ...delegatedLoopTask('t_child_delegate', 10, 'Delegated child'),
+          included_parent_ids: ['t_root_delegate']
+        },
+        {
+          ...delegatedLoopTask('t_root_delegate', 20, 'Delegated root'),
+          included_child_ids: ['t_child_delegate']
+        }
+      ]
+    })
+
+    expect($kanbanStatusBySession.get()[SID]?.map(item => [item.id, item.kanbanTaskId, item.title])).toEqual([
+      ['kanban-task:t_root_delegate', 't_root_delegate', 'Delegated root']
     ])
   })
 
