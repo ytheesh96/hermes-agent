@@ -205,3 +205,13 @@ def get_session_env(name: str, default: str = "") -> str:
             return value
     # Fall back to os.environ for CLI, cron, and test compatibility
     return os.getenv(name, default)
+
+
+def get_logical_session_id(default: Any = "") -> Any:
+    """Return the user-facing session key before the internal runtime id."""
+    return (
+        get_session_env("HERMES_SESSION_KEY")
+        or get_session_env("HERMES_TENANT")
+        or get_session_env("HERMES_SESSION_ID")
+        or default
+    )

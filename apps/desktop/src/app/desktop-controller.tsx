@@ -91,7 +91,6 @@ import { isSecondaryWindow } from '../store/windows'
 import { ChatView } from './chat'
 import { requestComposerFocus, requestComposerInsert } from './chat/composer/focus'
 import { useComposerActions } from './chat/hooks/use-composer-actions'
-import { LoopTaskStack } from './chat/loop-panel'
 import {
   ChatWorkRail,
   WORK_RAIL_MAX_WIDTH,
@@ -148,11 +147,10 @@ const SkillsView = lazy(async () => ({ default: (await import('./skills')).Skill
 // this cadence while the app is open + visible so new runs surface promptly
 // instead of waiting for the next user-triggered refreshSessions().
 const CRON_POLL_INTERVAL_MS = 30_000
-// External actors can append observed messages directly to the active
-// SessionDB row (Loop foreground handoff reviews are the motivating case)
-// without going through the currently attached gateway stream. Poll only the
-// visible active transcript, and only while no turn is streaming, so those DB
-// appends surface promptly even when no push event reaches /api/ws.
+// External actors can append observed messages directly to the active SessionDB
+// row without going through the currently attached gateway stream. Poll only
+// the visible active transcript, and only while no turn is streaming, so those
+// DB appends surface promptly even when no push event reaches /api/ws.
 const ACTIVE_SESSION_EXTERNAL_REFRESH_INTERVAL_MS = 3_000
 // The recents list is local-only: cron rows have their own section, and each
 // messaging platform (telegram, discord, …) is fetched separately into its own
@@ -772,14 +770,6 @@ export function DesktopController() {
     onAddContextRef: composer.addContextRefAttachment
   })
 
-  const loopStatusStack = loopPanel.state ? (
-    <LoopTaskStack
-      onSelectTaskId={loopPanel.onSelectTaskId}
-      selectedTaskId={loopPanel.selectedTaskId}
-      state={loopPanel.state}
-    />
-  ) : null
-
   const branchInNewChat = useCallback(
     async (messageId?: string) => {
       const branched = await branchCurrentSession(messageId)
@@ -1162,7 +1152,6 @@ export function DesktopController() {
       onThreadMessagesChange={handleThreadMessagesChange}
       onToggleSelectedPin={toggleSelectedPin}
       onTranscribeAudio={transcribeVoiceAudio}
-      statusStackLead={loopStatusStack}
     />
   )
 

@@ -169,7 +169,6 @@ export function ChatBar({
   maxRecordingSeconds = 120,
   queueSessionKey,
   sessionId,
-  statusStackLead,
   state,
   onCancel,
   onOpenKanbanTask,
@@ -212,10 +211,9 @@ export function ChatBar({
 
   const statusStackVisible = useMemo(
     () =>
-      Boolean(statusStackLead) ||
       queuedPrompts.length > 0 ||
       (statusSessionId ? (statusItemsBySession[statusSessionId]?.length ?? 0) > 0 : false),
-    [queuedPrompts.length, statusItemsBySession, statusSessionId, statusStackLead]
+    [queuedPrompts.length, statusItemsBySession, statusSessionId]
   )
 
   const composerRef = useRef<HTMLFormElement | null>(null)
@@ -1979,7 +1977,6 @@ export function ChatBar({
               accounts for it. Collapses to nothing when every status is empty. */}
           <ComposerStatusStack
             busy={busy}
-            lead={statusStackLead}
             onOpenKanbanTask={onOpenKanbanTask}
             queue={
               activeQueueSessionKey && queuedPrompts.length > 0 ? (

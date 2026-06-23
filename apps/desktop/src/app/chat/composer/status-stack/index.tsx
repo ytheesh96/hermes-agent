@@ -33,17 +33,15 @@ const groupLabel = (group: StatusGroup, s: Translations['statusStack']) => {
     return s.todos(group.items.filter(i => i.todoStatus === 'completed').length, group.items.length)
   }
 
-  if (group.type === 'subagent') {
+  if (group.type === 'subagent' || group.type === 'kanban-agent') {
     return s.subagents(group.items.length)
   }
 
-  return group.type === 'kanban-agent' ? `${group.items.length} Loopagent${group.items.length === 1 ? '' : 's'}` : s.background(group.items.length)
+  return s.background(group.items.length)
 }
 
 interface ComposerStatusStackProps {
   busy: boolean
-  /** Session-scoped sections supplied by the chat shell (e.g. Loop rows). */
-  lead?: ReactNode
   /** Open/focus the durable Loop/Kanban side panel for a task row. */
   onOpenKanbanTask?: (taskId: string) => void
   /** The queue, built by the composer (it owns the queue's callbacks). Rendered
@@ -73,7 +71,7 @@ export function visibleComposerStatusItems(items: readonly ComposerStatusItem[],
  * every session-scoped status — subagents, background tasks, queue — grouped by
  * type and separated by light dividers. Collapses to nothing when empty.
  */
-export function ComposerStatusStack({ busy, lead, queue, sessionId, onOpenKanbanTask }: ComposerStatusStackProps) {
+export function ComposerStatusStack({ busy, queue, sessionId, onOpenKanbanTask }: ComposerStatusStackProps) {
   const { t } = useI18n()
   const navigate = useNavigate()
   const itemsBySession = useStore($statusItemsBySession)
@@ -107,6 +105,12 @@ export function ComposerStatusStack({ busy, lead, queue, sessionId, onOpenKanban
   const openAgents = () => navigate(AGENTS_ROUTE)
 
   const openStatusItem = (item: ComposerStatusItem) => {
+    if (item.type === 'subagent' && item.sessionId) {
+      void openSessionInNewWindow(item.sessionId, { watch: true })
+
+      return
+    }
+
     if (item.kanbanTaskId && onOpenKanbanTask) {
       onOpenKanbanTask(item.kanbanTaskId)
 
@@ -122,7 +126,7 @@ export function ComposerStatusStack({ busy, lead, queue, sessionId, onOpenKanban
     openAgents()
   }
 
-  const sections: { key: string; node: ReactNode }[] = lead ? [{ key: 'lead', node: lead }] : []
+  const sections: { key: string; node: ReactNode }[] = []
 
   sections.push(...groups.map(group => ({
     key: group.type,

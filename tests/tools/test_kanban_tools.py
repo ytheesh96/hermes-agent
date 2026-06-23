@@ -1186,6 +1186,40 @@ def test_create_stamps_session_id_from_env(monkeypatch, worker_env):
         conn.close()
 
 
+def test_create_uses_session_context_over_stale_env(monkeypatch, worker_env):
+    """Desktop/TUI tool calls must stamp the active context, not stale env."""
+    from gateway.session_context import clear_session_vars, set_session_vars
+    from hermes_cli import kanban_db as kb
+    from tools import kanban_tools as kt
+
+    monkeypatch.setenv("HERMES_SESSION_ID", "stale-env-session")
+    monkeypatch.setenv("HERMES_TENANT", "stale-env-tenant")
+    tokens = set_session_vars(
+        session_id="fresh-runtime-session",
+        session_key="fresh-context-session",
+        tenant="fresh-context-tenant",
+    )
+    try:
+        out = kt._handle_create({
+            "title": "from active context",
+            "assignee": "peer",
+            "parents": [worker_env],
+        })
+    finally:
+        clear_session_vars(tokens)
+
+    d = json.loads(out)
+    assert d["ok"] is True
+    conn = kb.connect()
+    try:
+        new_task = kb.get_task(conn, d["task_id"])
+        assert new_task is not None
+        assert new_task.session_id == "fresh-context-session"
+        assert new_task.tenant == "fresh-context-tenant"
+    finally:
+        conn.close()
+
+
 def test_create_session_id_arg_overrides_env(monkeypatch, worker_env):
     """An explicit ``session_id`` arg from the model wins over the env
     propagation. Edge case but exercised: a tool call could carry a

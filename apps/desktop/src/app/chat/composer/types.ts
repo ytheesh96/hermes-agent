@@ -40,7 +40,6 @@ export interface ChatBarProps {
   gateway?: HermesGateway | null
   queueSessionKey?: string | null
   sessionId?: string | null
-  statusStackLead?: ReactNode
   cwd?: string | null
   onCancel: () => Promise<void> | void
   onOpenKanbanTask?: (taskId: string) => void

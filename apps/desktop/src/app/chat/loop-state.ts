@@ -569,9 +569,13 @@ function taskChildren(task: TenantLoopTask): string[] {
   return Array.from(new Set([...explicit, ...external]))
 }
 
-const isSelfAnchoredLoopTask = (task: TenantLoopTask): boolean => task.created_by === `loop:${task.id}`
+const isSelfAnchoredLoopTask = (task: TenantLoopTask): boolean =>
+  task.created_by === `loop:${task.id}` || task.created_by === 'loop_delegation:agent'
 
-function taskNeighborMap(source: TenantLoopSource, tasks: readonly TenantLoopTask[]): Map<string, Set<string>> {
+function taskNeighborMap(
+  source: Omit<TenantLoopSource, 'tasks'> & { tasks?: readonly TenantLoopTask[] },
+  tasks: readonly TenantLoopTask[]
+): Map<string, Set<string>> {
   const taskIds = new Set(tasks.map(task => task.id))
   const neighbors = new Map(tasks.map(task => [task.id, new Set<string>()]))
 
@@ -632,8 +636,37 @@ function taskGraphHasPath(startId: string, targetId: string, neighbors: Map<stri
   return false
 }
 
+export function relatedLoopTaskIdsForRoot(
+  source: Omit<TenantLoopSource, 'tasks'> & { tasks?: readonly TenantLoopTask[] },
+  root: TenantLoopTask,
+  tasks: readonly TenantLoopTask[] = source.tasks || []
+): Set<string> {
+  const neighbors = taskNeighborMap(source, tasks)
+  const seen = new Set<string>()
+  const queue = [root.id]
+
+  while (queue.length > 0) {
+    const taskId = queue.shift()!
+
+    if (seen.has(taskId)) {
+      continue
+    }
+
+    seen.add(taskId)
+
+    for (const nextId of neighbors.get(taskId) || []) {
+      if (!seen.has(nextId)) {
+        queue.push(nextId)
+      }
+    }
+  }
+
+  return seen
+}
+
 function topLevelSelfAnchoredRoots(source: TenantLoopSource, tasks: readonly TenantLoopTask[]): TenantLoopTask[] {
   const neighbors = taskNeighborMap(source, tasks)
+
   const selfAnchored = tasks
     .filter(isSelfAnchoredLoopTask)
     .sort((a, b) => (a.created_at || 0) - (b.created_at || 0) || a.id.localeCompare(b.id))

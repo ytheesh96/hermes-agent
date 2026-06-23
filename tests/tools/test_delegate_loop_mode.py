@@ -81,13 +81,57 @@ def test_delegate_task_loop_mode_creates_durable_loop_item(loop_delegate_env, mo
     assert task is not None
     assert task.title == "Review the Loop adapter"
     assert task.assignee == "reviewer-qa"
-    assert task.session_id == "session-123"
+    assert task.session_id == "tui-session-123"
     assert "Repo: /tmp/hermes-agent" in (task.body or "")
     assert "delegate_task_mode_loop" in (task.body or "")
     assert [
         (s["platform"], s["chat_id"], s["notifier_profile"])
         for s in subs
     ] == [("tui", "tui-session-123", "planner")]
+
+
+def test_delegate_task_loop_mode_uses_session_context_over_stale_env(
+    loop_delegate_env, monkeypatch
+):
+    from gateway.session_context import clear_session_vars, set_session_vars
+    from hermes_cli import kanban_db as kb
+    from tools import delegate_tool
+
+    monkeypatch.setenv("HERMES_SESSION_ID", "stale-env-session")
+    monkeypatch.setenv("HERMES_SESSION_KEY", "stale-env-session")
+    tokens = set_session_vars(
+        session_id="fresh-runtime-session",
+        session_key="fresh-context-session",
+        tenant="fresh-context-session",
+    )
+    try:
+        out = json.loads(
+            delegate_tool.delegate_task(
+                goal="Verify session routing",
+                mode="loop",
+                assignee="reviewer-qa",
+                parent_agent=DummyParent(),
+            )
+        )
+    finally:
+        clear_session_vars(tokens)
+
+    conn = kb.connect()
+    try:
+        task = kb.get_task(conn, out["loop_item_id"])
+        subs = kb.list_notify_subs(conn, out["loop_item_id"])
+    finally:
+        conn.close()
+
+    assert task is not None
+    assert task.session_id == "fresh-context-session"
+    assert task.tenant == "fresh-context-session"
+    assert '"origin_session_id": "fresh-context-session"' in (task.body or "")
+    assert '"origin_session_id": "fresh-runtime-session"' not in (task.body or "")
+    assert '"origin_session_id": "stale-env-session"' not in (task.body or "")
+    assert [(s["platform"], s["chat_id"]) for s in subs] == [
+        ("tui", "fresh-context-session")
+    ]
 
 
 def test_delegate_task_loop_mode_forwards_goal_mode_and_decompose(loop_delegate_env):
@@ -164,7 +208,7 @@ def test_delegate_task_loop_decompose_preserves_loop_lineage(loop_delegate_env):
     assert root.created_by == f"loop:{root_id}"
     assert child is not None
     assert child.created_by == f"loop:{root_id}"
-    assert child.session_id == "session-123"
+    assert child.session_id == "tui-session-123"
     assert child_loop_root == root_id
 
 

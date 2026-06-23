@@ -7,6 +7,7 @@ import time
 from typing import Any
 
 from tools.registry import registry, tool_error
+from gateway.session_context import get_logical_session_id, get_session_env
 
 
 def _check_loop_enabled() -> bool:
@@ -220,8 +221,8 @@ def _handle_loop_create(args: dict[str, Any], **_kwargs) -> str:
     proof_packet = dict(args.get("proof_packet") or {})
     execution = _parse_execution(args)
     board = args.get("board")
-    tenant = args.get("tenant") or os.environ.get("HERMES_TENANT") or os.environ.get("HERMES_SESSION_ID")
-    session_id = args.get("session_id") or os.environ.get("HERMES_SESSION_ID")
+    tenant = args.get("tenant") or get_session_env("HERMES_TENANT", "") or get_logical_session_id()
+    session_id = args.get("session_id") or get_logical_session_id()
     parents = args.get("parents") or []
     if isinstance(parents, str):
         parents = [parents]

@@ -73,8 +73,7 @@ interface StatusItemRowProps {
   item: ComposerStatusItem
   /** Clear a finished background task from the stack. */
   onDismiss?: (id: string) => void
-  /** Open the subagent's own session window, livestreamed by the gateway's
-   *  child-session mirror (Agents view fallback for older gateways). */
+  /** Open the row's associated subagent/session/Loop task surface. */
   onOpen?: () => void
   /** Cancel a running background task. */
   onStop?: (id: string) => void

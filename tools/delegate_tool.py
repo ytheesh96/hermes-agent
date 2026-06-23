@@ -39,6 +39,7 @@ _RUNTIME_PROVIDER_CUSTOM = "custom"
 from tools import file_state
 from tools.terminal_tool import set_approval_callback as _set_subagent_approval_cb
 from utils import base_url_hostname, is_truthy_value
+from gateway.session_context import get_logical_session_id, get_session_env
 
 
 # Tools that children must never have access to
@@ -2131,8 +2132,8 @@ def _loop_delegation_result(
             "source": "delegate_task_mode_loop",
             "goal": task_goal,
             "origin_profile": os.environ.get("HERMES_PROFILE") or "",
-            "origin_session_id": os.environ.get("HERMES_SESSION_ID") or "",
-            "session_key_present": bool(os.environ.get("HERMES_SESSION_KEY")),
+            "origin_session_id": get_logical_session_id(),
+            "session_key_present": bool(get_session_env("HERMES_SESSION_KEY")),
             "decompose": is_truthy_value(task_decompose, default=False),
             "goal_mode": is_truthy_value(task_goal_mode, default=False),
         }

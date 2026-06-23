@@ -131,7 +131,7 @@ describe('StatusItemRow worker visuals', () => {
     expect(container.querySelector('.codicon-circle-slash')).toBeTruthy()
   })
 
-  it('renders Kanban agents without a distinct badge', () => {
+  it('renders Loop worker subagents without a distinct badge', () => {
     const { rerender } = render(
       <I18nProvider configClient={null}>
         <StatusItemRow
@@ -140,7 +140,7 @@ describe('StatusItemRow worker visuals', () => {
             currentTool: 'peacock · Terminal',
             state: 'running',
             title: 'Implement Loop worker parity',
-            type: 'kanban-agent'
+            type: 'subagent'
           }}
         />
       </I18nProvider>
@@ -243,7 +243,7 @@ describe('StatusItemRow worker visuals', () => {
             output: 'worker log tail',
             state: 'failed',
             title: 'Blocked Loop child',
-            type: 'kanban-agent'
+            type: 'subagent'
           }}
           onOpen={onOpen}
         />
