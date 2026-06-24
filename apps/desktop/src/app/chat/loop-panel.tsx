@@ -1776,6 +1776,8 @@ const LOOP_GRAPH_NODE_HEIGHT = 58
 const LOOP_GRAPH_COLUMN_GAP = 18
 const LOOP_GRAPH_ROW_GAP = 34
 const LOOP_GRAPH_PADDING = 12
+const LOOP_GRAPH_ACTION_TRAY_HEIGHT = 32
+const LOOP_GRAPH_ACTION_TRAY_OVERLAP = 2
 const LOOP_GRAPH_CHOICE_GROUP_PADDING = 8
 const LOOP_GRAPH_CHOICE_GROUP_LABEL_HEIGHT = 20
 const LOOP_GRAPH_CANVAS_PADDING = 32
@@ -2234,7 +2236,11 @@ function LoopTaskGraphActionTray({
   const blocked = normalizedLoopValue(row.status) === 'blocked'
   const statusAction: LoopTaskAction = blocked ? 'unblock' : 'block'
   const statusLabel = blocked ? 'Unblock' : 'Block'
-  const top = y > LOOP_GRAPH_NODE_HEIGHT ? y - 30 : y + LOOP_GRAPH_NODE_HEIGHT + 6
+
+  const top =
+    y > LOOP_GRAPH_NODE_HEIGHT
+      ? y - LOOP_GRAPH_ACTION_TRAY_HEIGHT + LOOP_GRAPH_ACTION_TRAY_OVERLAP
+      : y + LOOP_GRAPH_NODE_HEIGHT - LOOP_GRAPH_ACTION_TRAY_OVERLAP
 
   return (
     <div
@@ -2331,11 +2337,8 @@ function LoopTaskGraphNode({
       data-testid={`loop-task-graph-node-${row.taskId}`}
       onBlur={event => onActionEnd?.(row.taskId, event.relatedTarget)}
       onClick={() => {
-        if (onSelect) {
-          onSelect(row)
-        } else {
-          onOpen?.(row)
-        }
+        onSelect?.(row)
+        onOpen?.(row)
       }}
       onFocus={() => onActionStart?.(row.taskId)}
       onMouseEnter={() => onActionStart?.(row.taskId)}

@@ -644,7 +644,7 @@ describe('LoopPanel', () => {
     expect(screen.queryByText(/"nodes"/)).toBeNull()
   }, 15_000)
 
-  it('keeps the Loop overview graph free of the selected-node inspector card', () => {
+  it('opens downstream graph node details from the Loop overview canvas without selected-node inspector chrome', () => {
     const state = quickActionGraphState()
 
     render(<LoopPanel onTaskAction={vi.fn()} open selectedTaskId="t_root" state={state} />)
@@ -658,10 +658,29 @@ describe('LoopPanel', () => {
 
     fireEvent.click(todoNode)
 
-    expect(todoNode.getAttribute('data-selected')).toBe('true')
+    expect(screen.getByTestId('loop-task-tab-t_todo')).toBeTruthy()
+    expect(screen.getByTestId('loop-task-card')).toBeTruthy()
+    expect(screen.getByRole('heading', { name: /Todo child/i })).toBeTruthy()
+    expect(screen.queryByTestId('loop-selected-node-inspector')).toBeNull()
+    expect(screen.queryByTestId('loop-selected-node-actions')).toBeNull()
+  })
+
+  it('opens root graph node details from the Loop overview canvas', () => {
+    const state = quickActionGraphState()
+
+    render(<LoopPanel onTaskAction={vi.fn()} open selectedTaskId="t_root" state={state} />)
+
+    const rootAgentsCard = screen.getByTestId('loop-root-agents-card')
+    const canvas = within(rootAgentsCard).getByTestId('loop-task-graph')
+    const rootNode = within(canvas).getByTestId('loop-task-graph-node-t_root')
+
     expect(screen.queryByTestId('loop-task-card')).toBeNull()
-    expect(within(rootAgentsCard).queryByTestId('loop-selected-node-inspector')).toBeNull()
-    expect(within(rootAgentsCard).queryByTestId('loop-selected-node-actions')).toBeNull()
+
+    fireEvent.click(rootNode)
+
+    expect(screen.getByTestId('loop-task-tab-t_root')).toBeTruthy()
+    expect(screen.getByTestId('loop-task-card')).toBeTruthy()
+    expect(screen.getByRole('heading', { name: /Root Task/i })).toBeTruthy()
   })
 
   it('reveals graph quick action tray on node hover and keyboard focus', () => {
@@ -689,6 +708,35 @@ describe('LoopPanel', () => {
     const focusTray = within(rootAgentsCard).getByTestId('loop-task-graph-action-tray-t_todo')
     expect(within(focusTray).getByRole('button', { name: /Ask in chat about t_todo/i })).toBeTruthy()
     expect(within(focusTray).getByRole('button', { name: /^Block t_todo$/i })).toBeTruthy()
+  })
+
+  it('keeps top graph quick action trays overlapping the node hover corridor', () => {
+    const state = quickActionGraphState()
+
+    render(<LoopPanel onTaskAction={vi.fn()} open selectedTaskId="t_root" state={state} />)
+
+    const rootAgentsCard = screen.getByTestId('loop-root-agents-card')
+    const canvas = within(rootAgentsCard).getByTestId('loop-task-graph')
+    const rootNode = within(canvas).getByTestId('loop-task-graph-node-t_root')
+    const todoNode = within(canvas).getByTestId('loop-task-graph-node-t_todo')
+
+    fireEvent.mouseEnter(rootNode)
+    const rootTray = within(rootAgentsCard).getByTestId('loop-task-graph-action-tray-t_root')
+    const rootNodeBottom = Number.parseFloat(rootNode.style.top) + Number.parseFloat(rootNode.style.height)
+    const rootTrayTop = Number.parseFloat(rootTray.style.top)
+    expect(rootTrayTop).toBeLessThanOrEqual(rootNodeBottom)
+
+    fireEvent.mouseLeave(rootNode, { relatedTarget: rootTray })
+    expect(within(rootAgentsCard).getByTestId('loop-task-graph-action-tray-t_root')).toBeTruthy()
+
+    fireEvent.mouseLeave(rootTray)
+    expect(within(rootAgentsCard).queryByTestId('loop-task-graph-action-tray-t_root')).toBeNull()
+
+    fireEvent.mouseEnter(todoNode)
+    const todoTray = within(rootAgentsCard).getByTestId('loop-task-graph-action-tray-t_todo')
+    expect(Number.parseFloat(todoTray.style.top)).toBeLessThanOrEqual(Number.parseFloat(todoNode.style.top))
+    fireEvent.mouseLeave(todoNode, { relatedTarget: todoTray })
+    expect(within(rootAgentsCard).getByTestId('loop-task-graph-action-tray-t_todo')).toBeTruthy()
   })
 
   it('routes graph quick actions with row data and status-aware block/unblock', () => {
@@ -1417,7 +1465,7 @@ describe('LoopPanel', () => {
     expect(within(canvas).getByTestId('loop-task-graph-node-t_child')).toBeTruthy()
   })
 
-  it('persists graph selection, highlights the selected dependency path, and dims sibling branches', () => {
+  it('highlights the focused graph dependency path and dims sibling branches', () => {
     const state = deriveLoopPanelStateFromTenantSource({
       session_id: 'sess-selected-path',
       root_task_id: 't_root',
@@ -1466,9 +1514,10 @@ describe('LoopPanel', () => {
     let canvas = within(agentsCard).getByTestId('loop-task-graph')
     expect(within(canvas).queryByTestId('loop-graph-summary')).toBeNull()
 
-    fireEvent.click(within(canvas).getByTestId('loop-task-graph-node-t_review'))
+    fireEvent.focus(within(canvas).getByTestId('loop-task-graph-node-t_review'))
     expect(screen.queryByTestId('loop-selected-node-inspector')).toBeNull()
     expect(screen.queryByTestId('loop-selected-node-actions')).toBeNull()
+    expect(screen.queryByTestId('loop-task-card')).toBeNull()
 
     const rootNode = within(canvas).getByTestId('loop-task-graph-node-t_root')
     const selectedNode = within(canvas).getByTestId('loop-task-graph-node-t_review')
@@ -1478,19 +1527,19 @@ describe('LoopPanel', () => {
     const downstreamEdge = within(canvas).getByTestId('loop-task-graph-edge-t_review-t_review_followup')
     const siblingEdge = within(canvas).getByTestId('loop-task-graph-edge-t_root-t_active')
 
-    expect(selectedNode.getAttribute('data-selected')).toBe('true')
-    expect(rootNode.getAttribute('data-path-connected')).toBe('true')
-    expect(downstreamNode.getAttribute('data-path-connected')).toBe('true')
+    expect(selectedNode.getAttribute('data-selected')).toBe('false')
+    expect(rootNode.getAttribute('data-dimmed')).toBe('false')
+    expect(downstreamNode.getAttribute('data-dimmed')).toBe('false')
     expect(siblingNode.getAttribute('data-dimmed')).toBe('true')
-    expect(selectedEdge.getAttribute('data-selected-connected')).toBe('true')
-    expect(downstreamEdge.getAttribute('data-selected-connected')).toBe('true')
+    expect(selectedEdge.getAttribute('data-dimmed')).toBe('false')
+    expect(downstreamEdge.getAttribute('data-dimmed')).toBe('false')
     expect(siblingEdge.getAttribute('data-selected-connected')).toBe('false')
     expect(siblingEdge.getAttribute('data-dimmed')).toBe('true')
 
     fireEvent.focus(rootNode)
     const rootActionTray = within(agentsCard).getByTestId('loop-task-graph-action-tray-t_root')
     fireEvent.focus(within(rootActionTray).getByRole('button', { name: /Ask in chat about t_root/i }))
-    expect(within(canvas).getByTestId('loop-task-graph-node-t_review').getAttribute('data-selected')).toBe('true')
+    expect(within(agentsCard).getByTestId('loop-task-graph-action-tray-t_root')).toBeTruthy()
   })
 
   it('keeps parallel upstream Loop options as siblings in selected-task graph view', () => {
@@ -2178,9 +2227,9 @@ describe('LoopPanel', () => {
 
     const blockedGraphNode = screen.getByRole('button', { name: /Credential blocker/i })
     fireEvent.click(blockedGraphNode)
-    expect(blockedGraphNode.getAttribute('data-selected')).toBe('true')
+    expect(screen.getByTestId('loop-task-card')).toBeTruthy()
+    expect(screen.getByRole('heading', { name: /Credential blocker/i })).toBeTruthy()
     expect(screen.queryByTestId('loop-selected-node-inspector')).toBeNull()
-    expect(screen.queryByText('blocked: missing private token')).toBeNull()
     expect(screen.queryByRole('button', { name: /accept review/i })).toBeNull()
     expect(screen.queryByRole('button', { name: /reject review/i })).toBeNull()
     expect(screen.queryByRole('button', { name: /escalate review/i })).toBeNull()
@@ -2337,8 +2386,9 @@ describe('LoopPanel', () => {
 
     const childGraphNode = within(screen.getByTestId('loop-root-agents-card')).getByTestId('loop-task-graph-node-t_child')
     fireEvent.click(childGraphNode)
-    expect(childGraphNode.getAttribute('data-selected')).toBe('true')
-    expect(screen.queryByTestId('loop-task-card')).toBeNull()
+    expect(screen.getByTestId('loop-task-tab-t_child')).toBeTruthy()
+    expect(screen.getByTestId('loop-task-card')).toBeTruthy()
+    expect(screen.getByRole('heading', { name: /Implementation child/i })).toBeTruthy()
     expect(screen.queryByTestId('loop-selected-node-inspector')).toBeNull()
     expect(screen.queryByRole('button', { name: /Open details for t_child/i })).toBeNull()
   })
