@@ -3,6 +3,7 @@
 import builtins
 import importlib
 import logging
+import re
 import sys
 
 import pytest
@@ -29,6 +30,7 @@ from agent.prompt_builder import (
     OPENAI_MODEL_EXECUTION_GUIDANCE,
     PARALLEL_TOOL_CALL_GUIDANCE,
     GOOGLE_MODEL_OPERATIONAL_GUIDANCE,
+    KANBAN_GUIDANCE,
     MEMORY_GUIDANCE,
     SESSION_SEARCH_GUIDANCE,
     PLATFORM_HINTS,
@@ -43,6 +45,24 @@ from hermes_cli.nous_subscription import NousFeatureState, NousSubscriptionFeatu
 
 
 class TestGuidanceConstants:
+    def test_kanban_guidance_names_registered_kanban_tools(self):
+        from model_tools import get_all_tool_names, get_toolset_for_tool
+        from tools.registry import registry
+
+        named_tools = set(
+            re.findall(r"`(kanban_[a-zA-Z0-9_]+)(?:\([^`]*\))?`", KANBAN_GUIDANCE)
+        )
+        registered_tools = set(get_all_tool_names())
+
+        assert named_tools
+        assert not named_tools - registered_tools
+        assert not {tool for tool in named_tools if not registry.get_schema(tool)}
+        assert not {
+            tool: get_toolset_for_tool(tool)
+            for tool in named_tools
+            if get_toolset_for_tool(tool) != "kanban"
+        }
+
     def test_memory_guidance_discourages_task_logs(self):
         assert "durable facts" in MEMORY_GUIDANCE
         assert "Do NOT save task progress" in MEMORY_GUIDANCE

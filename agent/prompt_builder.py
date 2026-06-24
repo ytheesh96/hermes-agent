@@ -190,7 +190,7 @@ KANBAN_GUIDANCE = (
     "2. Work in the workspace (`cd $HERMES_KANBAN_WORKSPACE`) and do not touch "
     "outside files unless asked.\n"
     "3. Decisions: use `kanban_request_decision(...)` for reversible choices; "
-    "use `kanban_request_epistemic_workflow(...)` for consequential uncertainty; "
+    "use `kanban_request_review(...)` when foreground judgment is the next step; "
     "use `kanban_request_orchestrator_handoff(...)` for graph/scope surgery.\n"
     "4. Heartbeat during long operations with `kanban_heartbeat(note=...)`.\n"
     "5. If genuinely blocked, call `kanban_block(reason=...)` and stop. State "
