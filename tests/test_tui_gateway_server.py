@@ -7679,6 +7679,115 @@ def test_tui_kanban_collect_follows_session_lineage(monkeypatch, tmp_path):
         reset_hermes_home_override(token)
 
 
+def test_tui_kanban_collect_delivers_semantic_descendant_block_from_origin_lineage(monkeypatch, tmp_path):
+    """A root TUI subscription should re-enter the origin/tip for semantic child blocks."""
+    from hermes_state import SessionDB
+    from hermes_cli import kanban_db as kb
+
+    home = tmp_path / ".hermes"
+    home.mkdir()
+    token = set_hermes_home_override(home)
+    monkeypatch.setenv("HERMES_HOME", str(home))
+    monkeypatch.setenv("HERMES_KANBAN_DB", str(tmp_path / "kanban.db"))
+    monkeypatch.setattr(server, "_db", None)
+    kb._INITIALIZED_PATHS.clear()
+    kb.init_db()
+
+    db = SessionDB()
+    try:
+        db.create_session("origin-session", source="tui")
+        db.end_session("origin-session", "compression")
+        db.create_session(
+            "tip-session",
+            source="tui",
+            parent_session_id="origin-session",
+        )
+    finally:
+        db.close()
+
+    conn = kb.connect()
+    try:
+        root = kb.create_task(conn, title="loop root", assignee="orchestrator")
+        child = kb.create_task(
+            conn,
+            title="blocked option",
+            assignee="worker",
+            created_by=f"loop:{root}",
+        )
+        kb.add_notify_sub(conn, task_id=root, platform="tui", chat_id="origin-session")
+        assert kb.block_task(conn, child, reason="product-decision: pick option A or B")
+    finally:
+        conn.close()
+
+    try:
+        messages = server._collect_tui_kanban_notifications({"session_key": "tip-session"})
+
+        assert len(messages) == 1
+        assert f"Kanban {child} blocked" in messages[0]
+        assert "product-decision: pick option A or B" in messages[0]
+        assert server._collect_tui_kanban_notifications({"session_key": "tip-session"}) == []
+        conn = kb.connect()
+        try:
+            assert len(kb.list_notify_subs(conn, root)) == 1
+            assert kb.list_notify_subs(conn, child) == []
+        finally:
+            conn.close()
+    finally:
+        reset_hermes_home_override(token)
+
+
+def test_tui_kanban_collect_respects_profile_for_descendant_block(monkeypatch, tmp_path):
+    """A TUI descendant event is claimed only by the root subscription's owner profile."""
+    from hermes_cli import kanban_db as kb
+
+    home = tmp_path / ".hermes"
+    home.mkdir()
+    token = set_hermes_home_override(home)
+    monkeypatch.setenv("HERMES_HOME", str(home))
+    monkeypatch.setenv("HERMES_KANBAN_DB", str(tmp_path / "kanban.db"))
+    kb._INITIALIZED_PATHS.clear()
+    kb.init_db()
+
+    conn = kb.connect()
+    try:
+        root = kb.create_task(conn, title="loop root", assignee="orchestrator")
+        child = kb.create_task(
+            conn,
+            title="blocked option",
+            assignee="worker",
+            created_by=f"loop:{root}",
+        )
+        kb.add_notify_sub(
+            conn,
+            task_id=root,
+            platform="tui",
+            chat_id="profile-session",
+            notifier_profile="elephant",
+        )
+        assert kb.block_task(conn, child, reason="needs-user: choose")
+    finally:
+        conn.close()
+
+    try:
+        monkeypatch.setenv("HERMES_PROFILE", "peacock")
+        assert server._collect_tui_kanban_notifications({"session_key": "profile-session"}) == []
+        conn = kb.connect()
+        try:
+            assert int(kb.list_notify_subs(conn, root)[0]["last_event_id"]) == 0
+        finally:
+            conn.close()
+
+        monkeypatch.setenv("HERMES_PROFILE", "elephant")
+        messages = server._collect_tui_kanban_notifications({"session_key": "profile-session"})
+
+        assert len(messages) == 1
+        assert f"Kanban {child} blocked" in messages[0]
+        assert "needs-user: choose" in messages[0]
+        assert server._collect_tui_kanban_notifications({"session_key": "profile-session"}) == []
+    finally:
+        reset_hermes_home_override(token)
+
+
 def test_tui_kanban_collect_uses_active_profile_when_env_unset(monkeypatch, tmp_path):
     """Profile-launched TUI pollers must not skip owner-scoped rows when HERMES_PROFILE is unset."""
     from hermes_cli import kanban_db as kb

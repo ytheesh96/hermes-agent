@@ -160,7 +160,15 @@ class GatewayKanbanWatchersMixin:
             logger.warning("kanban notifier: kanban_db not importable; notifier disabled")
             return
 
-        TERMINAL_KINDS = ("completed", "blocked", "gave_up", "crashed", "timed_out")
+        TERMINAL_KINDS = (
+            "completed",
+            "blocked",
+            "gave_up",
+            "crashed",
+            "timed_out",
+            "loop_descendant_blocked",
+            "loop_descendant_gave_up",
+        )
         # Subscriptions are removed only when the task reaches a truly final
         # status (done / archived). We used to also unsub on any terminal
         # event kind (gave_up / crashed / timed_out / blocked), but that
@@ -353,6 +361,15 @@ class GatewayKanbanWatchersMixin:
                             if ev.payload and ev.payload.get("reason"):
                                 reason = f": {str(ev.payload['reason'])[:160]}"
                             msg = f"⏸ {tag}Kanban {sub['task_id']} blocked{reason}"
+                        elif kind == "loop_descendant_blocked":
+                            payload = ev.payload or {}
+                            source_id = payload.get("source_task_id") or sub["task_id"]
+                            source_assignee = payload.get("assignee")
+                            source_tag = f"@{source_assignee} " if source_assignee else ""
+                            reason = ""
+                            if payload.get("reason"):
+                                reason = f": {str(payload['reason'])[:160]}"
+                            msg = f"⏸ {source_tag}Kanban {source_id} blocked{reason}"
                         elif kind == "gave_up":
                             err = ""
                             if ev.payload and ev.payload.get("error"):
@@ -360,6 +377,19 @@ class GatewayKanbanWatchersMixin:
                             msg = (
                                 f"✖ {tag}Kanban {sub['task_id']} gave up "
                                 f"after repeated spawn failures{err}"
+                            )
+                        elif kind == "loop_descendant_gave_up":
+                            payload = ev.payload or {}
+                            source_id = payload.get("source_task_id") or sub["task_id"]
+                            source_assignee = payload.get("assignee")
+                            source_tag = f"@{source_assignee} " if source_assignee else ""
+                            trigger = str(payload.get("trigger_outcome") or "worker")
+                            err = ""
+                            if payload.get("error"):
+                                err = f"\n{str(payload['error'])[:200]}"
+                            msg = (
+                                f"✖ {source_tag}Kanban {source_id} gave up "
+                                f"after repeated {trigger} failures{err}"
                             )
                         elif kind == "crashed":
                             msg = (

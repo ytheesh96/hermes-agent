@@ -67,6 +67,17 @@ def _create_completed_subscription(summary="done once"):
         conn.close()
 
 
+def _create_loop_root_and_child(conn):
+    root = kb.create_task(conn, title="loop root", assignee="orchestrator")
+    child = kb.create_task(
+        conn,
+        title="loop child",
+        assignee="worker",
+        created_by=f"loop:{root}",
+    )
+    return root, child
+
+
 def _unseen_terminal_events(tid):
     conn = kb.connect()
     try:
@@ -169,6 +180,148 @@ def test_loop_blocked_task_reenters_origin_subscription(tmp_path, monkeypatch):
     assert "blocked" in text.lower()
     assert tid in text
     assert "missing production credentials" in text
+
+
+def test_kanban_notifier_delivers_semantic_descendant_block_once_to_root_subscription(tmp_path, monkeypatch):
+    db_path = tmp_path / "loop-descendant-block.db"
+    monkeypatch.setenv("HERMES_KANBAN_DB", str(db_path))
+    kb.init_db()
+
+    conn = kb.connect()
+    try:
+        root, child = _create_loop_root_and_child(conn)
+        kb.add_notify_sub(
+            conn,
+            task_id=root,
+            platform="telegram",
+            chat_id="chat-1",
+            thread_id="thread-1",
+            notifier_profile="elephant",
+        )
+        assert kb.block_task(conn, child, reason="needs-user: pick option A or B")
+    finally:
+        conn.close()
+
+    adapter = RecordingAdapter()
+    runner = _make_runner(adapter)
+    runner._kanban_notifier_profile = "elephant"
+    asyncio.run(_run_one_notifier_tick(monkeypatch, runner))
+    asyncio.run(_run_one_notifier_tick(monkeypatch, runner))
+
+    assert adapter.sent == [
+        {
+            "chat_id": "chat-1",
+            "text": f"⏸ @worker Kanban {child} blocked: needs-user: pick option A or B",
+            "metadata": {"thread_id": "thread-1"},
+        }
+    ]
+
+    conn = kb.connect()
+    try:
+        subs = kb.list_notify_subs(conn, root)
+    finally:
+        conn.close()
+    assert len(subs) == 1
+    assert int(subs[0]["last_event_id"]) > 0
+
+
+def test_kanban_notifier_ignores_routine_descendant_completion_for_root_subscription(tmp_path, monkeypatch):
+    db_path = tmp_path / "loop-routine-child-complete.db"
+    monkeypatch.setenv("HERMES_KANBAN_DB", str(db_path))
+    kb.init_db()
+
+    conn = kb.connect()
+    try:
+        root, child = _create_loop_root_and_child(conn)
+        kb.add_notify_sub(conn, task_id=root, platform="telegram", chat_id="chat-1")
+        assert kb.complete_task(conn, child, summary="routine child done")
+    finally:
+        conn.close()
+
+    adapter = RecordingAdapter()
+    runner = _make_runner(adapter)
+    asyncio.run(_run_one_notifier_tick(monkeypatch, runner))
+
+    assert adapter.sent == []
+    conn = kb.connect()
+    try:
+        subs = kb.list_notify_subs(conn, root)
+    finally:
+        conn.close()
+    assert len(subs) == 1
+    assert int(subs[0]["last_event_id"]) == 0
+
+
+def test_kanban_notifier_routes_descendant_events_to_owning_profile(tmp_path, monkeypatch):
+    db_path = tmp_path / "loop-descendant-profile-owner.db"
+    monkeypatch.setenv("HERMES_KANBAN_DB", str(db_path))
+    kb.init_db()
+
+    conn = kb.connect()
+    try:
+        root, child = _create_loop_root_and_child(conn)
+        kb.add_notify_sub(
+            conn,
+            task_id=root,
+            platform="telegram",
+            chat_id="chat-1",
+            notifier_profile="elephant",
+        )
+        assert kb.block_task(conn, child, reason="product-decision: choose")
+    finally:
+        conn.close()
+
+    wrong_adapter = RecordingAdapter()
+    wrong_runner = _make_runner(wrong_adapter)
+    wrong_runner._kanban_notifier_profile = "peacock"
+    asyncio.run(_run_one_notifier_tick(monkeypatch, wrong_runner))
+
+    assert wrong_adapter.sent == []
+    conn = kb.connect()
+    try:
+        assert int(kb.list_notify_subs(conn, root)[0]["last_event_id"]) == 0
+    finally:
+        conn.close()
+
+    owner_adapter = RecordingAdapter()
+    owner_runner = _make_runner(owner_adapter)
+    owner_runner._kanban_notifier_profile = "elephant"
+    asyncio.run(_run_one_notifier_tick(monkeypatch, owner_runner))
+
+    assert len(owner_adapter.sent) == 1
+    assert owner_adapter.sent[0]["chat_id"] == "chat-1"
+    assert f"Kanban {child} blocked" in owner_adapter.sent[0]["text"]
+    assert "product-decision: choose" in owner_adapter.sent[0]["text"]
+
+
+def test_kanban_notifier_delivers_descendant_gave_up_to_root_subscription(tmp_path, monkeypatch):
+    db_path = tmp_path / "loop-descendant-gave-up.db"
+    monkeypatch.setenv("HERMES_KANBAN_DB", str(db_path))
+    kb.init_db()
+
+    conn = kb.connect()
+    try:
+        root, child = _create_loop_root_and_child(conn)
+        kb.add_notify_sub(conn, task_id=root, platform="telegram", chat_id="chat-1")
+        assert kb._record_task_failure(
+            conn,
+            child,
+            "spawn failed repeatedly",
+            outcome="spawn_failed",
+            failure_limit=1,
+        ) is True
+    finally:
+        conn.close()
+
+    adapter = RecordingAdapter()
+    runner = _make_runner(adapter)
+    asyncio.run(_run_one_notifier_tick(monkeypatch, runner))
+
+    assert len(adapter.sent) == 1
+    text = adapter.sent[0]["text"]
+    assert f"Kanban {child} gave up" in text
+    assert "after repeated spawn_failed failures" in text
+    assert "spawn failed repeatedly" in text
 
 
 def test_kanban_notifier_claim_prevents_second_watcher_send(tmp_path, monkeypatch):

@@ -7292,7 +7292,15 @@ def _notification_event_dedup_key(evt: dict) -> tuple:
     return (evt_sid, evt_type)
 
 
-_TUI_KANBAN_TERMINAL_KINDS = ("completed", "blocked", "gave_up", "crashed", "timed_out")
+_TUI_KANBAN_TERMINAL_KINDS = (
+    "completed",
+    "blocked",
+    "gave_up",
+    "crashed",
+    "timed_out",
+    "loop_descendant_blocked",
+    "loop_descendant_gave_up",
+)
 
 
 def _format_tui_kanban_notification(sub: dict, task: Any, ev: Any) -> str | None:
@@ -7313,9 +7321,25 @@ def _format_tui_kanban_notification(sub: dict, task: Any, ev: Any) -> str | None
     if kind == "blocked":
         reason = f": {str(payload.get('reason'))[:160]}" if payload.get("reason") else ""
         return f"[IMPORTANT: ⏸ {tag}Kanban {task_id} blocked{reason}]"
+    if kind == "loop_descendant_blocked":
+        source_id = payload.get("source_task_id") or task_id
+        source_assignee = payload.get("assignee")
+        source_tag = f"@{source_assignee} " if source_assignee else ""
+        reason = f": {str(payload.get('reason'))[:160]}" if payload.get("reason") else ""
+        return f"[IMPORTANT: ⏸ {source_tag}Kanban {source_id} blocked{reason}]"
     if kind == "gave_up":
         err = f"\n{str(payload.get('error'))[:200]}" if payload.get("error") else ""
         return f"[IMPORTANT: ✖ {tag}Kanban {task_id} gave up after repeated spawn failures{err}]"
+    if kind == "loop_descendant_gave_up":
+        source_id = payload.get("source_task_id") or task_id
+        source_assignee = payload.get("assignee")
+        source_tag = f"@{source_assignee} " if source_assignee else ""
+        trigger = str(payload.get("trigger_outcome") or "worker")
+        err = f"\n{str(payload.get('error'))[:200]}" if payload.get("error") else ""
+        return (
+            f"[IMPORTANT: ✖ {source_tag}Kanban {source_id} gave up "
+            f"after repeated {trigger} failures{err}]"
+        )
     if kind == "crashed":
         return f"[IMPORTANT: ✖ {tag}Kanban {task_id} worker crashed; dispatcher will retry]"
     if kind == "timed_out":

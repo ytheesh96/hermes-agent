@@ -26,6 +26,126 @@ def kanban_home(tmp_path, monkeypatch):
     return home
 
 
+def _create_loop_root_and_child(conn):
+    root = kb.create_task(conn, title="loop root", assignee="orchestrator")
+    child = kb.create_task(
+        conn,
+        title="loop child",
+        assignee="worker1",
+        created_by=f"loop:{root}",
+    )
+    return root, child
+
+
+def test_root_subscription_claims_semantic_descendant_block_once(kanban_home):
+    conn = kb.connect()
+    try:
+        root, child = _create_loop_root_and_child(conn)
+        kb.add_notify_sub(conn, task_id=root, platform="telegram", chat_id="chat1")
+
+        assert kb.block_task(conn, child, reason="review-required: QA should inspect")
+
+        _old, _cursor, events = kb.claim_unseen_events_for_sub(
+            conn,
+            task_id=root,
+            platform="telegram",
+            chat_id="chat1",
+            kinds=("loop_descendant_blocked",),
+        )
+        assert len(events) == 1
+        event = events[0]
+        payload = event.payload or {}
+        assert event.kind == "loop_descendant_blocked"
+        assert event.task_id == root
+        assert payload["source_task_id"] == child
+        assert payload["source_kind"] == "blocked"
+        assert payload["reason"] == "review-required: QA should inspect"
+        assert payload["loop_root_task_id"] == root
+
+        _old2, _cursor2, replay = kb.claim_unseen_events_for_sub(
+            conn,
+            task_id=root,
+            platform="telegram",
+            chat_id="chat1",
+            kinds=("loop_descendant_blocked",),
+        )
+        assert replay == []
+    finally:
+        conn.close()
+
+
+def test_root_subscription_ignores_nonsemantic_descendant_terminal_events(kanban_home):
+    conn = kb.connect()
+    try:
+        root, nonsemantic_child = _create_loop_root_and_child(conn)
+        routine_child = kb.create_task(
+            conn,
+            title="routine child",
+            assignee="worker1",
+            created_by=f"loop:{root}",
+        )
+        kb.add_notify_sub(conn, task_id=root, platform="telegram", chat_id="chat1")
+
+        assert kb.block_task(conn, nonsemantic_child, reason="ordinary implementation issue")
+        assert kb.complete_task(conn, routine_child, summary="ordinary child done")
+
+        _old, _cursor, events = kb.claim_unseen_events_for_sub(
+            conn,
+            task_id=root,
+            platform="telegram",
+            chat_id="chat1",
+            kinds=("loop_descendant_blocked", "loop_descendant_gave_up", "completed"),
+        )
+        assert events == []
+    finally:
+        conn.close()
+
+
+def test_root_subscription_claims_descendant_gave_up_once(kanban_home):
+    conn = kb.connect()
+    try:
+        root, child = _create_loop_root_and_child(conn)
+        kb.add_notify_sub(conn, task_id=root, platform="telegram", chat_id="chat1")
+
+        blocked = kb._record_task_failure(
+            conn,
+            child,
+            "worker crashed repeatedly",
+            outcome="crashed",
+            failure_limit=1,
+            event_payload_extra={"worker_pid": 12345},
+        )
+        assert blocked is True
+
+        _old, _cursor, events = kb.claim_unseen_events_for_sub(
+            conn,
+            task_id=root,
+            platform="telegram",
+            chat_id="chat1",
+            kinds=("loop_descendant_gave_up",),
+        )
+        assert len(events) == 1
+        event = events[0]
+        payload = event.payload or {}
+        assert event.kind == "loop_descendant_gave_up"
+        assert event.task_id == root
+        assert payload["source_task_id"] == child
+        assert payload["source_kind"] == "gave_up"
+        assert payload["error"] == "worker crashed repeatedly"
+        assert payload["trigger_outcome"] == "crashed"
+
+        _old2, _cursor2, replay = kb.claim_unseen_events_for_sub(
+            conn,
+            task_id=root,
+            platform="telegram",
+            chat_id="chat1",
+            kinds=("loop_descendant_gave_up",),
+        )
+        assert replay == []
+    finally:
+        conn.close()
+
+
 @pytest.mark.asyncio
 async def test_notifier_unsubs_after_completed_event(kanban_home):
     """
@@ -221,6 +341,69 @@ async def test_notifier_second_blocked_delivers(kanban_home):
         f"Should receive 2 blocked notification, but only get {len(blocked_deliveries)} count\n"
         f"Message {delivered_msgs}"
     )
+
+
+@pytest.mark.asyncio
+async def test_notifier_delivers_semantic_descendant_block_to_root_sub(kanban_home):
+    """A Loop root subscription should receive semantic child blockers."""
+    import hermes_cli.kanban_db as kb
+    from gateway.run import GatewayRunner
+    from gateway.config import Platform
+
+    conn = kb.connect()
+    try:
+        root, child = _create_loop_root_and_child(conn)
+        kb.add_notify_sub(
+            conn,
+            task_id=root,
+            platform="telegram",
+            chat_id="chat1",
+            thread_id="thread1",
+        )
+        assert kb.block_task(conn, child, reason="needs-user: choose one")
+    finally:
+        conn.close()
+
+    runner = object.__new__(GatewayRunner)
+    runner._running = True
+    runner._kanban_sub_fail_counts = {}
+
+    fake_adapter = MagicMock()
+
+    async def _send_and_stop(chat_id, msg, metadata=None):
+        runner._running = False
+
+    fake_adapter.send = AsyncMock(side_effect=_send_and_stop)
+    runner.adapters = {Platform.TELEGRAM: fake_adapter}
+
+    _orig_sleep = asyncio.sleep
+
+    async def _fast_sleep(_):
+        await _orig_sleep(0)
+
+    with patch("gateway.run.asyncio.sleep", side_effect=_fast_sleep):
+        await asyncio.wait_for(
+            runner._kanban_notifier_watcher(interval=1),
+            timeout=10.0,
+        )
+
+    fake_adapter.send.assert_called_once()
+    assert fake_adapter.send.call_args[0][0] == "chat1"
+    call_msg = fake_adapter.send.call_args[0][1]
+    call_metadata = fake_adapter.send.call_args.kwargs.get("metadata") or {}
+    assert child in call_msg
+    assert root not in call_msg.split("blocked", 1)[0]
+    assert "needs-user: choose one" in call_msg
+    assert call_metadata["thread_id"] == "thread1"
+
+    conn = kb.connect()
+    try:
+        root_subs = kb.list_notify_subs(conn, root)
+        child_subs = kb.list_notify_subs(conn, child)
+    finally:
+        conn.close()
+    assert len(root_subs) == 1
+    assert child_subs == []
 
 
 # ---------------------------------------------------------------------------

@@ -3230,6 +3230,100 @@ def _loop_root_for_task(conn: sqlite3.Connection, task_id: str) -> Optional[str]
     return _legacy_loop_root_from_decomposition_lineage(conn, task_id)
 
 
+_LOOP_DESCENDANT_SEMANTIC_BLOCK_PREFIXES = (
+    "review-required:",
+    "needs-user:",
+    "foreground-required:",
+    "product-decision:",
+    "human-required:",
+    "human-review:",
+    "safety-boundary:",
+    "blocked-waiting:",
+    "orchestrator-required:",
+)
+
+
+def _is_semantic_loop_descendant_block(
+    reason: Optional[str],
+    metadata: Optional[dict[str, Any]] = None,
+) -> bool:
+    """Return True for child blockers that should wake the Loop origin."""
+
+    candidates: list[str] = []
+    if reason:
+        candidates.append(str(reason))
+    if isinstance(metadata, dict):
+        for key in ("reason", "summary", "blocker", "handoff_reason"):
+            value = metadata.get(key)
+            if isinstance(value, str) and value.strip():
+                candidates.append(value)
+    return any(
+        text.strip().lower().startswith(_LOOP_DESCENDANT_SEMANTIC_BLOCK_PREFIXES)
+        for text in candidates
+    )
+
+
+def _append_loop_root_notification_event(
+    conn: sqlite3.Connection,
+    source_task_id: str,
+    *,
+    source_event_id: int,
+    source_kind: str,
+    synthetic_kind: str,
+    payload: Optional[dict[str, Any]] = None,
+    source_run_id: Optional[int] = None,
+) -> Optional[int]:
+    """Append a synthetic root-side notification event for a Loop child.
+
+    The root subscription/cursor machinery only tails events for the subscribed
+    task id.  Rather than duplicating subscription rows for every child, mirror
+    only semantic child boundary events onto the Loop root task stream.  The
+    notifier then claims the synthetic root event exactly like any direct root
+    completion/block.
+    """
+
+    root_task_id = _loop_root_for_task(conn, source_task_id)
+    if not root_task_id or root_task_id == source_task_id:
+        return None
+    source_row = conn.execute(
+        "SELECT title, assignee FROM tasks WHERE id = ?",
+        (source_task_id,),
+    ).fetchone()
+    root_row = conn.execute(
+        "SELECT 1 FROM tasks WHERE id = ?",
+        (root_task_id,),
+    ).fetchone()
+    if source_row is None or root_row is None:
+        return None
+
+    source_payload = payload if isinstance(payload, dict) else {}
+    root_payload: dict[str, Any] = {
+        "source_task_id": source_task_id,
+        "source_event_id": int(source_event_id),
+        "source_kind": source_kind,
+        "loop_root_task_id": root_task_id,
+        "title": source_row["title"],
+        "assignee": source_row["assignee"],
+    }
+    if source_run_id is not None:
+        root_payload["source_run_id"] = int(source_run_id)
+    for key in (
+        "reason",
+        "summary",
+        "error",
+        "failures",
+        "effective_limit",
+        "limit_source",
+        "trigger_outcome",
+        "worker_pid",
+        "limit_seconds",
+        "elapsed_seconds",
+    ):
+        if key in source_payload:
+            root_payload[key] = source_payload[key]
+    return _append_event(conn, root_task_id, synthetic_kind, root_payload)
+
+
 def _lineage_session_id(
     conn: sqlite3.Connection,
     task_id: str,
@@ -6013,7 +6107,19 @@ def block_task(
         ev_summary = ev_summary.strip().splitlines()[0][:400] if ev_summary else ""
         if ev_summary:
             blocked_payload["summary"] = ev_summary
-        _append_event(conn, task_id, "blocked", blocked_payload, run_id=run_id)
+        source_event_id = _append_event(
+            conn, task_id, "blocked", blocked_payload, run_id=run_id
+        )
+        if _is_semantic_loop_descendant_block(reason, metadata):
+            _append_loop_root_notification_event(
+                conn,
+                task_id,
+                source_event_id=source_event_id,
+                source_kind="blocked",
+                synthetic_kind="loop_descendant_blocked",
+                payload=blocked_payload,
+                source_run_id=run_id,
+            )
         return True
 
 
@@ -8341,7 +8447,16 @@ def _record_task_failure(
             }
             if event_payload_extra:
                 payload.update(event_payload_extra)
-            _append_event(conn, task_id, "gave_up", payload, run_id=run_id)
+            source_event_id = _append_event(conn, task_id, "gave_up", payload, run_id=run_id)
+            _append_loop_root_notification_event(
+                conn,
+                task_id,
+                source_event_id=source_event_id,
+                source_kind="gave_up",
+                synthetic_kind="loop_descendant_gave_up",
+                payload=payload,
+                source_run_id=run_id,
+            )
             blocked = True
         else:
             # Below threshold.
