@@ -1147,13 +1147,24 @@ describe('LoopPanel', () => {
 
     const agentsCard = screen.getByTestId('loop-root-agents-card')
 
-    expect(within(agentsCard).getByRole('heading', { name: /^Loop graph$/i })).toBeTruthy()
+    expect(screen.getByTestId('loop-panel-body').className).not.toContain('p-3')
+    expect(agentsCard.getAttribute('data-root-overview-canvas')).toBe('true')
+    expect(agentsCard.className).not.toContain('border')
+    expect(agentsCard.className).not.toContain('rounded-lg')
+    expect(within(agentsCard).queryByRole('heading', { name: /^Loop graph$/i })).toBeNull()
+    expect(within(agentsCard).queryByRole('heading', { name: /^Agents$/i })).toBeNull()
     const openListButton = agentsCard.querySelector('button[aria-label="Show agents list"]')
     expect(openListButton).toBeTruthy()
     expect(openListButton?.textContent).toBe('')
     const canvas = within(agentsCard).getByTestId('loop-task-graph')
+    expect(canvas.getAttribute('aria-label')).toBe('Loop graph canvas')
+    expect(canvas.className).not.toContain('max-h-80')
+    expect(canvas.className).not.toContain('border')
+    expect(canvas.className).not.toContain('rounded-md')
+    expect(canvas.className).not.toContain('p-3')
     expect(screen.queryByTestId('loop-canvas-overlay')).toBeNull()
     expect(within(canvas).queryByText('Root')).toBeNull()
+    expect(within(canvas).queryByTestId('loop-graph-summary')).toBeNull()
     const rootGraphNode = within(canvas).getByTestId('loop-task-graph-node-t_root')
     const activeGraphNode = within(canvas).getByTestId('loop-task-graph-node-t_running')
     const reviewGraphNode = within(canvas).getByTestId('loop-task-graph-node-t_review')
@@ -1195,6 +1206,7 @@ describe('LoopPanel', () => {
 
     fireEvent.click(within(agentsCard).getByRole('button', { name: 'Show agents list' }))
     expect(within(agentsCard).queryByTestId('loop-task-graph')).toBeNull()
+    expect(within(agentsCard).queryByRole('heading', { name: /^Agents$/i })).toBeNull()
     const agentsList = within(agentsCard).getByTestId('loop-root-agents-list')
 
     const agentRows = within(agentsList).getAllByRole('button')
@@ -1377,11 +1389,7 @@ describe('LoopPanel', () => {
 
     let agentsCard = screen.getByTestId('loop-root-agents-card')
     let canvas = within(agentsCard).getByTestId('loop-task-graph')
-    const summary = within(canvas).getByTestId('loop-graph-summary')
-    expect(summary.textContent).toContain('2 active')
-    expect(summary.textContent).toContain('3 frontier')
-    expect(summary.textContent).toContain('1 blocker')
-    expect(summary.textContent).toContain('1 review')
+    expect(within(canvas).queryByTestId('loop-graph-summary')).toBeNull()
 
     fireEvent.click(within(canvas).getByTestId('loop-task-graph-node-t_review'))
     expect(screen.queryByTestId('loop-selected-node-inspector')).toBeNull()

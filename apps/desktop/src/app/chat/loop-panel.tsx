@@ -2372,12 +2372,14 @@ function LoopGraphSummary({ rows }: { rows: LoopRow[] }) {
 }
 
 function LoopTaskGraph({
+  fullPanel = false,
   onOpenTaskTab,
   onSelectTask,
   onTaskAction,
   rows,
   selectedTaskId
 }: {
+  fullPanel?: boolean
   onOpenTaskTab?: (row: LoopRow) => void
   onSelectTask?: (row: LoopRow) => void
   onTaskAction?: (action: LoopTaskAction, row: LoopRow) => void
@@ -2468,13 +2470,23 @@ function LoopTaskGraph({
 
   return (
     <div
-      className="max-h-80 min-h-48 overflow-auto rounded-md border border-(--ui-stroke-tertiary) p-3"
+      aria-label={fullPanel ? 'Loop graph canvas' : undefined}
+      className={cn(
+        'overflow-auto',
+        fullPanel
+          ? 'h-full min-h-0 bg-(--ui-editor-surface-background) p-0'
+          : 'max-h-80 min-h-48 rounded-md border border-(--ui-stroke-tertiary) p-3'
+      )}
       data-testid="loop-task-graph"
       data-zoom={zoom.toFixed(2)}
       onWheel={handleWheel}
+      role={fullPanel ? 'region' : undefined}
     >
-      <LoopGraphSummary rows={rows} />
-      <div className="relative mx-auto" style={{ height: layout.height * zoom, width: layout.width * zoom }}>
+      {fullPanel ? null : <LoopGraphSummary rows={rows} />}
+      <div
+        className="relative mx-auto"
+        style={{ height: layout.height * zoom, minHeight: fullPanel ? '100%' : undefined, width: layout.width * zoom }}
+      >
         <div
           className="relative origin-top-left"
           data-testid="loop-task-graph-surface"
@@ -2910,35 +2922,32 @@ function LoopRootAgentsCard({
   }, [])
 
   return (
-    <DetailSection
-      action={
-        <Tip label={showCanvas ? 'Show agents list' : 'Show graph canvas'} side="left">
-          <Button
-            aria-label={showCanvas ? 'Show agents list' : 'Show graph canvas'}
-            className={cn(
-              '-my-1 text-muted-foreground/80 hover:text-foreground',
-              showCanvas && 'bg-(--ui-bg-secondary) text-(--ui-text-primary)'
-            )}
-            onClick={() => setView(value => (value === 'canvas' ? 'list' : 'canvas'))}
-            size="icon-xs"
-            type="button"
-            variant="ghost"
-          >
-            {showCanvas ? (
-              <Codicon name="list-unordered" size="0.875rem" />
-            ) : (
-              <GitBranch aria-hidden className="size-3.5" />
-            )}
-          </Button>
-        </Tip>
-      }
-      testId="loop-root-agents-card"
-      title={showCanvas ? 'Loop graph' : 'Agents'}
+    <section
+      aria-label={showCanvas ? 'Loop graph canvas' : 'Loop agents list'}
+      className="relative flex h-full min-h-0 min-w-0 max-w-full flex-1 flex-col overflow-hidden bg-(--ui-editor-surface-background) text-xs"
+      data-root-overview-canvas="true"
+      data-testid="loop-root-agents-card"
     >
+      <Tip label={showCanvas ? 'Show agents list' : 'Show graph canvas'} side="left">
+        <Button
+          aria-label={showCanvas ? 'Show agents list' : 'Show graph canvas'}
+          className={cn(
+            'absolute right-2 top-2 z-40 text-muted-foreground/80 shadow-nous hover:text-foreground',
+            showCanvas && 'bg-(--ui-surface-background) text-(--ui-text-primary)'
+          )}
+          onClick={() => setView(value => (value === 'canvas' ? 'list' : 'canvas'))}
+          size="icon-xs"
+          type="button"
+          variant="ghost"
+        >
+          {showCanvas ? <Codicon name="list-unordered" size="0.875rem" /> : <GitBranch aria-hidden className="size-3.5" />}
+        </Button>
+      </Tip>
       {rows.length === 0 ? (
         <EmptyDetail>No agents yet.</EmptyDetail>
       ) : showCanvas ? (
         <LoopTaskGraph
+          fullPanel
           onOpenTaskTab={onOpenTaskTab}
           onSelectTask={selectGraphTask}
           onTaskAction={onTaskAction}
@@ -2946,7 +2955,7 @@ function LoopRootAgentsCard({
           selectedTaskId={selectedGraphRow?.taskId || null}
         />
       ) : (
-        <div className="flex flex-col gap-0.5" data-testid="loop-root-agents-list">
+        <div className="flex min-h-0 flex-1 flex-col gap-0.5 overflow-auto px-3 pb-3 pt-10" data-testid="loop-root-agents-list">
           {rows.map(row => (
             <StatusItemRow
               item={loopOverviewStatusItem(row, { preferAssigneeForQueued: row.taskId === root.taskId })}
@@ -2956,7 +2965,7 @@ function LoopRootAgentsCard({
           ))}
         </div>
       )}
-    </DetailSection>
+    </section>
   )
 }
 
@@ -3087,7 +3096,7 @@ function LoopRootOverview({
   const decomposed = childCount > 0
 
   return (
-    <div className="grid min-w-0 max-w-full gap-3">
+    <div className="flex h-full min-h-0 min-w-0 max-w-full flex-col">
       {decomposed ? (
         <LoopRootAgentsCard groups={groups} onOpenTaskTab={onOpenTaskTab} onTaskAction={onTaskAction} root={root} />
       ) : null}
@@ -3823,6 +3832,10 @@ export function LoopPanel({
 
   const missingTaskId = activeTaskTabId || focusedTaskId
 
+  const showingRootCanvas = Boolean(
+    !activeArtifactTab && !activeTaskTabId && showingLoopOverview && overviewAnchor && selectedOverviewGroup
+  )
+
   const startResize = useCallback(
     (event: ReactPointerEvent<HTMLDivElement>) => {
       if (event.button !== 0) {
@@ -3917,7 +3930,10 @@ export function LoopPanel({
             taskTabs={taskTabs}
           />
         )}
-        <div className="flex min-h-0 min-w-0 flex-1 flex-col p-3">
+        <div
+          className={cn('flex min-h-0 min-w-0 flex-1 flex-col', showingRootCanvas ? 'p-0' : 'p-3')}
+          data-testid="loop-panel-body"
+        >
           {state.message && (
             <div
               className={cn(
@@ -3931,7 +3947,7 @@ export function LoopPanel({
             </div>
           )}
 
-          <div className="min-h-0 flex-1 overflow-auto">
+          <div className={cn('min-h-0 flex-1', showingRootCanvas ? 'overflow-hidden' : 'overflow-auto')}>
             {activeArtifactTab ? (
               <LoopArtifactSourceTab onSelectView={selectArtifactView} tab={activeArtifactTab} />
             ) : activeTaskTabId ? (
@@ -3968,7 +3984,7 @@ export function LoopPanel({
                 </section>
               )
             ) : showingLoopOverview && overviewAnchor && selectedOverviewGroup ? (
-              <div className="grid min-w-0 max-w-full gap-3">
+              <div className="flex h-full min-h-0 min-w-0 max-w-full flex-col">
                 <LoopRootOverview
                   group={selectedOverviewGroup}
                   onOpenTaskTab={openLoopOverviewTask}
