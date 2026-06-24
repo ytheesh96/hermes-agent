@@ -78,6 +78,9 @@ function DetailFetchHarness({ state }: { state: LoopPanelState }) {
             title: 'External parent',
             status: 'ready',
             body: 'Fetched external body',
+            branch_kind: 'alternative',
+            decision_group_id: 'external-choice',
+            selection_state: 'chosen',
             included_child_ids: ['t_child'],
             included_parent_ids: []
           },
@@ -601,6 +604,57 @@ describe('LoopPanel', () => {
     expect(screen.queryByRole('button', { name: /show debug json/i })).toBeNull()
     expect(screen.queryByText(/"nodes"/)).toBeNull()
   }, 15_000)
+
+  it('keeps graph node selection in the selected-node inspector and only routes safe actions', () => {
+    const state = deriveLoopPanelState([
+      toolMessage({
+        ok: true,
+        root_task_id: 't_root',
+        graph_revision: 3,
+        nodes: [
+          { task_id: 't_root', title: 'Root Task', status: 'running', parents: [], depth: 0 },
+          { task_id: 't_child', title: 'Build child', status: 'triage', parents: ['t_root'], depth: 1 }
+        ]
+      })
+    ])
+
+    const onTaskAction = vi.fn()
+
+    render(<LoopPanel onTaskAction={onTaskAction} open selectedTaskId="t_root" state={state!} />)
+
+    const rootAgentsCard = screen.getByTestId('loop-root-agents-card')
+    expect(within(rootAgentsCard).getByText('No node selected')).toBeTruthy()
+    expect(within(rootAgentsCard).getByText(/Click a node in the graph/i)).toBeTruthy()
+
+    fireEvent.click(within(rootAgentsCard).getByTestId('loop-task-graph-node-t_child'))
+
+    expect(screen.queryByTestId('loop-task-card')).toBeNull()
+    const inspector = within(rootAgentsCard).getByTestId('loop-selected-node-inspector')
+    expect(within(inspector).getByRole('heading', { name: /Build child/i })).toBeTruthy()
+    expect(within(inspector).getByText('t_child')).toBeTruthy()
+    expect(within(inspector).getByText(/This creates a follow-up row. It does not start execution./i)).toBeTruthy()
+
+    const actions = within(inspector).getByTestId('loop-selected-node-actions')
+    const actionText = actions.textContent || ''
+
+    const actionOrder = ['Open details', 'Ask in chat', 'Add child', 'Add alternative', 'Block', 'Archive'].map(label =>
+      actionText.indexOf(label)
+    )
+
+    expect(actionOrder.every(index => index >= 0)).toBe(true)
+    expect([...actionOrder].sort((a, b) => a - b)).toEqual(actionOrder)
+    expect((within(actions).getByRole('button', { name: /Add child/i }) as HTMLButtonElement).disabled).toBe(true)
+    expect((within(actions).getByRole('button', { name: /Add alternative/i }) as HTMLButtonElement).disabled).toBe(true)
+    expect((within(actions).getByRole('button', { name: /^Block/i }) as HTMLButtonElement).disabled).toBe(true)
+    expect((within(actions).getByRole('button', { name: /^Archive/i }) as HTMLButtonElement).disabled).toBe(true)
+
+    fireEvent.click(within(actions).getByRole('button', { name: /Ask in chat about t_child/i }))
+    expect(onTaskAction).toHaveBeenCalledWith('ask-hermes', expect.objectContaining({ taskId: 't_child' }))
+
+    fireEvent.click(within(actions).getByRole('button', { name: /Open details for t_child/i }))
+    expect(screen.getByTestId('loop-task-card')).toBeTruthy()
+    expect(screen.getByRole('heading', { name: /Build child/i })).toBeTruthy()
+  })
 
   it('renders orchestrator fork lineage and task-attached foreground handoffs in the drawer', () => {
     const state = deriveLoopPanelStateFromTenantSource({
@@ -1179,6 +1233,84 @@ describe('LoopPanel', () => {
     expect(within(canvas).getByTestId('loop-task-graph-node-t_child')).toBeTruthy()
   })
 
+  it('persists graph selection, highlights the selected dependency path, and dims sibling branches', () => {
+    const state = deriveLoopPanelStateFromTenantSource({
+      session_id: 'sess-selected-path',
+      root_task_id: 't_root',
+      tenant: 'tenant-a',
+      latest_event_id: 410,
+      tasks: [
+        {
+          id: 't_root',
+          title: 'Root Task',
+          status: 'running',
+          tenant: 'tenant-a',
+          included_child_ids: ['t_active', 't_review'],
+          included_parent_ids: []
+        },
+        {
+          id: 't_active',
+          title: 'Active sibling branch',
+          status: 'running',
+          tenant: 'tenant-a',
+          included_child_ids: [],
+          included_parent_ids: ['t_root']
+        },
+        {
+          id: 't_review',
+          title: 'Review child',
+          status: 'blocked',
+          tenant: 'tenant-a',
+          latest_summary: 'review-required: inspect proof',
+          included_child_ids: ['t_review_followup'],
+          included_parent_ids: ['t_root']
+        },
+        {
+          id: 't_review_followup',
+          title: 'Review follow-up',
+          status: 'todo',
+          tenant: 'tenant-a',
+          included_child_ids: [],
+          included_parent_ids: ['t_review']
+        }
+      ]
+    })!
+
+    render(<LoopPanel open selectedTaskId="t_root" state={state} />)
+
+    let agentsCard = screen.getByTestId('loop-root-agents-card')
+    let canvas = within(agentsCard).getByTestId('loop-task-graph')
+    const summary = within(canvas).getByTestId('loop-graph-summary')
+    expect(summary.textContent).toContain('2 active')
+    expect(summary.textContent).toContain('3 frontier')
+    expect(summary.textContent).toContain('1 blocker')
+    expect(summary.textContent).toContain('1 review')
+
+    fireEvent.click(within(canvas).getByTestId('loop-task-graph-node-t_review'))
+    const inspector = screen.getByTestId('loop-selected-node-inspector')
+    expect(within(inspector).getByRole('heading', { name: /Review child/i })).toBeTruthy()
+
+    const rootNode = within(canvas).getByTestId('loop-task-graph-node-t_root')
+    const selectedNode = within(canvas).getByTestId('loop-task-graph-node-t_review')
+    const downstreamNode = within(canvas).getByTestId('loop-task-graph-node-t_review_followup')
+    const siblingNode = within(canvas).getByTestId('loop-task-graph-node-t_active')
+    const selectedEdge = within(canvas).getByTestId('loop-task-graph-edge-t_root-t_review')
+    const downstreamEdge = within(canvas).getByTestId('loop-task-graph-edge-t_review-t_review_followup')
+    const siblingEdge = within(canvas).getByTestId('loop-task-graph-edge-t_root-t_active')
+
+    expect(selectedNode.getAttribute('data-selected')).toBe('true')
+    expect(rootNode.getAttribute('data-path-connected')).toBe('true')
+    expect(downstreamNode.getAttribute('data-path-connected')).toBe('true')
+    expect(siblingNode.getAttribute('data-dimmed')).toBe('true')
+    expect(selectedEdge.getAttribute('data-selected-connected')).toBe('true')
+    expect(downstreamEdge.getAttribute('data-selected-connected')).toBe('true')
+    expect(siblingEdge.getAttribute('data-selected-connected')).toBe('false')
+    expect(siblingEdge.getAttribute('data-dimmed')).toBe('true')
+
+    fireEvent.focus(screen.getByRole('button', { name: /Ask in chat about t_root/i }))
+    expect(within(canvas).getByTestId('loop-task-graph-node-t_review').getAttribute('data-selected')).toBe('true')
+  })
+
   it('keeps parallel upstream Loop options as siblings in selected-task graph view', () => {
     const state = deriveLoopPanelStateFromTenantSource({
       session_id: 'sess-graph-options',
@@ -1304,6 +1436,7 @@ describe('LoopPanel', () => {
 
     let agentsCard = screen.getByTestId('loop-task-agents-card')
     let canvas = within(agentsCard).getByTestId('loop-task-graph')
+    expect(within(canvas).getByTestId('loop-graph-summary').textContent).toContain('1 choice')
     expect(within(canvas).getByTestId('loop-task-graph-edge-t_option_a-t_anchor').getAttribute('stroke-dasharray')).toBe(
       '0.5 8'
     )
@@ -1355,6 +1488,282 @@ describe('LoopPanel', () => {
     canvas = within(agentsCard).getByTestId('loop-task-graph')
     expect(within(canvas).getByTestId('loop-task-graph-edge-t_option_a-t_anchor').getAttribute('stroke-dasharray')).toBeNull()
     expect(within(canvas).queryByTestId('loop-task-graph-edge-t_option_b-t_anchor')).toBeNull()
+  })
+
+  it('renders grouped decision alternatives with choose-one chrome and state pills', () => {
+    const state = deriveLoopPanelStateFromTenantSource({
+      session_id: 'sess-graph-choice-groups',
+      root_task_id: 't_root',
+      tenant: 'tenant-a',
+      latest_event_id: 410,
+      tasks: [
+        {
+          id: 't_candidate',
+          title: 'Candidate option',
+          status: 'scheduled',
+          tenant: 'tenant-a',
+          branch_kind: 'alternative',
+          decision_group_id: 'choice-1',
+          selection_state: 'candidate',
+          included_child_ids: ['t_anchor'],
+          included_parent_ids: []
+        },
+        {
+          id: 't_recommended',
+          title: 'Recommended option',
+          status: 'scheduled',
+          tenant: 'tenant-a',
+          branch_kind: 'alternative',
+          decision_group_id: 'choice-1',
+          selection_state: 'recommended',
+          included_child_ids: ['t_anchor'],
+          included_parent_ids: []
+        },
+        {
+          id: 't_chosen',
+          title: 'Chosen option',
+          status: 'scheduled',
+          tenant: 'tenant-a',
+          branch_kind: 'alternative',
+          decision_group_id: 'choice-1',
+          selection_state: 'chosen',
+          included_child_ids: ['t_anchor'],
+          included_parent_ids: []
+        },
+        {
+          id: 't_rejected',
+          title: 'Rejected option',
+          status: 'scheduled',
+          tenant: 'tenant-a',
+          branch_kind: 'alternative',
+          decision_group_id: 'choice-1',
+          selection_state: 'rejected',
+          included_child_ids: ['t_anchor'],
+          included_parent_ids: []
+        },
+        {
+          id: 't_anchor',
+          title: 'Decision anchor',
+          status: 'scheduled',
+          tenant: 'tenant-a',
+          included_child_ids: ['t_root'],
+          included_parent_ids: ['t_candidate', 't_recommended', 't_chosen', 't_rejected']
+        },
+        {
+          id: 't_root',
+          title: 'Root task',
+          status: 'scheduled',
+          tenant: 'tenant-a',
+          included_child_ids: [],
+          included_parent_ids: ['t_anchor']
+        }
+      ]
+    })!
+
+    render(<LoopPanel open selectedTaskId="t_anchor" state={state} />)
+
+    const canvas = within(screen.getByTestId('loop-task-agents-card')).getByTestId('loop-task-graph')
+    const group = within(canvas).getByTestId('loop-task-graph-choice-group-choice-1')
+    expect(within(group).getByText('Choose one')).toBeTruthy()
+    expect(group.getAttribute('title')).toBe('One option in this group should be selected')
+
+    const candidate = within(canvas).getByTestId('loop-task-graph-node-t_candidate')
+    expect(candidate.getAttribute('data-choice-state')).toBe('candidate')
+    expect(candidate.getAttribute('data-decision-group-id')).toBe('choice-1')
+    expect(candidate.getAttribute('aria-label')).toContain('Candidate option in decision group choice-1')
+    expect(within(candidate).getByText('Candidate')).toBeTruthy()
+
+    const recommended = within(canvas).getByTestId('loop-task-graph-node-t_recommended')
+    expect(recommended.getAttribute('data-choice-state')).toBe('recommended')
+    expect(within(recommended).getByText('Recommended')).toBeTruthy()
+
+    const chosen = within(canvas).getByTestId('loop-task-graph-node-t_chosen')
+    expect(chosen.getAttribute('data-choice-state')).toBe('chosen')
+    expect(within(chosen).getByText('Chosen')).toBeTruthy()
+
+    const rejected = within(canvas).getByTestId('loop-task-graph-node-t_rejected')
+    expect(rejected.getAttribute('data-choice-state')).toBe('rejected')
+    expect(within(rejected).getByText('Rejected')).toBeTruthy()
+  })
+
+  it('falls back cleanly when decision metadata is incomplete', () => {
+    const state = deriveLoopPanelStateFromTenantSource({
+      session_id: 'sess-graph-choice-fallback',
+      root_task_id: 't_root',
+      tenant: 'tenant-a',
+      latest_event_id: 411,
+      tasks: [
+        {
+          id: 't_no_group',
+          title: 'Alternative without group',
+          status: 'scheduled',
+          tenant: 'tenant-a',
+          branch_kind: 'alternative',
+          selection_state: 'rejected',
+          included_child_ids: ['t_anchor'],
+          included_parent_ids: []
+        },
+        {
+          id: 't_no_branch',
+          title: 'Grouped but not alternative',
+          status: 'scheduled',
+          tenant: 'tenant-a',
+          decision_group_id: 'choice-2',
+          selection_state: 'candidate',
+          included_child_ids: ['t_anchor'],
+          included_parent_ids: []
+        },
+        {
+          id: 't_anchor',
+          title: 'Decision anchor',
+          status: 'scheduled',
+          tenant: 'tenant-a',
+          included_child_ids: ['t_root'],
+          included_parent_ids: ['t_no_group', 't_no_branch']
+        },
+        {
+          id: 't_root',
+          title: 'Root task',
+          status: 'scheduled',
+          tenant: 'tenant-a',
+          included_child_ids: [],
+          included_parent_ids: ['t_anchor']
+        }
+      ]
+    })!
+
+    render(<LoopPanel open selectedTaskId="t_anchor" state={state} />)
+
+    const canvas = within(screen.getByTestId('loop-task-agents-card')).getByTestId('loop-task-graph')
+    expect(within(canvas).queryByText('Choose one')).toBeNull()
+
+    const noGroup = within(canvas).getByTestId('loop-task-graph-node-t_no_group')
+    expect(noGroup.getAttribute('data-choice-state')).toBe('rejected')
+    expect(noGroup.getAttribute('data-decision-group-id')).toBeNull()
+    expect(within(noGroup).getByText('Rejected')).toBeTruthy()
+
+    const noBranch = within(canvas).getByTestId('loop-task-graph-node-t_no_branch')
+    expect(noBranch.getAttribute('data-choice-state')).toBeNull()
+    expect(within(noBranch).queryByText('Candidate')).toBeNull()
+  })
+
+  it('treats a grouped alternative without selection state as a candidate option', () => {
+    const state = deriveLoopPanelStateFromTenantSource({
+      session_id: 'sess-graph-single-choice',
+      root_task_id: 't_root',
+      tenant: 'tenant-a',
+      latest_event_id: 411,
+      tasks: [
+        {
+          id: 't_single_option',
+          title: 'Only visible option',
+          status: 'scheduled',
+          tenant: 'tenant-a',
+          branch_kind: 'alternative',
+          decision_group_id: 'choice-3',
+          included_child_ids: ['t_anchor'],
+          included_parent_ids: []
+        },
+        {
+          id: 't_anchor',
+          title: 'Decision anchor',
+          status: 'scheduled',
+          tenant: 'tenant-a',
+          included_child_ids: ['t_root'],
+          included_parent_ids: ['t_single_option']
+        },
+        {
+          id: 't_root',
+          title: 'Root task',
+          status: 'scheduled',
+          tenant: 'tenant-a',
+          included_child_ids: [],
+          included_parent_ids: ['t_anchor']
+        }
+      ]
+    })!
+
+    render(<LoopPanel open selectedTaskId="t_anchor" state={state} />)
+
+    const canvas = within(screen.getByTestId('loop-task-agents-card')).getByTestId('loop-task-graph')
+    expect(within(canvas).getByTestId('loop-task-graph-choice-group-choice-3')).toBeTruthy()
+
+    const option = within(canvas).getByTestId('loop-task-graph-node-t_single_option')
+    expect(option.getAttribute('data-choice-state')).toBe('candidate')
+    expect(within(option).getByText('Candidate')).toBeTruthy()
+  })
+
+  it('renders and selects decision alternatives without dispatching work', () => {
+    const state = deriveLoopPanelStateFromTenantSource({
+      session_id: 'sess-graph-choice-no-dispatch',
+      root_task_id: 't_root',
+      tenant: 'tenant-a',
+      latest_event_id: 412,
+      tasks: [
+        {
+          id: 't_candidate',
+          title: 'Candidate option',
+          status: 'scheduled',
+          tenant: 'tenant-a',
+          branch_kind: 'alternative',
+          decision_group_id: 'choice-4',
+          selection_state: 'candidate',
+          included_child_ids: ['t_anchor'],
+          included_parent_ids: []
+        },
+        {
+          id: 't_anchor',
+          title: 'Decision anchor',
+          status: 'scheduled',
+          tenant: 'tenant-a',
+          included_child_ids: ['t_root'],
+          included_parent_ids: ['t_candidate']
+        },
+        {
+          id: 't_root',
+          title: 'Root task',
+          status: 'scheduled',
+          tenant: 'tenant-a',
+          included_child_ids: [],
+          included_parent_ids: ['t_anchor']
+        }
+      ]
+    })!
+
+    const onSelectTaskId = vi.fn()
+    const onTaskAction = vi.fn()
+
+    const { rerender } = render(
+      <LoopPanel
+        onSelectTaskId={onSelectTaskId}
+        onTaskAction={onTaskAction}
+        open
+        selectedTaskId="t_anchor"
+        state={state}
+      />
+    )
+
+    expect(onTaskAction).not.toHaveBeenCalled()
+
+    const canvas = within(screen.getByTestId('loop-task-agents-card')).getByTestId('loop-task-graph')
+    fireEvent.click(within(canvas).getByTestId('loop-task-graph-node-t_candidate'))
+
+    expect(onSelectTaskId).toHaveBeenCalledWith('t_candidate')
+    expect(onTaskAction).not.toHaveBeenCalled()
+
+    rerender(
+      <LoopPanel
+        onSelectTaskId={onSelectTaskId}
+        onTaskAction={onTaskAction}
+        open
+        selectedTaskId="t_candidate"
+        state={state}
+      />
+    )
+
+    expect(screen.getByRole('heading', { name: /Candidate option/i })).toBeTruthy()
+    expect(screen.queryByRole('button', { name: /Submit t_candidate/i })).toBeNull()
+    expect(onTaskAction).not.toHaveBeenCalled()
   })
 
   it('does not expose Submit for scheduled unconfirmed decision-option rows', () => {
@@ -1739,6 +2148,9 @@ describe('LoopPanel', () => {
 
     fireEvent.click(screen.getByRole('button', { name: /Implementation child/i }))
     expect(screen.getByRole('heading', { name: /Implementation child/i })).toBeTruthy()
+    expect(screen.queryByTestId('loop-task-card')).toBeNull()
+
+    fireEvent.click(screen.getByRole('button', { name: /Open details for t_child/i }))
     expect(screen.getByTestId('loop-task-card')).toBeTruthy()
   })
 
@@ -2323,6 +2735,10 @@ describe('LoopPanel', () => {
     expect(screen.getByRole('heading', { name: /External parent/i })).toBeTruthy()
     expect(screen.getByText('Fetched external body')).toBeTruthy()
     expect(within(screen.getByTestId('loop-task-card')).queryByText('t_external')).toBeNull()
+    const externalNode = within(screen.getByTestId('loop-task-agents-card')).getByTestId('loop-task-graph-node-t_external')
+    expect(externalNode.getAttribute('data-choice-state')).toBe('chosen')
+    expect(externalNode.getAttribute('aria-label')).toContain('Chosen option in decision group external-choice')
+    expect(within(externalNode).getByText('Chosen')).toBeTruthy()
     expect(
       within(screen.getByTestId('loop-task-agents-card')).getByRole('button', { name: /Build child/i })
     ).toBeTruthy()
