@@ -521,7 +521,7 @@ def test_loop_handoff_plugin_list_is_empty_after_removal(client, tmp_path):
     assert status.json()["escalated_count"] == 0
 
 
-def test_session_source_attaches_orchestrator_fork_and_handoff_metadata(client):
+def test_session_source_attaches_orchestrator_fork_metadata(client):
     conn = kb.connect()
     try:
         task_id = _loop_node(conn, session_id="sess-parent")
@@ -539,15 +539,6 @@ def test_session_source_attaches_orchestrator_fork_and_handoff_metadata(client):
                  WHERE id = ?
                 """,
                 (task_id,),
-            )
-            kb._record_loop_handoff(
-                conn,
-                task_id,
-                root_task_id="t_looproot",
-                handoff_kind="blocked_waiting",
-                run_id=None,
-                summary="foreground owner must choose recovery path",
-                metadata={"worker_session_id": "worker-session-1"},
             )
     finally:
         conn.close()

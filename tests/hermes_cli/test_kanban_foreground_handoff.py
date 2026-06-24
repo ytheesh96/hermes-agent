@@ -102,19 +102,7 @@ def test_explicit_foreground_block_metadata_stays_plain_blocker(kanban_home):
         assert kb.list_loop_handoffs(conn, task_id=child_id) == []
 
 
-def test_legacy_loop_handoff_review_batching_is_disabled(kanban_home):
-    with kb.connect() as conn:
-        root_id = _loop_root_node(conn)
-        # A stale/legacy row should not wake a foreground review lane anymore.
-        kb._record_loop_handoff(
-            conn,
-            root_id,
-            root_task_id=root_id,
-            handoff_kind="worker_completed",
-            run_id=None,
-            summary="legacy handoff",
-        )
-
-        assert kb.list_loop_handoffs(conn, task_id=root_id) == []
-        assert kb.claim_next_loop_handoff_review_batch(conn) is None
-        assert kb.run_next_loop_handoff_review_batch(conn, review_runner=lambda batch: {"ok": True}) is None
+def test_legacy_loop_handoff_review_batching_helpers_are_removed():
+    assert not hasattr(kb, "_record_loop_handoff")
+    assert not hasattr(kb, "claim_next_loop_handoff_review_batch")
+    assert not hasattr(kb, "run_next_loop_handoff_review_batch")

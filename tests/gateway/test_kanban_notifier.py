@@ -91,14 +91,6 @@ def test_gateway_dispatcher_does_not_start_removed_loop_handoff_review_batch(tmp
     monkeypatch.delenv("HERMES_KANBAN_BOARD", raising=False)
     kb._INITIALIZED_PATHS.clear()
     kb.init_db()
-    started_review_runs = []
-
-    def fake_start_review_runner(batch, *, board=None):
-        started_review_runs.append({"batch": batch, "board": board})
-        return {"ok": True, "pid": 4242, "mode": "subprocess"}
-
-    monkeypatch.setattr(kb, "start_loop_handoff_review_process", fake_start_review_runner)
-
     with kb.connect() as conn:
         task_id = kb.create_task(
             conn,
@@ -126,7 +118,6 @@ def test_gateway_dispatcher_does_not_start_removed_loop_handoff_review_batch(tmp
 
     assert handoffs == []
     assert events == []
-    assert started_review_runs == []
 
 
 def test_kanban_notifier_dedupes_board_slugs_pointing_to_same_db(tmp_path, monkeypatch):

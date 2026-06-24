@@ -55,7 +55,6 @@ _TASK_EVENT_TO_SOURCE_KIND = {
     "manual_terminated": "run_failed",
     "failed": "run_failed",
     "gave_up": "run_failed",
-    "loop_foreground_handoff": "task_edited",
     "scheduled": "task_edited",
 }
 

@@ -339,49 +339,8 @@ def test_legacy_foreground_decomposed_child_explicit_block_stays_plain_blocker(k
     assert events == []
 
 
-def test_loop_handoff_recording_is_noop_after_removal(kanban_home):
-    """Legacy recording helper no longer persists foreground handoff rows."""
-    with kb.connect() as conn:
-        root_id = kb.create_task(
-            conn,
-            title="Loop root",
-            assignee="foreground",
-            created_by="foreground",
-            tenant="loop-tenant",
-            triage=True,
-        )
-        child_ids = kb.decompose_triage_task(
-            conn,
-            root_id,
-            root_assignee="orchestrator",
-            children=[{"title": "implementation", "assignee": "engineer"}],
-            author="foreground",
-        )
-        assert child_ids is not None
-        source_event_id = kb._append_event(conn, root_id, "completed", {"summary": "done"})
-
-        first = kb._record_loop_handoff(
-            conn,
-            root_id,
-            root_task_id=root_id,
-            handoff_kind="worker_completed",
-            run_id=None,
-            source_event_id=source_event_id,
-            summary="first evidence wins",
-        )
-        second = kb._record_loop_handoff(
-            conn,
-            root_id,
-            root_task_id=root_id,
-            handoff_kind="worker_completed",
-            run_id=None,
-            source_event_id=source_event_id,
-            summary="duplicate retry should not overwrite",
-        )
-        handoffs = kb.list_loop_handoffs(conn, task_id=root_id)
-
-    assert first == second == {}
-    assert handoffs == []
+def test_loop_handoff_recording_helper_removed_after_removal():
+    assert not hasattr(kb, "_record_loop_handoff")
 
 
 def test_decompose_non_loop_children_keep_author_provenance(kanban_home):

@@ -86,7 +86,7 @@ import time
 from contextvars import ContextVar, Token
 from dataclasses import dataclass, field, replace
 from pathlib import Path
-from typing import Any, Callable, Iterable, Optional
+from typing import Any, Iterable, Optional
 
 from toolsets import get_toolset_names
 
@@ -3283,70 +3283,6 @@ def _is_loop_root_handoff_source(
     return root_row is None
 
 
-def _is_explicit_loop_foreground_boundary_reason(reason: Optional[str]) -> bool:
-    """Return True for block reasons that deliberately wake Loop review."""
-    normalized = str(reason or "").strip().lower()
-    return normalized.startswith(
-        (
-            "blocked-waiting:",
-            "orchestrator-required:",
-            "review-required:",
-            "foreground-required:",
-            "foreground-handoff:",
-            "human-required:",
-            "human-review:",
-            "needs-user:",
-            "product-decision:",
-            "safety-boundary:",
-        )
-    )
-
-
-_LOOP_FOREGROUND_HANDOFF_METADATA_KINDS = {
-    "blocked_waiting",
-    "decision_request",
-    "needs_user",
-    "review_required",
-    "safety_boundary",
-    "product_decision",
-}
-
-
-def _is_explicit_loop_foreground_boundary_metadata(
-    metadata: Optional[dict[str, Any]],
-) -> bool:
-    """Return True when metadata explicitly requests a foreground handoff.
-
-    The flag alone is intentionally insufficient: routine worker metadata is
-    often rich and arbitrary, so foreground wakeups require both an explicit
-    opt-in and a typed boundary/escalation kind.
-    """
-    if not isinstance(metadata, dict):
-        return False
-    if metadata.get("foreground_handoff") is not True:
-        return False
-    for key in ("handoff_kind", "escalation_kind"):
-        raw_kind = metadata.get(key)
-        if isinstance(raw_kind, str):
-            normalized = raw_kind.strip().lower().replace("-", "_")
-            if normalized in _LOOP_FOREGROUND_HANDOFF_METADATA_KINDS:
-                return True
-    return False
-
-
-def _should_emit_loop_foreground_handoff(
-    conn: sqlite3.Connection,
-    task_id: str,
-    *,
-    root_task_id: Optional[str] = None,
-    handoff_kind: str,
-    reason: Optional[str] = None,
-    metadata: Optional[dict[str, Any]] = None,
-) -> bool:
-    """Foreground handoffs were removed; Loop completion uses notify/reentry."""
-    return False
-
-
 _LOOP_HANDOFF_ACTIVE_STATES = {"assigned", "reviewing"}
 # Autonomous reviewer actions may only act on pending/active handoffs that are
 # still waiting for review. Escalated and terminal rows require human/user
@@ -3537,37 +3473,6 @@ def _infer_handoff_target_actor(
     return "orchestrator"
 
 
-def _build_handoff_payload(
-    *,
-    summary: Optional[str],
-    reason: Optional[str],
-    worker_metadata: dict[str, Any],
-    artifacts: list[str],
-    changed_files: list[str],
-    created_cards: list[str],
-    parent_state_snapshot: list[dict[str, Any]],
-    child_state_snapshot: list[dict[str, Any]],
-) -> dict[str, Any]:
-    payload: dict[str, Any] = {}
-    if summary is not None:
-        payload["summary"] = summary
-    if reason is not None:
-        payload["reason"] = reason
-    if worker_metadata:
-        payload["worker_metadata"] = worker_metadata
-    if artifacts:
-        payload["artifacts"] = artifacts
-    if changed_files:
-        payload["changed_files"] = changed_files
-    if created_cards:
-        payload["created_cards"] = created_cards
-    if parent_state_snapshot:
-        payload["parent_state_snapshot"] = parent_state_snapshot
-    if child_state_snapshot:
-        payload["child_state_snapshot"] = child_state_snapshot
-    return payload
-
-
 def _loop_handoff_row_to_dict(row: sqlite3.Row) -> dict[str, Any]:
     out = dict(row)
     out["artifacts"] = _decode_json_list(out.pop("artifacts_json", None))
@@ -3592,63 +3497,6 @@ def _loop_handoff_row_to_dict(row: sqlite3.Row) -> dict[str, Any]:
         )
     out["queue_state"] = _loop_handoff_queue_state(out.get("state"))
     return out
-
-
-def _task_state_snapshot(conn: sqlite3.Connection, task_ids: Iterable[str]) -> list[dict[str, Any]]:
-    ids = [str(task_id) for task_id in task_ids if str(task_id).strip()]
-    if not ids:
-        return []
-    placeholders = ",".join("?" for _ in ids)
-    rows = conn.execute(
-        f"SELECT id, title, status, assignee, current_run_id FROM tasks WHERE id IN ({placeholders})",
-        ids,
-    ).fetchall()
-    by_id = {row["id"]: row for row in rows}
-    out: list[dict[str, Any]] = []
-    for task_id in ids:
-        row = by_id.get(task_id)
-        if row:
-            out.append(
-                {
-                    "task_id": row["id"],
-                    "title": row["title"],
-                    "status": row["status"],
-                    "assignee": row["assignee"],
-                    "current_run_id": row["current_run_id"],
-                }
-            )
-    return out
-
-
-def _loop_handoff_idempotency_key(
-    *,
-    root_task_id: str,
-    task_id: str,
-    run_id: Optional[int],
-    source_event_id: Optional[int],
-    handoff_kind: str,
-) -> str:
-    if source_event_id is not None:
-        return f"loop-handoff:event:{int(source_event_id)}"
-    run_part = "none" if run_id is None else str(int(run_id))
-    return f"loop-handoff:{root_task_id}:{task_id}:{run_part}:{handoff_kind}"
-
-
-def _record_loop_handoff(
-    conn: sqlite3.Connection,
-    task_id: str,
-    *,
-    root_task_id: str,
-    handoff_kind: str,
-    run_id: Optional[int],
-    source_event_id: Optional[int] = None,
-    summary: Optional[str] = None,
-    reason: Optional[str] = None,
-    metadata: Optional[dict] = None,
-    created_cards: Optional[Iterable[str]] = None,
-) -> dict[str, Any]:
-    """No-op compatibility shim: foreground Loop handoffs were removed."""
-    return {}
 
 
 def list_loop_handoffs(
@@ -3722,18 +3570,6 @@ def request_loop_foreground_decision(
             if expected_run_id is not None
             else task_row["current_run_id"]
         )
-        md = dict(metadata or {})
-        md.update(
-            {
-                "decision_request": True,
-                "question": question_text,
-                "options": clean_options,
-            }
-        )
-        if recommendation:
-            md["recommendation"] = str(recommendation).strip()
-        md.setdefault("target_actor", "orchestrator")
-
         conn.execute(
             "UPDATE tasks SET last_heartbeat_at = ? WHERE id = ?",
             (now, task_id),
@@ -3765,24 +3601,13 @@ def request_loop_foreground_decision(
             decision_payload,
             run_id=run_id,
         )
-        handoff = _append_loop_foreground_handoff_event(
-            conn,
-            task_id,
-            root_task_id=root_task_id,
-            handoff_kind="worker_decision_requested",
-            run_id=run_id,
-            source_event_id=source_event_id,
-            summary=summary or question_text,
-            reason=reason,
-            metadata=md,
-        )
         return {
             "ok": True,
             "task_id": task_id,
             "root_task_id": root_task_id,
             "run_id": run_id,
             "source_event_id": source_event_id,
-            "handoff": handoff,
+            "handoff": {},
         }
 
 
@@ -3825,546 +3650,6 @@ def loop_handoff_status(
         "escalated_count": escalated,
         "needs_attention_count": needs_attention,
         "quiet_green": bool(rows) and needs_attention == 0 and resolved == len(rows),
-    }
-
-
-def _supersede_pending_loop_handoffs(
-    conn: sqlite3.Connection,
-    task_id: str,
-    *,
-    reason: str,
-    handoff_kinds: Optional[Iterable[str]] = None,
-    now: Optional[int] = None,
-) -> list[int]:
-    """Cancel pending handoffs made stale by a newer task-state transition."""
-    task_id = str(task_id or "").strip()
-    if not task_id:
-        return []
-    states = ("recorded", "queued", "batched")
-    clauses = [
-        "task_id = ?",
-        "state IN (" + ",".join("?" for _ in states) + ")",
-    ]
-    args: list[Any] = [task_id, *states]
-    kinds = [str(kind).strip() for kind in (handoff_kinds or []) if str(kind).strip()]
-    if kinds:
-        clauses.append("handoff_kind IN (" + ",".join("?" for _ in kinds) + ")")
-        args.extend(kinds)
-    rows = conn.execute(
-        "SELECT id FROM loop_handoffs WHERE " + " AND ".join(clauses) + " ORDER BY id ASC",
-        args,
-    ).fetchall()
-    ids = [int(row["id"]) for row in rows]
-    if not ids:
-        return []
-    now = int(now or time.time())
-    placeholders = ",".join("?" for _ in ids)
-    conn.execute(
-        f"""
-        UPDATE loop_handoffs
-           SET state = 'cancelled_superseded', attention = NULL,
-               verification_state = 'superseded', verification_status = 'superseded',
-               decision_actor = 'task-state', decision_reason = ?,
-               resolution_action = 'cancel', resolved_by = 'task-state',
-               resolved_at = COALESCE(resolved_at, ?),
-               completed_at = COALESCE(completed_at, ?),
-               updated_at = ?
-         WHERE id IN ({placeholders})
-        """,
-        (reason, now, now, now, *ids),
-    )
-    _append_event(
-        conn,
-        task_id,
-        "loop_handoff_superseded",
-        {"handoff_ids": ids, "reason": reason},
-    )
-    return ids
-
-
-def _supersede_resolved_worker_block_handoffs_for_scope(
-    conn: sqlite3.Connection,
-    *,
-    tenant: str,
-    root_task_id: str,
-    now: Optional[int] = None,
-) -> list[int]:
-    """Cancel legacy pending block handoffs whose task has already moved on."""
-    rows = conn.execute(
-        """
-        SELECT h.id, h.task_id
-          FROM loop_handoffs h
-          LEFT JOIN tasks t ON t.id = h.task_id
-         WHERE h.tenant = ?
-           AND h.root_task_id = ?
-           AND h.handoff_kind = 'worker_blocked'
-           AND h.state IN ('recorded', 'queued', 'batched')
-           AND COALESCE(t.status, '') != 'blocked'
-         ORDER BY h.id ASC
-        """,
-        (tenant, root_task_id),
-    ).fetchall()
-    ids = [int(row["id"]) for row in rows]
-    if not ids:
-        return []
-    now = int(now or time.time())
-    placeholders = ",".join("?" for _ in ids)
-    reason = "task state resolved before pending block handoff review"
-    conn.execute(
-        f"""
-        UPDATE loop_handoffs
-           SET state = 'cancelled_superseded', attention = NULL,
-               verification_state = 'superseded', verification_status = 'superseded',
-               decision_actor = 'task-state', decision_reason = ?,
-               resolution_action = 'cancel', resolved_by = 'task-state',
-               resolved_at = COALESCE(resolved_at, ?),
-               completed_at = COALESCE(completed_at, ?),
-               updated_at = ?
-         WHERE id IN ({placeholders})
-        """,
-        (reason, now, now, now, *ids),
-    )
-    by_task: dict[str, list[int]] = {}
-    for row in rows:
-        by_task.setdefault(str(row["task_id"]), []).append(int(row["id"]))
-    for stale_task_id, stale_ids in by_task.items():
-        _append_event(
-            conn,
-            stale_task_id,
-            "loop_handoff_superseded",
-            {"handoff_ids": stale_ids, "reason": reason},
-        )
-    return ids
-
-
-def _loop_handoff_dependency_depths(
-    conn: sqlite3.Connection, task_ids: set[str]) -> dict[str, int]:
-    if not task_ids:
-        return {}
-    rows = conn.execute("SELECT parent_id, child_id FROM task_links").fetchall()
-    parents: dict[str, list[str]] = {task_id: [] for task_id in task_ids}
-    for row in rows:
-        if row["child_id"] in task_ids and row["parent_id"] in task_ids:
-            parents.setdefault(row["child_id"], []).append(row["parent_id"])
-    cache: dict[str, int] = {}
-
-    def depth(task_id: str, visiting: Optional[set[str]] = None) -> int:
-        if task_id in cache:
-            return cache[task_id]
-        visiting = visiting or set()
-        if task_id in visiting:
-            return 0
-        visiting.add(task_id)
-        pids = parents.get(task_id, [])
-        value = 0 if not pids else 1 + max(depth(pid, visiting) for pid in pids)
-        cache[task_id] = value
-        return value
-
-    return {task_id: depth(task_id) for task_id in task_ids}
-
-
-def claim_loop_handoff_batch(
-    conn: sqlite3.Connection,
-    *,
-    tenant: str,
-    root_task_id: str,
-    reviewer_session_id: str,
-    limit: int = 10,
-    batch_id: Optional[str] = None,
-) -> list[dict[str, Any]]:
-    """Disabled compatibility shim for removed Loop foreground handoff reviews."""
-    return []
-
-
-_LOOP_HANDOFF_REVIEW_SOURCE = "kanban-loop-review"
-
-
-def loop_handoff_reviewer_session_id(tenant: Optional[str], root_task_id: str) -> str:
-    """Stable foreground-review session id for one tenant/root handoff lane.
-
-    The scheduler uses the tenant/root pair as the serialization key because
-    ``claim_loop_handoff_batch`` already prevents concurrent active batches for
-    that scope. Hashing keeps the id compact and safe for every SessionDB
-    consumer while preserving a deterministic mapping for resume/reconnect.
-    """
-    key = f"{tenant or ''}\0{root_task_id}"
-    digest = hashlib.sha256(key.encode("utf-8")).hexdigest()[:32]
-    return f"loop-review-{digest}"
-
-
-def _loop_handoff_review_session_title(tenant: Optional[str], root_task_id: str) -> str:
-    tenant_label = tenant or "default"
-    raw = f"Loop review {tenant_label}/{root_task_id}"
-    return raw[:100]
-
-
-def _ensure_loop_handoff_review_session(session_db: Any, *, tenant: Optional[str], root_task_id: str) -> str:
-    session_id = loop_handoff_reviewer_session_id(tenant, root_task_id)
-    model_config = {
-        "_kanban_loop_review": {
-            "tenant": tenant,
-            "root_task_id": root_task_id,
-            "session_key": "tenant/root",
-        }
-    }
-    session_db.create_session(
-        session_id,
-        _LOOP_HANDOFF_REVIEW_SOURCE,
-        model_config=model_config,
-    )
-    try:
-        session_db.reopen_session(session_id)
-    except Exception:
-        pass
-    try:
-        session_db.set_session_title(
-            session_id,
-            _loop_handoff_review_session_title(tenant, root_task_id),
-        )
-    except Exception:
-        pass
-    return session_id
-
-
-def _handoff_visible_summary(handoff: dict[str, Any]) -> Optional[str]:
-    if (
-        str(handoff.get("handoff_kind") or "").strip() == "worker_completed"
-        and str(handoff.get("task_id") or "").strip()
-        and str(handoff.get("task_id") or "").strip() == str(handoff.get("root_task_id") or "").strip()
-    ):
-        return None
-    summary = str(handoff.get("summary") or handoff.get("reason") or "").strip()
-    if not summary:
-        return None
-    return summary.splitlines()[0][:240]
-
-
-def _render_loop_handoff_review_message(
-    *,
-    tenant: Optional[str],
-    root_task_id: str,
-    batch_id: str,
-    handoffs: list[dict[str, Any]],
-) -> str:
-    cards = []
-    for handoff in handoffs:
-        handoff_id = handoff.get("id") if handoff.get("id") is not None else handoff.get("handoff_id")
-        cards.append(
-            {
-                "task_title": handoff.get("task_title") or handoff.get("task_id"),
-                "summary": _handoff_visible_summary(handoff),
-                "action": "Open drawer",
-                "payload_ref": f"loop_handoff:{handoff_id}" if handoff_id is not None else None,
-            }
-        )
-    payload = {
-        "kind": "kanban_loop_handoff_review_batch",
-        "tenant": tenant,
-        "root_task_id": root_task_id,
-        "review_batch_id": batch_id,
-        "handoff_count": len(handoffs),
-        "transcript_card_contract": "handoff-a-minimal",
-        "visible_cards": cards,
-        "instructions": [
-            "Treat visible_cards as transcript artifacts only: title, one-line summary, and Open drawer.",
-            "Do not render or offer mutating decision controls from this transcript message.",
-            "Use each payload_ref to fetch full handoff details from the Loop/Kanban drawer/API before deciding.",
-        ],
-    }
-    return json.dumps(payload, ensure_ascii=False, indent=2, sort_keys=True)
-
-
-def _pending_loop_handoff_review_scopes(conn: sqlite3.Connection) -> list[dict[str, Any]]:
-    rows = conn.execute(
-        """
-        SELECT tenant, root_task_id, MIN(created_at) AS first_created_at, MIN(id) AS first_id
-          FROM loop_handoffs
-         WHERE state IN ('recorded', 'queued', 'batched')
-         GROUP BY tenant, root_task_id
-         ORDER BY first_created_at ASC, first_id ASC
-        """
-    ).fetchall()
-    return [dict(row) for row in rows]
-
-
-def _loop_handoff_origin_session_candidates(
-    conn: sqlite3.Connection,
-    *,
-    tenant: Optional[str],
-    root_task_id: str,
-) -> list[str]:
-    """Return foreground session ids that may own a pending handoff scope."""
-    candidates: list[str] = []
-    seen: set[str] = set()
-
-    def add(value: Any) -> None:
-        sid = str(value or "").strip()
-        if not sid or sid in seen:
-            return
-        candidates.append(sid)
-        seen.add(sid)
-
-    rows = conn.execute(
-        """
-        SELECT originating_session_id, tenant
-          FROM loop_handoffs
-         WHERE tenant = ?
-           AND root_task_id = ?
-           AND state IN ('recorded', 'queued', 'batched')
-         ORDER BY created_at ASC, id ASC
-        """,
-        (tenant, root_task_id),
-    ).fetchall()
-    for row in rows:
-        add(row["originating_session_id"])
-        # In the desktop/Loop path the tenant is often the originating session
-        # id. Treat it as a candidate, but only a real SessionDB hit below can
-        # make it authoritative; named tenants safely fall through.
-        add(row["tenant"])
-
-    root = conn.execute(
-        "SELECT session_id, tenant FROM tasks WHERE id = ?",
-        (root_task_id,),
-    ).fetchone()
-    if root is not None:
-        add(root["session_id"])
-        add(root["tenant"])
-    return candidates
-
-
-def _live_loop_handoff_session_status(
-    session_db: Any,
-    candidates: Iterable[str],
-    *,
-    session_busy: Optional[Callable[[str], bool]] = None,
-) -> tuple[Optional[str], bool]:
-    """Pick the live foreground session/tip and report whether it is busy.
-
-    Handoffs should return to the originating foreground conversation when it
-    is still live. If that conversation was compacted, route to the current
-    compression tip. Ended non-compression sessions are not treated as live;
-    those use the dedicated tenant-review fallback.
-    """
-    for session_id in candidates:
-        try:
-            if not session_db.get_session(session_id):
-                continue
-        except Exception:
-            continue
-        try:
-            lineage = session_db.get_compression_lineage_root_to_tip(session_id)
-        except Exception:
-            lineage = [session_id]
-        for candidate in reversed(lineage or [session_id]):
-            try:
-                row = session_db.get_session(candidate)
-            except Exception:
-                row = None
-            if row and row.get("ended_at") is None:
-                if session_busy is not None:
-                    try:
-                        if session_busy(candidate):
-                            return candidate, True
-                    except Exception:
-                        _log.debug("loop handoff session busy check failed", exc_info=True)
-                return candidate, False
-    return None, False
-
-
-def _live_loop_handoff_session_id(session_db: Any, candidates: Iterable[str]) -> Optional[str]:
-    """Pick the live foreground session/tip for candidate ids, if any."""
-    live_session_id, busy = _live_loop_handoff_session_status(session_db, candidates)
-    return None if busy else live_session_id
-
-
-def _current_session_profile_name() -> str:
-    """Best-effort profile name for the SessionDB opened by SessionDB()."""
-    home = str(os.environ.get("HERMES_HOME") or "").strip()
-    if home:
-        try:
-            path = Path(home).expanduser()
-            if path.parent.name == "profiles" and path.name:
-                return path.name
-        except Exception:
-            pass
-    return "default"
-
-
-def _loop_handoff_review_target(
-    conn: sqlite3.Connection,
-    *,
-    tenant: Optional[str],
-    root_task_id: str,
-    session_db: Any = None,
-    session_busy: Optional[Callable[[str], bool]] = None,
-    defer_live_foreground: bool = False,
-    required_live_session_id: Optional[str] = None,
-) -> Optional[tuple[Any, str, str, str]]:
-    """Resolve where a foreground handoff batch should be injected.
-
-    Prefer the live originating/root foreground session (or its compression
-    tip). If none is live, create/resume the deterministic tenant-review
-    session in the reviewer profile DB so the reviewer subprocess can resume it.
-
-    ``defer_live_foreground`` is used by background schedulers: a pending
-    handoff for a still-live foreground session must remain queued until that
-    foreground runtime reaches an idle boundary and can run the turn in-process.
-    ``required_live_session_id`` is used by that foreground runtime to claim
-    only handoffs that target its own live session; it never falls back to the
-    dedicated reviewer route.
-    """
-    from hermes_state import SessionDB
-
-    try:
-        default_session_db = session_db or SessionDB()
-    except Exception:
-        default_session_db = None
-    live_session_id = None
-    live_session_busy = False
-    if default_session_db is not None:
-        live_session_id, live_session_busy = _live_loop_handoff_session_status(
-            default_session_db,
-            _loop_handoff_origin_session_candidates(
-                conn,
-                tenant=tenant,
-                root_task_id=root_task_id,
-            ),
-            session_busy=session_busy,
-        )
-    required_live_session_id = str(required_live_session_id or "").strip() or None
-    if live_session_busy:
-        return None
-    if live_session_id:
-        if required_live_session_id and live_session_id != required_live_session_id:
-            return None
-        if defer_live_foreground:
-            return None
-        return default_session_db, live_session_id, _current_session_profile_name(), "foreground"
-
-    if required_live_session_id:
-        return None
-
-    if session_db is not None:
-        reviewer_session_id = _ensure_loop_handoff_review_session(
-            session_db,
-            tenant=tenant,
-            root_task_id=root_task_id,
-        )
-        return session_db, reviewer_session_id, _current_session_profile_name(), "dedicated"
-
-    reviewer_profile = _loop_handoff_reviewer_profile()
-    reviewer_session_db = _loop_handoff_reviewer_session_db(reviewer_profile)
-    reviewer_session_id = _ensure_loop_handoff_review_session(
-        reviewer_session_db,
-        tenant=tenant,
-        root_task_id=root_task_id,
-    )
-    return reviewer_session_db, reviewer_session_id, reviewer_profile, "dedicated"
-
-
-def claim_next_loop_handoff_review_batch(
-    conn: sqlite3.Connection,
-    *,
-    session_db: Any = None,
-    limit: int = 10,
-    session_busy: Optional[Callable[[str], bool]] = None,
-    defer_live_foreground: bool = False,
-    required_live_session_id: Optional[str] = None,
-) -> Optional[dict[str, Any]]:
-    """Disabled: foreground Loop handoff review lanes were removed."""
-    return None
-
-
-def _loop_handoff_review_runner_prompt(batch: dict[str, Any]) -> str:
-    """Compatibility prompt for removed Loop handoff review sessions."""
-    return "Loop foreground handoff review lanes were removed. No action is required."
-
-
-def _append_loop_handoff_review_run_events(
-    conn: sqlite3.Connection,
-    batch: dict[str, Any],
-    *,
-    runner_result: Optional[dict[str, Any]] = None,
-    error: Optional[str] = None,
-) -> None:
-    """Audit that a claimed batch was handed to an execution/resume path."""
-    payload: dict[str, Any] = {
-        "tenant": batch.get("tenant"),
-        "root_task_id": batch.get("root_task_id"),
-        "reviewer_session_id": batch.get("reviewer_session_id"),
-        "reviewer_profile": batch.get("reviewer_profile"),
-        "review_route": batch.get("review_route"),
-        "review_batch_id": batch.get("review_batch_id"),
-        "review_message_id": batch.get("review_message_id"),
-    }
-    if runner_result is not None:
-        payload["runner_ok"] = bool(runner_result.get("ok", True))
-        if runner_result.get("outcome") is not None:
-            payload["runner_outcome"] = runner_result.get("outcome")
-        if runner_result.get("pid") is not None:
-            payload["runner_pid"] = runner_result.get("pid")
-        if runner_result.get("mode") is not None:
-            payload["runner_mode"] = runner_result.get("mode")
-    if error:
-        payload["runner_ok"] = False
-        payload["runner_error"] = str(error)
-    with write_txn(conn):
-        for handoff in batch.get("handoffs") or []:
-            _append_event(
-                conn,
-                handoff["task_id"],
-                "loop_handoff_review_run",
-                payload,
-                run_id=handoff.get("run_id"),
-            )
-
-
-def run_next_loop_handoff_review_batch(
-    conn: sqlite3.Connection,
-    *,
-    session_db: Any = None,
-    limit: int = 10,
-    session_busy: Optional[Callable[[str], bool]] = None,
-    defer_live_foreground: bool = False,
-    required_live_session_id: Optional[str] = None,
-    review_runner: Any,
-) -> Optional[dict[str, Any]]:
-    """Disabled: foreground Loop handoff review lanes were removed."""
-    return None
-
-
-def _loop_handoff_reviewer_profile() -> str:
-    """Compatibility default for removed Loop handoff reviewer subprocesses."""
-    return "reviewer-qa"
-
-
-def _loop_handoff_reviewer_session_db(profile: Optional[str] = None) -> Any:
-    """Return a SessionDB for legacy callers; review subprocesses are disabled."""
-    from hermes_state import SessionDB
-
-    profile_arg = (profile or _loop_handoff_reviewer_profile()).strip() or "reviewer-qa"
-    try:
-        from hermes_cli.profiles import normalize_profile_name, resolve_profile_env
-        profile_arg = normalize_profile_name(profile_arg)
-        profile_home = Path(resolve_profile_env(profile_arg))
-    except FileNotFoundError:
-        return SessionDB()
-    except Exception:
-        return SessionDB()
-    return SessionDB(db_path=profile_home / "state.db")
-
-
-def start_loop_handoff_review_process(
-    batch: dict[str, Any],
-    *,
-    board: Optional[str] = None,
-    profile: Optional[str] = None,
-) -> dict[str, Any]:
-    """Disabled compatibility shim for removed Loop foreground handoff reviews."""
-    return {
-        "ok": False,
-        "outcome": "disabled",
-        "reason": "Loop foreground handoff review lanes were removed",
     }
 
 
@@ -5245,23 +4530,6 @@ def review_loop_handoff_autonomous_action(
         "created_cards": created_cards,
         "notification": {"level": "quiet", "state": notification_state},
     }
-
-def _append_loop_foreground_handoff_event(
-    conn: sqlite3.Connection,
-    task_id: str,
-    *,
-    root_task_id: str,
-    handoff_kind: str,
-    run_id: Optional[int],
-    source_event_id: Optional[int] = None,
-    summary: Optional[str] = None,
-    reason: Optional[str] = None,
-    metadata: Optional[dict] = None,
-    created_cards: Optional[Iterable[str]] = None,
-) -> dict[str, Any]:
-    """No-op compatibility shim: foreground handoffs were removed."""
-    return {}
-
 
 def _end_run(
     conn: sqlite3.Connection,
@@ -6223,14 +5491,6 @@ def complete_task(
             )
         if cur.rowcount != 1:
             return False
-        loop_root_task_id = _loop_root_for_task(conn, task_id)
-        _supersede_pending_loop_handoffs(
-            conn,
-            task_id,
-            reason="task completed before pending block handoff review",
-            handoff_kinds=("worker_blocked",),
-            now=now,
-        )
         run_id = _end_run(
             conn, task_id,
             outcome="completed", status="done",
@@ -6260,12 +5520,6 @@ def complete_task(
         }
         if verified_cards:
             completed_payload["verified_cards"] = verified_cards
-        should_emit_loop_handoff = _should_emit_loop_foreground_handoff(
-            conn,
-            task_id,
-            root_task_id=loop_root_task_id,
-            handoff_kind="worker_completed",
-        )
         # Carry artifact paths in the event payload so the gateway
         # notifier can upload them as native attachments alongside the
         # completion message. Workers pass these via
@@ -6280,23 +5534,11 @@ def complete_task(
                 ]
                 if cleaned_artifacts:
                     completed_payload["artifacts"] = cleaned_artifacts
-        completed_event_id = _append_event(
+        _append_event(
             conn, task_id, "completed",
             completed_payload,
             run_id=run_id,
         )
-        if should_emit_loop_handoff:
-            _append_loop_foreground_handoff_event(
-                conn,
-                task_id,
-                root_task_id=loop_root_task_id,
-                handoff_kind="worker_completed",
-                run_id=run_id,
-                source_event_id=completed_event_id,
-                summary=summary if summary is not None else result,
-                metadata=metadata,
-                created_cards=verified_cards,
-            )
     # Prose-scan the summary + result for t_<hex> references that do
     # not resolve. Advisory — does not block the completion. Runs in
     # its own txn so the completion itself is already durable by the
@@ -6324,11 +5566,7 @@ def complete_task(
     # care about", and a success resets that question.
     _clear_failure_counter(conn, task_id)
     # Recompute ready status for dependents (separate txn so children see done).
-    # Loop root/final completions hand control back to foreground first; routine
-    # child completions may release their own dependents without injecting a
-    # foreground transcript handoff.
-    if not should_emit_loop_handoff:
-        recompute_ready(conn)
+    recompute_ready(conn)
     # Clean up the scratch workspace and any stale tmux session for the worker.
     _cleanup_workspace(conn, task_id)
     _done_task = get_task(conn, task_id)
@@ -6751,7 +5989,6 @@ def block_task(
             )
         if cur.rowcount != 1:
             return False
-        loop_root_task_id = _loop_root_for_task(conn, task_id)
         run_id = _end_run(
             conn, task_id,
             outcome="blocked", status="blocked",
@@ -6772,27 +6009,7 @@ def block_task(
         ev_summary = ev_summary.strip().splitlines()[0][:400] if ev_summary else ""
         if ev_summary:
             blocked_payload["summary"] = ev_summary
-        blocked_event_id = _append_event(conn, task_id, "blocked", blocked_payload, run_id=run_id)
-        should_emit_loop_handoff = _should_emit_loop_foreground_handoff(
-            conn,
-            task_id,
-            root_task_id=loop_root_task_id,
-            handoff_kind="worker_blocked",
-            reason=reason,
-            metadata=metadata,
-        )
-        if should_emit_loop_handoff:
-            _append_loop_foreground_handoff_event(
-                conn,
-                task_id,
-                root_task_id=loop_root_task_id or "",
-                handoff_kind="worker_blocked",
-                run_id=run_id,
-                source_event_id=blocked_event_id,
-                summary=summary,
-                reason=reason,
-                metadata=metadata,
-            )
+        _append_event(conn, task_id, "blocked", blocked_payload, run_id=run_id)
         return True
 
 
@@ -6897,13 +6114,6 @@ def request_review_task(
             )
         if cur.rowcount != 1:
             return False
-        if status == "blocked":
-            _supersede_pending_loop_handoffs(
-                conn,
-                task_id,
-                reason="task routed to review lane",
-                handoff_kinds=("worker_blocked",),
-            )
         review_metadata = dict(metadata or {})
         routing_metadata = {
             "review_kind": review_kind,
@@ -7254,13 +6464,6 @@ def unblock_task(conn: sqlite3.Connection, task_id: str) -> bool:
         )
         if cur.rowcount != 1:
             return False
-        _supersede_pending_loop_handoffs(
-            conn,
-            task_id,
-            reason="task unblocked before pending block handoff review",
-            handoff_kinds=("worker_blocked",),
-            now=now,
-        )
         _append_event(
             conn, task_id, "unblocked",
             {"status": new_status} if new_status != "ready" else None,
@@ -9020,80 +8223,6 @@ def detect_crashed_workers(conn: sqlite3.Connection) -> list[str]:
     return crashed
 
 
-def _loop_child_failure_handoff_exists(
-    conn: sqlite3.Connection,
-    *,
-    task_id: str,
-    root_task_id: str,
-    handoff_kind: str,
-) -> bool:
-    """Return True when a non-terminal child-failure handoff already exists."""
-    terminal_placeholders = ",".join("?" for _ in _LOOP_HANDOFF_TERMINAL_STATES)
-    row = conn.execute(
-        "SELECT 1 FROM loop_handoffs "
-        "WHERE root_task_id = ? AND task_id = ? AND handoff_kind = ? "
-        f"AND state NOT IN ({terminal_placeholders}) LIMIT 1",
-        (root_task_id, task_id, handoff_kind, *_LOOP_HANDOFF_TERMINAL_STATES),
-    ).fetchone()
-    return row is not None
-
-
-def _append_loop_child_gave_up_handoff(
-    conn: sqlite3.Connection,
-    task_id: str,
-    *,
-    root_task_id: str,
-    run_id: Optional[int],
-    source_event_id: Optional[int],
-    payload: dict[str, Any],
-) -> None:
-    """Surface a Loop child circuit-breaker failure to the foreground lane."""
-    handoff_kind = "worker_gave_up"
-    if _loop_child_failure_handoff_exists(
-        conn,
-        task_id=task_id,
-        root_task_id=root_task_id,
-        handoff_kind=handoff_kind,
-    ):
-        return
-
-    task_row = conn.execute(
-        "SELECT tenant, session_id FROM tasks WHERE id = ?",
-        (task_id,),
-    ).fetchone()
-    tenant = task_row["tenant"] if task_row else None
-    child_session_id = (
-        task_row["session_id"]
-        if task_row and "session_id" in task_row.keys()
-        else None
-    )
-    originating_session_id = _lineage_session_id(conn, task_id, root_task_id=root_task_id)
-    trigger_outcome = str(payload.get("trigger_outcome") or "failure")
-    metadata = {
-        "failed_task_id": task_id,
-        "loop_root_task_id": root_task_id,
-        "board": get_current_board(),
-        "tenant": tenant,
-        "originating_session_id": originating_session_id,
-        "child_session_id": child_session_id,
-        "latest_failure": dict(payload),
-    }
-    reason = (
-        f"Loop child task gave up after {trigger_outcome} "
-        "before completing or blocking."
-    )
-    _append_loop_foreground_handoff_event(
-        conn,
-        task_id,
-        root_task_id=root_task_id,
-        handoff_kind=handoff_kind,
-        run_id=run_id,
-        source_event_id=source_event_id,
-        reason=reason,
-        metadata=metadata,
-    )
-
-
 def _record_task_failure(
     conn: sqlite3.Connection,
     task_id: str,
@@ -9208,23 +8337,7 @@ def _record_task_failure(
             }
             if event_payload_extra:
                 payload.update(event_payload_extra)
-            gave_up_event_id = _append_event(
-                conn, task_id, "gave_up", payload, run_id=run_id,
-            )
-            loop_root_task_id = _loop_root_for_task(conn, task_id)
-            if loop_root_task_id and not _is_loop_root_handoff_source(
-                conn,
-                task_id,
-                root_task_id=loop_root_task_id,
-            ):
-                _append_loop_child_gave_up_handoff(
-                    conn,
-                    task_id,
-                    root_task_id=loop_root_task_id,
-                    run_id=run_id,
-                    source_event_id=gave_up_event_id,
-                    payload=payload,
-                )
+            _append_event(conn, task_id, "gave_up", payload, run_id=run_id)
             blocked = True
         else:
             # Below threshold.
