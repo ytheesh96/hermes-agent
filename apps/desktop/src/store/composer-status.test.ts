@@ -263,6 +263,54 @@ describe('reconcileKanbanSessionSource', () => {
     ])
   })
 
+  it('keeps a subscribed root task in Tasks when the root itself has an active worker and graph links', () => {
+    reconcileKanbanSessionSource(SID, {
+      session_id: SID,
+      tasks: [
+        {
+          created_by: 'loop_delegation:agent',
+          id: 't_root',
+          session_id: SID,
+          status: 'running',
+          title: 'Subscribed linked root',
+          included_parent_ids: [],
+          included_child_ids: ['t_child']
+        },
+        {
+          id: 't_child',
+          session_id: SID,
+          status: 'ready',
+          title: 'Root child',
+          included_parent_ids: ['t_root'],
+          included_child_ids: []
+        }
+      ],
+      workers: [
+        {
+          current_tool: 'search_files',
+          profile: 'default',
+          run_id: 43,
+          status: 'running',
+          task_id: 't_root',
+          task_status: 'running',
+          task_title: 'Subscribed linked root',
+          worker_session_id: 'worker-session-root'
+        }
+      ]
+    })
+
+    const items = $kanbanStatusBySession.get()[SID] ?? []
+    const groups = groupStatusItems(items)
+
+    expect(groups.map(group => group.type)).toEqual(['todo', 'subagent'])
+    expect(groups[0]!.items.map(item => [item.id, item.kanbanTaskId, item.title, item.currentTool])).toEqual([
+      ['kanban-task:t_root', 't_root', 'Subscribed linked root', 'Loop']
+    ])
+    expect(groups[1]!.items.map(item => [item.id, item.kanbanTaskId, item.sessionId, item.profile, item.currentTool])).toEqual([
+      ['kanban-agent:t_root:43', 't_root', 'worker-session-root', 'default', 'Search Files']
+    ])
+  })
+
   it('clears stale Kanban rows when session-source metadata disappears', () => {
     reconcileKanbanSessionSource(SID, { tasks: [{ id: 't_running', status: 'running', title: 'Running' }] })
     reconcileKanbanSessionSource(SID, null)

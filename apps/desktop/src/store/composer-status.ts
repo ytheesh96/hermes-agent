@@ -516,6 +516,13 @@ export function reconcileKanbanSessionSource(sid: string, source: TenantLoopSour
         return true
       }
 
+      // If the backend names a different root, keep the old linked worker as
+      // Subagents-only noise; otherwise a subscribed root that is doing its own
+      // work still belongs in Tasks even when it has graph links.
+      if (!source.root_task_id || source.root_task_id === task.id) {
+        return true
+      }
+
       return (task.included_child_ids?.length ?? 0) === 0 && (task.included_parent_ids?.length ?? 0) === 0
     })
     .map(task => kanbanTaskToItem(task, visibleTasks, activeWorkers))

@@ -150,7 +150,7 @@ export function ComposerStatusStack({ busy, queue, sessionId, onOpenKanbanTask }
             </Button>
           ) : undefined
         }
-        defaultCollapsed={group.type !== 'todo'}
+        defaultCollapsed={group.type === 'background'}
         icon={
           group.type === 'todo' ? (
             <Codicon className="text-muted-foreground/70" name="checklist" size="0.8rem" />
