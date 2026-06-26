@@ -10,8 +10,13 @@ import { $kanbanStatusBySession, reconcileKanbanSessionSourceForComposer } from 
 import { $loopagentsBySession } from '@/store/loopagents'
 import { $previewStatusBySession } from '@/store/preview-status'
 import { $threadScrolledUp } from '@/store/thread-scroll'
+import { openSessionInNewWindow } from '@/store/windows'
 
 import { ComposerStatusStack } from './index'
+
+vi.mock('@/store/windows', () => ({
+  openSessionInNewWindow: vi.fn()
+}))
 
 class ResizeObserverStub {
   disconnect() {}
@@ -164,6 +169,7 @@ describe('ComposerStatusStack Loop/Kanban rows', () => {
     $loopagentsBySession.set({})
     $previewStatusBySession.set({})
     $threadScrolledUp.set(false)
+    vi.mocked(openSessionInNewWindow).mockClear()
   })
 
   it('renders subscribed Loop roots in Tasks and active subscribed workers as visible Subagents rows', () => {
@@ -207,7 +213,7 @@ describe('ComposerStatusStack Loop/Kanban rows', () => {
     expect(screen.getByText('Search Files')).toBeTruthy()
   })
 
-  it('prefers opening durable Loop task rows over worker-session windows when both ids are present', () => {
+  it('opens Loop worker rows with session ids in watch windows before task drawer fallback', () => {
     const onOpenKanbanTask = vi.fn()
 
     $kanbanStatusBySession.set({
@@ -228,7 +234,33 @@ describe('ComposerStatusStack Loop/Kanban rows', () => {
     fireEvent.click(screen.getByRole('button', { name: '1 Subagent' }))
     fireEvent.click(screen.getByRole('button', { name: /Root Loop worker/i }))
 
+    expect(openSessionInNewWindow).toHaveBeenCalledWith('worker-session-77', { watch: true })
+    expect(onOpenKanbanTask).not.toHaveBeenCalled()
+  })
+
+  it('keeps Loop task rows focused on the task drawer even if a session id is present', () => {
+    const onOpenKanbanTask = vi.fn()
+
+    $kanbanStatusBySession.set({
+      'logical-origin': [
+        {
+          id: 'kanban-task:t_root',
+          kanbanTaskId: 't_root',
+          sessionId: 'worker-session-77',
+          state: 'running',
+          title: 'Root Loop task',
+          todoStatus: 'in_progress',
+          type: 'todo'
+        }
+      ]
+    })
+
+    renderStack('logical-origin', onOpenKanbanTask)
+
+    fireEvent.click(screen.getByRole('button', { name: /Root Loop task/i }))
+
     expect(onOpenKanbanTask).toHaveBeenCalledWith('t_root')
+    expect(openSessionInNewWindow).not.toHaveBeenCalled()
   })
 
   it('returns an already-selected Loop root row click to the overview drawer', () => {

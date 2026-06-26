@@ -34,10 +34,10 @@ export interface ComposerStatusItem {
   kanbanTaskId?: string
   /** Kanban worker run id for the durable agent row. */
   runId?: number
-  /** subagent: its own stored session id — ordinary subagent rows open that
-   *  session window (livestreamed by the gateway's child-session mirror).
-   *  Kanban/Loop rows may also carry this durable worker transcript id, but row
-   *  clicks prefer kanbanTaskId so the user lands on the Loop canvas/task first. */
+  /** subagent: its own stored session id — ordinary subagent and Loop worker
+   *  rows open that session window (livestreamed by the gateway's child-session
+   *  mirror). Task/root rows still prefer kanbanTaskId so the user lands on the
+   *  Loop canvas/task first. */
   sessionId?: string
   state: StatusItemState
   /** Shared leading glyph grammar for Loop/Kanban rows. */

@@ -10,16 +10,139 @@ import { type Translations, useI18n } from '@/i18n'
 import { AlertCircle, CheckCircle2 } from '@/lib/icons'
 import { useEnterAnimation } from '@/lib/use-enter-animation'
 import { cn } from '@/lib/utils'
+import { $loopagentsBySession, type LoopagentActivity } from '@/store/loopagents'
 import {
   $subagentsBySession,
   allSubagents,
   buildSubagentTree,
   type SubagentNode,
+  type SubagentProgress,
   type SubagentStatus,
   type SubagentStreamEntry
 } from '@/store/subagents'
 
 import { OverlayView } from '../overlays/overlay-view'
+
+const normalized = (value: unknown): string =>
+  typeof value === 'string' && value.trim() ? value.trim().toLowerCase().replaceAll('-', '_') : ''
+
+const humanToolLabel = (name: string): string =>
+  name
+    .split('_')
+    .filter(Boolean)
+    .map(part => part[0]!.toUpperCase() + part.slice(1))
+    .join(' ') || name
+
+const needsAttentionText = (text: string): boolean =>
+  text.includes('review-required') ||
+  text.includes('review required') ||
+  text.includes('human approval') ||
+  text.includes('needs approval')
+
+function loopagentNeedsAttention(agent: LoopagentActivity): boolean {
+  const status = normalized(agent.status)
+  const taskStatus = normalized(agent.taskStatus)
+
+  const text = [agent.errorPreview, agent.summaryPreview, agent.sourceEvent, agent.taskStatus]
+    .filter(Boolean)
+    .join(' ')
+    .toLowerCase()
+
+  return (
+    status === 'blocked' ||
+    status === 'failed' ||
+    status === 'interrupted' ||
+    taskStatus === 'blocked' ||
+    needsAttentionText(text)
+  )
+}
+
+function loopagentVisibleInSpawnTree(agent: LoopagentActivity): boolean {
+  if (agent.kind !== 'worker') {
+    return false
+  }
+
+  const status = normalized(agent.status)
+
+  return status === 'queued' || status === 'running' || loopagentNeedsAttention(agent)
+}
+
+function loopagentStatus(agent: LoopagentActivity): SubagentStatus {
+  const status = normalized(agent.status)
+
+  if (status === 'interrupted') {
+    return 'interrupted'
+  }
+
+  if (loopagentNeedsAttention(agent)) {
+    return 'failed'
+  }
+
+  if (status === 'completed') {
+    return 'completed'
+  }
+
+  if (status === 'queued') {
+    return 'queued'
+  }
+
+  return 'running'
+}
+
+function loopagentContextLabel(agent: LoopagentActivity): string | undefined {
+  const profile = agent.profile?.trim()
+  const currentTool = agent.currentTool ? humanToolLabel(agent.currentTool) : undefined
+  const session = agent.workerSessionId?.trim()
+  const label = [profile, currentTool, session].filter(Boolean).join(' · ')
+
+  return label || undefined
+}
+
+function loopagentStream(agent: LoopagentActivity, status: SubagentStatus): SubagentStreamEntry[] {
+  const at = agent.updatedAt || Date.now()
+  const currentTool = agent.currentTool ? humanToolLabel(agent.currentTool) : ''
+
+  if (agent.errorPreview) {
+    return [{ at, isError: true, kind: 'progress', text: agent.errorPreview }]
+  }
+
+  if (agent.summaryPreview) {
+    return [{ at, kind: status === 'completed' ? 'summary' : 'progress', text: agent.summaryPreview }]
+  }
+
+  if (currentTool) {
+    return [{ at, kind: 'tool', text: currentTool }]
+  }
+
+  return []
+}
+
+function loopagentToSubagent(agent: LoopagentActivity): SubagentProgress {
+  const status = loopagentStatus(agent)
+
+  return {
+    currentTool: agent.currentTool,
+    filesRead: [],
+    filesWritten: [],
+    goal: agent.title || agent.taskId,
+    id: agent.id,
+    model: loopagentContextLabel(agent),
+    parentId: null,
+    sessionId: agent.workerSessionId,
+    startedAt: agent.updatedAt,
+    status,
+    stream: loopagentStream(agent, status),
+    summary: agent.summaryPreview || agent.errorPreview,
+    taskCount: 1,
+    taskIndex: 0,
+    updatedAt: agent.updatedAt
+  }
+}
+
+const allLoopagentWorkers = (bySession: Record<string, LoopagentActivity[]>): SubagentProgress[] =>
+  Object.values(bySession)
+    .flatMap(list => list.filter(loopagentVisibleInSpawnTree).map(loopagentToSubagent))
+    .sort((a, b) => a.startedAt - b.startedAt || a.goal.localeCompare(b.goal))
 
 // Mirrors statusGlyph() in tool-fallback.tsx so subagent rows speak the
 // same visual vocabulary as the chat tool blocks.
@@ -79,11 +202,15 @@ interface AgentsViewProps {
 export function AgentsView({ onClose }: AgentsViewProps) {
   const { t } = useI18n()
   const subagentsBySession = useStore($subagentsBySession)
+  const loopagentsBySession = useStore($loopagentsBySession)
 
-  // Aggregate every session, matching the status-bar indicator — a subagent
-  // running in a background session must still be visible here, or the two
-  // desync ("Agents N running" vs an empty tree).
-  const tree = useMemo(() => buildSubagentTree(allSubagents(subagentsBySession)), [subagentsBySession])
+  // Aggregate every session's ordinary subagents plus live durable Loop workers;
+  // a Loopagent worker running in the background must not leave the Spawn tree
+  // empty just because it arrived through the Kanban/Loop event feed.
+  const tree = useMemo(
+    () => buildSubagentTree([...allSubagents(subagentsBySession), ...allLoopagentWorkers(loopagentsBySession)]),
+    [loopagentsBySession, subagentsBySession]
+  )
 
   return (
     <OverlayView

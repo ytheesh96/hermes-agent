@@ -69,6 +69,10 @@ function isOpenLocalTodo(item: ComposerStatusItem): boolean {
   )
 }
 
+function isWorkerSessionRow(item: ComposerStatusItem): boolean {
+  return item.type === 'subagent' || item.type === 'kanban-agent'
+}
+
 export function visibleComposerStatusItems(items: readonly ComposerStatusItem[], busy: boolean): ComposerStatusItem[] {
   if (busy) {
     return [...items]
@@ -123,6 +127,12 @@ export function ComposerStatusStack({ busy, queue, sessionId, onOpenKanbanTask }
   const openAgents = () => navigate(AGENTS_ROUTE)
 
   const openStatusItem = (item: ComposerStatusItem) => {
+    if (isWorkerSessionRow(item) && item.sessionId) {
+      void openSessionInNewWindow(item.sessionId, { watch: true })
+
+      return
+    }
+
     if (item.kanbanTaskId && onOpenKanbanTask) {
       onOpenKanbanTask(item.kanbanTaskId)
 

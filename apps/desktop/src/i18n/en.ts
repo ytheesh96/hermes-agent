@@ -742,7 +742,7 @@ export const en: Translations = {
   agents: {
     close: 'Close agents',
     title: 'Spawn tree',
-    subtitle: 'Live subagent activity for the current turn.',
+    subtitle: 'Live agent activity for this session.',
     emptyTitle: 'No live subagents',
     emptyDesc: 'When a turn delegates work, child agents stream their progress here.',
     running: 'Running',
