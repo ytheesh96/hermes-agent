@@ -1,27 +1,23 @@
 import { useStore } from '@nanostores/react'
-import { useQuery } from '@tanstack/react-query'
 import { type ReactNode, useEffect, useMemo, useState } from 'react'
 
-import { type LoopWorkerRun, normalizeLoopWorkers } from '@/app/chat/loop-state'
 import { useElapsedSeconds } from '@/components/chat/activity-timer'
 import { ActivityTimerText } from '@/components/chat/activity-timer-text'
+import { Codicon } from '@/components/ui/codicon'
 import { FadeText } from '@/components/ui/fade-text'
 import { GlyphSpinner } from '@/components/ui/glyph-spinner'
-import { getLoopSessionSource } from '@/hermes'
 import { type Translations, useI18n } from '@/i18n'
-import { AlertCircle, CheckCircle2, Sparkles } from '@/lib/icons'
+import { AlertCircle, CheckCircle2 } from '@/lib/icons'
 import { useEnterAnimation } from '@/lib/use-enter-animation'
 import { cn } from '@/lib/utils'
-import { $activeGatewayProfile } from '@/store/profile'
-import { $activeSessionId } from '@/store/session'
 import {
   $subagentsBySession,
+  allSubagents,
   buildSubagentTree,
   type SubagentNode,
   type SubagentStatus,
   type SubagentStreamEntry
 } from '@/store/subagents'
-import { openSessionInNewWindow } from '@/store/windows'
 
 import { OverlayView } from '../overlays/overlay-view'
 
@@ -82,24 +78,12 @@ interface AgentsViewProps {
 
 export function AgentsView({ onClose }: AgentsViewProps) {
   const { t } = useI18n()
-  const activeSessionId = useStore($activeSessionId)
-  const activeGatewayProfile = useStore($activeGatewayProfile)
   const subagentsBySession = useStore($subagentsBySession)
 
-  const loopSource = useQuery({
-    enabled: Boolean(activeSessionId),
-    queryFn: () => getLoopSessionSource(activeSessionId!, activeGatewayProfile),
-    queryKey: ['loop-session-source', activeGatewayProfile, activeSessionId],
-    refetchInterval: 5_000
-  })
-
-  const activeSubagents = useMemo(
-    () => (activeSessionId ? (subagentsBySession[activeSessionId] ?? []) : []),
-    [activeSessionId, subagentsBySession]
-  )
-
-  const tree = useMemo(() => buildSubagentTree(activeSubagents), [activeSubagents])
-  const loopWorkers = useMemo(() => normalizeLoopWorkers(loopSource.data), [loopSource.data])
+  // Aggregate every session, matching the status-bar indicator — a subagent
+  // running in a background session must still be visible here, or the two
+  // desync ("Agents N running" vs an empty tree).
+  const tree = useMemo(() => buildSubagentTree(allSubagents(subagentsBySession)), [subagentsBySession])
 
   return (
     <OverlayView
@@ -112,68 +96,8 @@ export function AgentsView({ onClose }: AgentsViewProps) {
         <h2 className="text-sm font-semibold text-foreground">{t.agents.title}</h2>
         <p className="text-xs text-muted-foreground/80">{t.agents.subtitle}</p>
       </header>
-      <SubagentTree loopWorkers={loopWorkers} tree={tree} />
+      <SubagentTree tree={tree} />
     </OverlayView>
-  )
-}
-
-function workerAge(worker: LoopWorkerRun): string {
-  if (worker.state === 'running' && typeof worker.elapsedSeconds === 'number') {
-    return `running ${Math.max(0, Math.round(worker.elapsedSeconds))}s`
-  }
-
-  if (typeof worker.finishedAgeSeconds === 'number') {
-    const seconds = Math.max(0, Math.round(worker.finishedAgeSeconds))
-
-    if (seconds < 60) {
-      return `finished ${seconds}s ago`
-    }
-
-    return `finished ${Math.round(seconds / 60)}m ago`
-  }
-
-  return worker.state
-}
-
-function LoopWorkerRows({ workers }: { workers: readonly LoopWorkerRun[] }) {
-  if (workers.length === 0) {
-    return null
-  }
-
-  return (
-    <section className="grid min-w-0 gap-3">
-      <p className="text-[0.66rem] font-medium uppercase tracking-wider text-muted-foreground/70">Kanban agents</p>
-      <div className="grid min-w-0 gap-3">
-        {workers.map(worker => (
-          <div className="grid min-w-0 gap-1 pl-1" key={`${worker.taskId}:${worker.runId}`}>
-            <button
-              aria-label={
-                worker.workerSessionId
-                  ? `Open worker session for ${worker.taskId}`
-                  : `Inspect worker run #${worker.runId} for ${worker.taskId}`
-              }
-              className="flex min-w-0 items-start gap-2 text-left"
-              onClick={() => {
-                if (worker.workerSessionId) {
-                  void openSessionInNewWindow(worker.workerSessionId, { watch: true })
-                }
-              }}
-              type="button"
-            >
-              <span className="mt-1 size-1.5 shrink-0 rounded-full bg-primary/80" />
-              <span className="min-w-0 flex-1">
-                <span className="block truncate text-[0.82rem] font-medium text-foreground/90">{worker.taskTitle}</span>
-                <span className="block truncate text-[0.66rem] text-muted-foreground/65">
-                  {worker.state} · run #{worker.runId} · {worker.profile || 'worker'} · {workerAge(worker)}
-                </span>
-              </span>
-            </button>
-            {worker.latestText ? <p className="m-0 pl-4 text-[0.72rem] text-muted-foreground/75">{worker.latestText}</p> : null}
-            {!worker.workerSessionId ? <p className="m-0 pl-4 text-[0.68rem] text-muted-foreground/65">No worker session recorded for this run.</p> : null}
-          </div>
-        ))}
-      </div>
-    </section>
   )
 }
 
@@ -260,7 +184,7 @@ function groupDelegations(roots: readonly SubagentNode[]): RootGroup[] {
   return groups
 }
 
-function SubagentTree({ loopWorkers, tree }: { loopWorkers: readonly LoopWorkerRun[]; tree: SubagentNode[] }) {
+function SubagentTree({ tree }: { tree: SubagentNode[] }) {
   const { t } = useI18n()
   const flat = useMemo(() => flatten(tree), [tree])
   const groups = useMemo(() => groupDelegations(tree), [tree])
@@ -283,10 +207,10 @@ function SubagentTree({ loopWorkers, tree }: { loopWorkers: readonly LoopWorkerR
     return () => window.clearInterval(id)
   }, [active])
 
-  if (tree.length === 0 && loopWorkers.length === 0) {
+  if (tree.length === 0) {
     return (
       <div className="grid place-items-center gap-3 py-12 text-center">
-        <Sparkles className="size-6 text-muted-foreground/60" />
+        <Codicon className="text-muted-foreground/60" name="hubot" size="1.5rem" />
         <p className="text-sm font-medium text-foreground/90">{t.agents.emptyTitle}</p>
         <p className="max-w-md text-xs leading-relaxed text-muted-foreground/75">{t.agents.emptyDesc}</p>
       </div>
@@ -308,7 +232,6 @@ function SubagentTree({ loopWorkers, tree }: { loopWorkers: readonly LoopWorkerR
       <p className="shrink-0 text-[0.7rem] text-muted-foreground/70">{summary.join(' · ')}</p>
       <div className="min-h-0 min-w-0 flex-1 overflow-x-hidden overflow-y-auto overscroll-contain pr-1">
         <div className="flex min-w-0 flex-col gap-6">
-          <LoopWorkerRows workers={loopWorkers} />
           {groups.map(group => (
             <DelegationGroup group={group} key={group.id} nowMs={nowMs} />
           ))}

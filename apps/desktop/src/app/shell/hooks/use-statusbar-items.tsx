@@ -1,33 +1,17 @@
 import { useStore } from '@nanostores/react'
-import { useQuery } from '@tanstack/react-query'
 import { useCallback, useMemo } from 'react'
 
-import { loopWorkerCounts, normalizeLoopWorkers } from '@/app/chat/loop-state'
 import type { CommandCenterSection } from '@/app/command-center'
 import { $terminalTakeover, setTerminalTakeover } from '@/app/right-sidebar/store'
 import { GatewayMenuPanel } from '@/app/shell/gateway-menu-panel'
+import { Codicon } from '@/components/ui/codicon'
 import { GlyphSpinner } from '@/components/ui/glyph-spinner'
-import { getLoopSessionSource } from '@/hermes'
 import { useI18n } from '@/i18n'
-import {
-  Activity,
-  AlertCircle,
-  Clock,
-  Command,
-  Hash,
-  Loader2,
-  Sparkles,
-  Terminal,
-  Zap,
-  ZapFilled
-} from '@/lib/icons'
+import { Activity, AlertCircle, Clock, Command, Hash, Loader2, Terminal, Zap, ZapFilled } from '@/lib/icons'
 import type { RuntimeReadinessResult } from '@/lib/runtime-readiness'
 import { contextBarLabel, LiveDuration, usageContextLabel } from '@/lib/statusbar'
 import { cn } from '@/lib/utils'
 import { setGlobalYolo, setSessionYolo } from '@/lib/yolo-session'
-import { $desktopActionTasks } from '@/store/activity'
-import { $previewServerRestartStatus } from '@/store/preview'
-import { $activeGatewayProfile } from '@/store/profile'
 import {
   $activeSessionId,
   $busy,
@@ -35,11 +19,10 @@ import {
   $currentUsage,
   $sessionStartedAt,
   $turnStartedAt,
-  $workingSessionIds,
   $yoloActive,
   setYoloActive
 } from '@/store/session'
-import { $subagentsBySession, activeSubagentCount } from '@/store/subagents'
+import { $subagentsBySession, activeSubagentCount, failedSubagentCount } from '@/store/subagents'
 import { $gatewayRestarting } from '@/store/system-actions'
 import {
   $backendUpdateApply,
@@ -90,17 +73,13 @@ export function useStatusbarItems({
   const { t } = useI18n()
   const copy = t.shell.statusbar
   const activeSessionId = useStore($activeSessionId)
-  const activeGatewayProfile = useStore($activeGatewayProfile)
   const terminalTakeover = useStore($terminalTakeover)
   const yoloActive = useStore($yoloActive)
   const busy = useStore($busy)
   const currentUsage = useStore($currentUsage)
-  const desktopActionTasks = useStore($desktopActionTasks)
   const gatewayRestarting = useStore($gatewayRestarting)
-  const previewServerRestartStatus = useStore($previewServerRestartStatus)
   const sessionStartedAt = useStore($sessionStartedAt)
   const turnStartedAt = useStore($turnStartedAt)
-  const workingSessionIds = useStore($workingSessionIds)
   const subagentsBySession = useStore($subagentsBySession)
   const updateStatus = useStore($updateStatus)
   const updateApply = useStore($updateApply)
@@ -108,15 +87,6 @@ export function useStatusbarItems({
   const backendUpdateApply = useStore($backendUpdateApply)
   const desktopVersion = useStore($desktopVersion)
   const connection = useStore($connection)
-
-  const loopSource = useQuery({
-    enabled: gatewayState === 'open' && Boolean(activeSessionId),
-    queryFn: () => getLoopSessionSource(activeSessionId!, activeGatewayProfile),
-    queryKey: ['loop-session-source', activeGatewayProfile, activeSessionId],
-    refetchInterval: 5_000
-  })
-
-  const loopCounts = useMemo(() => loopWorkerCounts(normalizeLoopWorkers(loopSource.data)), [loopSource.data])
 
   const contextUsage = useMemo(() => usageContextLabel(currentUsage), [currentUsage])
   const contextBar = useMemo(() => contextBarLabel(currentUsage), [currentUsage])
@@ -173,37 +143,17 @@ export function useStatusbarItems({
     [gatewayLogLines, gatewayState, inferenceStatus, openCommandCenterSection, statusSnapshot]
   )
 
-  const { bgFailed, bgRunning, subagentsRunning } = useMemo(() => {
-    const actions = Object.values(desktopActionTasks)
-    const running = actions.filter(t => t.status.running).length
-    const failed = actions.filter(t => !t.status.running && (t.status.exit_code ?? 0) !== 0).length
-    const previewRunning = previewServerRestartStatus === 'running' ? 1 : 0
-    const previewFailed = previewServerRestartStatus === 'error' ? 1 : 0
-
-    const subagentsRunning = Object.values(subagentsBySession).reduce(
-      (sum, items) => sum + activeSubagentCount(items),
-      0
-    )
+  // The indicator must speak the same scope as the Spawn-tree panel it opens:
+  // every session's subagents, never background system actions (gateway
+  // restarts, toolset installs) which surface in their own panels.
+  const { subagentsFailed, subagentsRunning } = useMemo(() => {
+    const lists = Object.values(subagentsBySession)
 
     return {
-      bgFailed: failed + previewFailed,
-      bgRunning: workingSessionIds.length + running + previewRunning,
-      subagentsRunning
+      subagentsFailed: lists.reduce((sum, items) => sum + failedSubagentCount(items), 0),
+      subagentsRunning: lists.reduce((sum, items) => sum + activeSubagentCount(items), 0)
     }
-  }, [desktopActionTasks, previewServerRestartStatus, subagentsBySession, workingSessionIds])
-
-  const agentsAttention = bgFailed + loopCounts.attention
-  const agentsRunning = bgRunning + subagentsRunning + loopCounts.running
-
-  const agentsDetail = [
-    subagentsRunning > 0 ? copy.subagents(subagentsRunning) : '',
-    loopCounts.attention > 0
-      ? `${loopCounts.attention} Loop ${loopCounts.attention === 1 ? 'worker' : 'workers'} need attention`
-      : '',
-    loopCounts.running > 0 ? `${loopCounts.running} Loop ${loopCounts.running === 1 ? 'worker' : 'workers'} running` : '',
-    bgFailed > 0 ? copy.failed(bgFailed) : '',
-    bgRunning > 0 ? copy.running(bgRunning) : ''
-  ].filter(Boolean)
+  }, [subagentsBySession])
 
   const gatewayOpen = gatewayState === 'open'
   const gatewayConnecting = gatewayState === 'connecting'
@@ -348,16 +298,21 @@ export function useStatusbarItems({
       {
         className: cn(
           agentsOpen && 'bg-accent/55 text-foreground',
-          agentsAttention > 0 && 'text-destructive hover:text-destructive'
+          subagentsFailed > 0 && 'text-destructive hover:text-destructive'
         ),
-        detail: agentsDetail.length ? agentsDetail.join(' · ') : undefined,
+        detail:
+          subagentsRunning > 0
+            ? copy.subagents(subagentsRunning)
+            : subagentsFailed > 0
+              ? copy.failed(subagentsFailed)
+              : undefined,
         icon:
-          agentsAttention > 0 ? (
+          subagentsFailed > 0 ? (
             <AlertCircle className="size-3" />
-          ) : agentsRunning > 0 ? (
+          ) : subagentsRunning > 0 ? (
             <Loader2 className="size-3 animate-spin" />
           ) : (
-            <Sparkles className="size-3" />
+            <Codicon name="hubot" size="0.75rem" />
           ),
         id: 'agents',
         label: copy.agents,
@@ -376,9 +331,6 @@ export function useStatusbarItems({
     ],
     [
       agentsOpen,
-      agentsAttention,
-      agentsDetail,
-      agentsRunning,
       commandCenterOpen,
       copy,
       gatewayMenuContent,
@@ -388,6 +340,8 @@ export function useStatusbarItems({
       inferenceReady,
       inferenceStatus?.reason,
       openAgents,
+      subagentsFailed,
+      subagentsRunning,
       toggleCommandCenter
     ]
   )

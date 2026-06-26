@@ -3,13 +3,7 @@ import { cleanup, render, renderHook } from '@testing-library/react'
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 
 import { getGlobalModelInfo, getGlobalModelOptions } from '@/hermes'
-import {
-  $activeSessionId,
-  $currentModel,
-  $currentProvider,
-  setCurrentModel,
-  setCurrentProvider
-} from '@/store/session'
+import { $activeSessionId, $currentModel, $currentProvider, setCurrentModel, setCurrentProvider } from '@/store/session'
 
 import { useModelControls } from './use-model-controls'
 
@@ -18,7 +12,6 @@ const notifyError = vi.fn()
 
 vi.mock('@/hermes', () => ({
   getGlobalModelInfo: vi.fn(),
-  getGlobalModelOptions: vi.fn(),
   setGlobalModel: (...args: Parameters<typeof setGlobalModel>) => setGlobalModel(...args)
 }))
 
@@ -63,7 +56,6 @@ describe('useModelControls', () => {
     $activeSessionId.set(null)
     setCurrentModel('')
     setCurrentProvider('')
-    vi.mocked(getGlobalModelOptions).mockResolvedValue({ providers: [] } as never)
   })
 
   afterEach(() => {
@@ -122,11 +114,7 @@ describe('useModelControls', () => {
     let controls!: Controls
 
     render(
-      <Harness
-        activeSessionId="session-1"
-        onReady={value => (controls = value)}
-        requestGateway={requestGateway}
-      />
+      <Harness activeSessionId="session-1" onReady={value => (controls = value)} requestGateway={requestGateway} />
     )
 
     await expect(
@@ -148,13 +136,7 @@ describe('useModelControls', () => {
     const requestGateway = vi.fn()
     let controls!: Controls
 
-    render(
-      <Harness
-        activeSessionId={null}
-        onReady={value => (controls = value)}
-        requestGateway={requestGateway}
-      />
-    )
+    render(<Harness activeSessionId={null} onReady={value => (controls = value)} requestGateway={requestGateway} />)
 
     await expect(
       controls.selectModel({
@@ -196,29 +178,5 @@ describe('useModelControls', () => {
     // A profile swap forces a reseed to the new profile's default.
     await result.current.refreshCurrentModel(true)
     expect($currentModel.get()).toBe('openai/gpt-5.5')
-  })
-
-  it('repairs a stale composer provider when the current model belongs elsewhere', async () => {
-    setCurrentModel('gpt-5.5')
-    setCurrentProvider('nous')
-    vi.mocked(getGlobalModelOptions).mockResolvedValue({
-      providers: [
-        { authenticated: true, models: ['openai/gpt-5.5', 'stepfun/step-3.7-flash:free'], slug: 'nous' },
-        { authenticated: true, models: ['gpt-5.5'], slug: 'openai-codex' }
-      ]
-    } as never)
-
-    const { result } = renderHook(() =>
-      useModelControls({
-        activeSessionId: null,
-        queryClient: new QueryClient(),
-        requestGateway: vi.fn()
-      })
-    )
-
-    await result.current.refreshCurrentModel()
-
-    expect($currentModel.get()).toBe('gpt-5.5')
-    expect($currentProvider.get()).toBe('openai-codex')
   })
 })

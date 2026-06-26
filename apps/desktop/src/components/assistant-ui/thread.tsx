@@ -11,7 +11,6 @@ import {
   useMessageRuntime
 } from '@assistant-ui/react'
 import { useStore } from '@nanostores/react'
-import { IconPlayerStopFilled } from '@tabler/icons-react'
 import {
   type ClipboardEvent,
   type ComponentProps,
@@ -92,19 +91,25 @@ import { attachmentDisplayText, attachmentId, pathLabel } from '@/lib/chat-runti
 import { DATA_IMAGE_URL_RE } from '@/lib/embedded-images'
 import { LinkifiedText } from '@/lib/external-link'
 import { triggerHaptic } from '@/lib/haptics'
-import { GitBranchIcon, Loader2Icon, Volume2Icon, VolumeXIcon, XIcon } from '@/lib/icons'
+import { GitBranchIcon, Loader2Icon, StopFilled, Volume2Icon, VolumeXIcon, XIcon } from '@/lib/icons'
 import { extractPreviewTargets } from '@/lib/preview-targets'
 import { useEnterAnimation } from '@/lib/use-enter-animation'
 import { cn } from '@/lib/utils'
 import { playSpeechText, stopVoicePlayback } from '@/lib/voice-playback'
+import { $backgroundResume } from '@/store/background-delegation'
 import { $compactionActive } from '@/store/compaction'
 import type { ComposerAttachment } from '@/store/composer'
 import { notifyError } from '@/store/notifications'
+import { $activeSessionAwaitingInput } from '@/store/prompts'
 import { $connection } from '@/store/session'
 import { notifyThreadEditClose, notifyThreadEditOpen } from '@/store/thread-scroll'
 import { $voicePlayback } from '@/store/voice-playback'
 
 type ThreadLoadingState = 'response' | 'session'
+interface RestoreMessageTarget {
+  text: string
+  userOrdinal: number | null
+}
 
 interface MessageActionProps {
   messageId: string
@@ -172,7 +177,7 @@ export const Thread: FC<{
   onCancel?: () => Promise<void> | void
   onDismissError?: (messageId: string) => void
   onOpenKanbanTask?: (taskId: string) => void
-  onRestoreToMessage?: (messageId: string) => Promise<void> | void
+  onRestoreToMessage?: (messageId: string, target?: RestoreMessageTarget) => Promise<void> | void
   sessionId?: string | null
   sessionKey?: string | null
 }> = ({
@@ -189,16 +194,58 @@ export const Thread: FC<{
   sessionId = null,
   sessionKey
 }) => {
+  const { t } = useI18n()
+  const copy = t.assistant.thread
+
+  const [restoreConfirmTarget, setRestoreConfirmTarget] = useState<
+    (RestoreMessageTarget & { messageId: string }) | null
+  >(null)
+
+  const closeRestoreConfirm = useCallback(() => setRestoreConfirmTarget(null), [])
+
+  const confirmRestore = useCallback(() => {
+    if (!restoreConfirmTarget || !onRestoreToMessage) {
+      throw new Error('Restore is unavailable for this message.')
+    }
+
+    const { messageId, text, userOrdinal } = restoreConfirmTarget
+
+    closeRestoreConfirm()
+    void Promise.resolve(onRestoreToMessage(messageId, { text, userOrdinal })).catch((error: unknown) => {
+      notifyError(error, 'Restore failed')
+    })
+  }, [closeRestoreConfirm, onRestoreToMessage, restoreConfirmTarget])
+
+  const requestRestoreConfirm = useCallback((messageId: string, target: RestoreMessageTarget) => {
+    setRestoreConfirmTarget({ messageId, ...target })
+  }, [])
+
   const messageComponents = useMemo(
     () => ({
-      AssistantMessage: () => <AssistantMessage onBranchInNewChat={onBranchInNewChat} onDismissError={onDismissError} />,
+      AssistantMessage: () => (
+        <AssistantMessage onBranchInNewChat={onBranchInNewChat} onDismissError={onDismissError} />
+      ),
       SystemMessage,
       UserEditComposer: () => <UserEditComposer cwd={cwd} gateway={gateway} sessionId={sessionId} />,
       UserMessage: () => (
-        <UserMessage onCancel={onCancel} onOpenKanbanTask={onOpenKanbanTask} onRestoreToMessage={onRestoreToMessage} />
+        <UserMessage
+          onCancel={onCancel}
+          onOpenKanbanTask={onOpenKanbanTask}
+          onRequestRestoreConfirm={onRestoreToMessage ? requestRestoreConfirm : undefined}
+        />
       )
     }),
-    [cwd, gateway, onBranchInNewChat, onCancel, onDismissError, onOpenKanbanTask, onRestoreToMessage, sessionId]
+    [
+      cwd,
+      gateway,
+      onBranchInNewChat,
+      onCancel,
+      onDismissError,
+      onOpenKanbanTask,
+      onRestoreToMessage,
+      requestRestoreConfirm,
+      sessionId
+    ]
   )
 
   const emptyPlaceholder = intro ? (
@@ -213,11 +260,20 @@ export const Thread: FC<{
         clampToComposer={clampToComposer}
         components={messageComponents}
         emptyPlaceholder={emptyPlaceholder}
-        loadingIndicator={loading === 'response' ? <ResponseLoadingIndicator /> : null}
+        loadingIndicator={loading === 'response' ? <ResponseLoadingIndicator /> : <BackgroundResumeNotice />}
         sessionKey={sessionKey}
       />
       {loading === 'session' && <CenteredThreadSpinner />}
       <ThreadTimeline />
+      <ConfirmDialog
+        confirmLabel={copy.restoreConfirm}
+        description={copy.restoreBody}
+        destructive
+        onClose={closeRestoreConfirm}
+        onConfirm={confirmRestore}
+        open={Boolean(restoreConfirmTarget)}
+        title={copy.restoreTitle}
+      />
     </div>
   )
 }
@@ -383,6 +439,36 @@ const ResponseLoadingIndicator: FC = () => {
   )
 }
 
+// Parked-background affordance: a top-level delegate_task runs in the
+// background, so the parent turn ends and the app goes idle while the subagent
+// keeps working and its result re-enters as a fresh turn later. Instead of a
+// spinner (reads as "stuck"), reuse the same compact, centered system-note
+// chrome as the steer / slash-status lines (SystemMessage above) so it sits in
+// the thread like every other meta line. Idle-only (gated upstream). Null when
+// nothing is parked.
+const BackgroundResumeNotice: FC = () => {
+  const { t } = useI18n()
+  const resume = useStore($backgroundResume)
+
+  if (!resume) {
+    return null
+  }
+
+  const label = resume.activity ?? t.assistant.thread.resumeWhenBackgroundDone(resume.count)
+
+  return (
+    <div
+      aria-live="polite"
+      className="flex max-w-[min(86%,44rem)] items-center gap-1.5 self-center px-2 py-0.5 text-[0.6875rem] leading-5 text-muted-foreground/55"
+      data-slot="aui_background-resume"
+      role="status"
+    >
+      <Codicon className="text-muted-foreground/55" name="sync" size="0.75rem" />
+      <span className="shimmer min-w-0 truncate">{label}</span>
+    </div>
+  )
+}
+
 // Seconds of no visible output (text or part count) before a still-running turn
 // is treated as stalled and the thinking indicator returns at the tail.
 const STREAM_STALL_S = 2
@@ -413,6 +499,10 @@ const StreamStallIndicator: FC = () => {
 
   const [stalled, setStalled] = useState(false)
   const compacting = useStore($compactionActive)
+  // A pending clarify / approval / sudo / secret means the turn is paused on the
+  // user, not working — so don't resurrect the "thinking" timer while they
+  // decide (matches the pet's awaitingInput pose taking priority over busy).
+  const awaitingInput = useStore($activeSessionAwaitingInput)
 
   useEffect(() => {
     setStalled(false)
@@ -421,7 +511,7 @@ const StreamStallIndicator: FC = () => {
     return () => window.clearTimeout(id)
   }, [activity])
 
-  const active = stalled || compacting
+  const active = (stalled || compacting) && !awaitingInput
   const elapsed = useElapsedSeconds(active)
 
   if (!active) {
@@ -848,7 +938,7 @@ const USER_ACTION_ICON_BUTTON_CLASS =
   'grid place-items-center rounded-md bg-transparent text-(--ui-text-secondary) transition-colors hover:bg-(--ui-control-active-background) hover:text-foreground disabled:cursor-default disabled:text-(--ui-text-quaternary) disabled:opacity-70'
 
 const USER_ACTION_ICON_SIZE = '0.6875rem'
-const StopGlyph = <IconPlayerStopFilled aria-hidden className="size-3.5 -translate-y-px" />
+const StopGlyph = <StopFilled aria-hidden className="size-3.5 -translate-y-px" />
 
 // Background-process notifications are injected into the conversation as user
 // messages (the agent must react to them, and message-role alternation forbids
@@ -886,139 +976,13 @@ const ProcessNotificationNote: FC<{ text: string }> = ({ text }) => {
   )
 }
 
-type LoopHandoffVisibleCard = {
-  action: string
-  payloadRef: string
-  summary: string
-  taskTitle: string
-}
-
-type LoopHandoffReviewBatch = {
-  handoffCount: number
-  reviewBatchId: string
-  rootTaskId: string
-  tenant: string
-  visibleCards: LoopHandoffVisibleCard[]
-}
-
-function stringField(record: Record<string, unknown>, key: string): string {
-  const value = record[key]
-
-  return typeof value === 'string' ? value.trim() : ''
-}
-
-function parseLoopHandoffReviewBatch(text: string): LoopHandoffReviewBatch | null {
-  let parsed: unknown
-
-  try {
-    parsed = JSON.parse(text.replace(/\u00a0/g, ' '))
-  } catch {
-    return null
-  }
-
-  if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) {
-    return null
-  }
-
-  const record = parsed as Record<string, unknown>
-
-  if (record.kind !== 'kanban_loop_handoff_review_batch') {
-    return null
-  }
-
-  const rootTaskId = stringField(record, 'root_task_id')
-  const visibleCardsRaw = Array.isArray(record.visible_cards) ? record.visible_cards : []
-
-  const visibleCards = visibleCardsRaw
-    .filter((item): item is Record<string, unknown> => Boolean(item) && typeof item === 'object' && !Array.isArray(item))
-    .map(item => ({
-      action: stringField(item, 'action') || 'Open drawer',
-      payloadRef: stringField(item, 'payload_ref'),
-      summary: stringField(item, 'summary'),
-      taskTitle: stringField(item, 'task_title') || rootTaskId || 'Loop handoff'
-    }))
-    .filter(card => card.summary || card.taskTitle || card.payloadRef)
-
-  if (!rootTaskId || visibleCards.length === 0) {
-    return null
-  }
-
-  const handoffCount = typeof record.handoff_count === 'number' ? record.handoff_count : visibleCards.length
-
-  return {
-    handoffCount,
-    reviewBatchId: stringField(record, 'review_batch_id'),
-    rootTaskId,
-    tenant: stringField(record, 'tenant'),
-    visibleCards
-  }
-}
-
-const LoopHandoffReviewBatchCard: FC<{
-  batch: LoopHandoffReviewBatch
-  onOpenKanbanTask?: (taskId: string) => void
-}> = ({ batch, onOpenKanbanTask }) => (
-  <div className="flex w-full justify-center px-2 py-1">
-    <section
-      aria-label="Loop handoff review"
-      className="flex w-full max-w-[min(86%,44rem)] flex-col gap-2 rounded-xl border border-(--ui-stroke-tertiary) bg-(--ui-chat-surface-background) px-3 py-2 text-left shadow-xs"
-      data-testid="loop-handoff-review-batch"
-    >
-      <div className="flex items-center justify-between gap-3 text-[0.6875rem] font-medium uppercase tracking-[0.08em] text-(--ui-text-tertiary)">
-        <span className="flex items-center gap-1.5">
-          <Codicon className="text-(--ui-text-secondary)" name="git-pull-request" size="0.75rem" />
-          Loop handoff review
-        </span>
-        <span>{batch.handoffCount === 1 ? '1 handoff' : `${batch.handoffCount} handoffs`}</span>
-      </div>
-      <div className="flex flex-col gap-2">
-        {batch.visibleCards.map(card => (
-          <article
-            className="rounded-lg border border-(--ui-stroke-tertiary) bg-muted/20 px-3 py-2"
-            data-payload-ref={card.payloadRef || undefined}
-            key={card.payloadRef || `${batch.rootTaskId}:${card.taskTitle}`}
-          >
-            <div className="flex flex-wrap items-start justify-between gap-2">
-              <div className="min-w-0 flex-1">
-                <h3 className="wrap-anywhere text-[0.8125rem] font-medium leading-5 text-foreground">{card.taskTitle}</h3>
-                {card.summary && (
-                  <p className="wrap-anywhere mt-0.5 text-[0.75rem] leading-5 text-(--ui-text-secondary)">{card.summary}</p>
-                )}
-                {card.payloadRef && (
-                  <p className="mt-1 font-mono text-[0.6875rem] leading-4 text-(--ui-text-quaternary)">{card.payloadRef}</p>
-                )}
-              </div>
-              <button
-                aria-label={`Open drawer for ${card.taskTitle}`}
-                className="shrink-0 rounded-md border border-(--ui-stroke-tertiary) px-2 py-1 text-[0.6875rem] font-medium text-(--ui-text-secondary) transition-colors hover:border-(--ui-stroke-secondary) hover:bg-(--ui-control-hover-background) hover:text-foreground disabled:cursor-default disabled:opacity-55"
-                disabled={!onOpenKanbanTask}
-                onClick={() => onOpenKanbanTask?.(batch.rootTaskId)}
-                type="button"
-              >
-                {card.action || 'Open drawer'}
-              </button>
-            </div>
-          </article>
-        ))}
-      </div>
-      {(batch.reviewBatchId || batch.tenant) && (
-        <div className="flex flex-wrap gap-x-3 gap-y-1 text-[0.625rem] leading-4 text-(--ui-text-quaternary)">
-          {batch.reviewBatchId && <span className="font-mono">{batch.reviewBatchId}</span>}
-          {batch.tenant && <span className="font-mono">tenant:{batch.tenant}</span>}
-        </div>
-      )}
-    </section>
-  </div>
-)
-
 const UserMessage: FC<{
   onCancel?: () => Promise<void> | void
   onOpenKanbanTask?: (taskId: string) => void
-  onRestoreToMessage?: (messageId: string) => Promise<void> | void
-}> = ({ onCancel, onOpenKanbanTask, onRestoreToMessage }) => {
+  onRequestRestoreConfirm?: (messageId: string, target: RestoreMessageTarget) => void
+}> = ({ onCancel, onOpenKanbanTask: _onOpenKanbanTask, onRequestRestoreConfirm }) => {
   const { t } = useI18n()
   const copy = t.assistant.thread
-  const [restoreConfirmOpen, setRestoreConfirmOpen] = useState(false)
   const messageId = useAuiState(s => s.message.id)
   const content = useAuiState(s => s.message.content)
   const messageText = messageContentText(content)
@@ -1031,6 +995,24 @@ const UserMessage: FC<{
       if (message.role === 'user') {
         return message.id ?? null
       }
+    }
+
+    return null
+  })
+
+  const runtimeUserOrdinal = useAuiState(s => {
+    let ordinal = 0
+
+    for (const message of s.thread.messages) {
+      if (message.role !== 'user') {
+        continue
+      }
+
+      if (message.id === s.message.id) {
+        return ordinal
+      }
+
+      ordinal += 1
     }
 
     return null
@@ -1100,27 +1082,13 @@ const UserMessage: FC<{
     )
   }
 
-  const handoffBatch = parseLoopHandoffReviewBatch(messageText.trim())
-
-  if (handoffBatch) {
-    return (
-      <MessagePrimitive.Root
-        className="flex w-full min-w-0 flex-col items-stretch"
-        data-role="user"
-        data-slot="aui_user-message-root"
-      >
-        <LoopHandoffReviewBatchCard batch={handoffBatch} onOpenKanbanTask={onOpenKanbanTask} />
-      </MessagePrimitive.Root>
-    )
-  }
-
   const hasBody = messageText.trim().length > 0
   const isLatestUser = messageId === latestUserId
   const showStop = isLatestUser && threadRunning && Boolean(onCancel)
   // Restore (re-run this exact prompt) is available everywhere the Stop button
   // isn't — including mid-stream on older prompts, since the action interrupts
   // the live turn before rewinding.
-  const showRestore = !showStop && Boolean(onRestoreToMessage) && hasBody
+  const showRestore = !showStop && Boolean(onRequestRestoreConfirm) && hasBody
 
   const bubbleClassName = cn(
     USER_BUBBLE_BASE_CLASS,
@@ -1145,7 +1113,6 @@ const UserMessage: FC<{
   return (
     <MessagePrimitive.Root asChild>
       <StickyHumanMessageContainer
-        messageId={messageId}
         attachments={
           // Attachments live BELOW the sticky bubble in normal flow, so they
           // scroll away behind the pinned bubble instead of riding along with
@@ -1156,6 +1123,7 @@ const UserMessage: FC<{
             </div>
           ) : null
         }
+        messageId={messageId}
       >
         <ActionBarPrimitive.Root className="relative w-full max-w-full" data-slot="aui_user-bubble-actions">
           <div className="human-message-with-todos-wrapper flex w-full flex-col gap-0">
@@ -1198,7 +1166,14 @@ const UserMessage: FC<{
                         event.preventDefault()
                         event.stopPropagation()
                         triggerHaptic('selection')
-                        setRestoreConfirmOpen(true)
+                        onRequestRestoreConfirm?.(messageId, {
+                          text: messageText,
+                          userOrdinal: runtimeUserOrdinal
+                        })
+                      }}
+                      onPointerDown={event => {
+                        event.preventDefault()
+                        event.stopPropagation()
                       }}
                       title={copy.restoreFromHere}
                       type="button"
@@ -1232,17 +1207,6 @@ const UserMessage: FC<{
             </BranchPickerPrimitive.Root>
           </div>
         </ActionBarPrimitive.Root>
-        {showRestore && (
-          <ConfirmDialog
-            confirmLabel={copy.restoreConfirm}
-            description={copy.restoreBody}
-            destructive
-            onClose={() => setRestoreConfirmOpen(false)}
-            onConfirm={() => onRestoreToMessage?.(messageId)}
-            open={restoreConfirmOpen}
-            title={copy.restoreTitle}
-          />
-        )}
       </StickyHumanMessageContainer>
     </MessagePrimitive.Root>
   )

@@ -249,14 +249,12 @@ export function useComposerActions({ activeSessionId, currentCwd, requestGateway
       ? 'folder'
       : refText.startsWith('@url:')
         ? 'url'
-        : refText.startsWith('@task:')
-          ? 'task'
-          : 'file'
+        : 'file'
 
     attachToMain({
       id: attachmentId(kind, refText),
       kind,
-      label: label || refText.replace(/^@(file|folder|task|url):/, ''),
+      label: label || refText.replace(/^@(file|folder|url):/, ''),
       detail,
       refText
     })
@@ -332,35 +330,38 @@ export function useComposerActions({ activeSessionId, currentCwd, requestGateway
     [currentCwd]
   )
 
-  const attachImagePath = useCallback(async (filePath: string) => {
-    if (!filePath) {
-      return false
-    }
-
-    const baseAttachment: ComposerAttachment = {
-      id: attachmentId('image', filePath),
-      kind: 'image',
-      label: pathLabel(filePath),
-      detail: filePath,
-      path: filePath
-    }
-
-    attachToMain(baseAttachment)
-
-    try {
-      const previewUrl = await window.hermesDesktop?.readFileDataUrl(filePath)
-
-      if (previewUrl) {
-        addComposerAttachment({ ...baseAttachment, previewUrl })
+  const attachImagePath = useCallback(
+    async (filePath: string) => {
+      if (!filePath) {
+        return false
       }
 
-      return true
-    } catch (err) {
-      notifyError(err, copy.imagePreviewFailed)
+      const baseAttachment: ComposerAttachment = {
+        id: attachmentId('image', filePath),
+        kind: 'image',
+        label: pathLabel(filePath),
+        detail: filePath,
+        path: filePath
+      }
 
-      return true
-    }
-  }, [copy.imagePreviewFailed])
+      attachToMain(baseAttachment)
+
+      try {
+        const previewUrl = await window.hermesDesktop?.readFileDataUrl(filePath)
+
+        if (previewUrl) {
+          addComposerAttachment({ ...baseAttachment, previewUrl })
+        }
+
+        return true
+      } catch (err) {
+        notifyError(err, copy.imagePreviewFailed)
+
+        return true
+      }
+    },
+    [copy.imagePreviewFailed]
+  )
 
   const attachImageBlob = useCallback(
     async (blob: Blob) => {
@@ -414,25 +415,36 @@ export function useComposerActions({ activeSessionId, currentCwd, requestGateway
     }
   }, [attachImagePath, copy.attachImages, currentCwd, t.composer.images])
 
-  const pasteClipboardImage = useCallback(async () => {
-    try {
-      const path = await window.hermesDesktop?.saveClipboardImage()
+  const pasteClipboardImage = useCallback(
+    async ({ silent = false }: { silent?: boolean } = {}) => {
+      try {
+        const path = await window.hermesDesktop?.saveClipboardImage()
 
-      if (!path) {
-        notify({
-          kind: 'warning',
-          title: copy.clipboard,
-          message: copy.noClipboardImage
-        })
+        if (!path) {
+          if (!silent) {
+            notify({
+              kind: 'warning',
+              title: copy.clipboard,
+              message: copy.noClipboardImage
+            })
+          }
 
-        return
+          return false
+        }
+
+        await attachImagePath(path)
+
+        return true
+      } catch (err) {
+        if (!silent) {
+          notifyError(err, copy.clipboardPasteFailed)
+        }
+
+        return false
       }
-
-      await attachImagePath(path)
-    } catch (err) {
-      notifyError(err, copy.clipboardPasteFailed)
-    }
-  }, [attachImagePath, copy.clipboard, copy.clipboardPasteFailed, copy.noClipboardImage])
+    },
+    [attachImagePath, copy.clipboard, copy.clipboardPasteFailed, copy.noClipboardImage]
+  )
 
   const attachContextFolderPath = useCallback(
     (folderPath: string) => {

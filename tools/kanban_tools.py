@@ -347,6 +347,7 @@ def _task_summary_dict(kb, conn, task) -> dict[str, Any]:
         "tenant": task.tenant,
         "workspace_kind": task.workspace_kind,
         "workspace_path": task.workspace_path,
+        "project_id": task.project_id,
         "created_by": task.created_by,
         "created_at": task.created_at,
         "started_at": task.started_at,
@@ -655,9 +656,16 @@ def _handle_block(args: dict, **kw) -> str:
             f"metadata must be an object/dict, got {type(metadata).__name__}"
         )
     metadata = _stamp_worker_session_metadata(tid, metadata)
+    reason = redact_sensitive_text(str(reason), force=True)
+    kind = args.get("kind")
     board = args.get("board")
     try:
         kb, conn = _connect(board=board)
+        if kind is not None and kind not in kb.VALID_BLOCK_KINDS:
+            conn.close()
+            return tool_error(
+                f"kind must be one of {sorted(kb.VALID_BLOCK_KINDS)} (or omit it)"
+            )
         try:
             reason_text = str(reason).strip()
             ok = kb.block_task(
@@ -665,6 +673,7 @@ def _handle_block(args: dict, **kw) -> str:
                 reason=reason_text,
                 summary=summary,
                 metadata=metadata,
+                kind=kind,
                 expected_run_id=_worker_run_id(tid),
             )
             if not ok:
@@ -673,11 +682,15 @@ def _handle_block(args: dict, **kw) -> str:
                     f"or stale run)"
                 )
             run = kb.latest_run(conn, tid)
+            # Tell the worker where the task actually landed so it doesn't
+            # assume it's sitting in 'blocked' when routing sent it elsewhere.
+            landed = kb.get_task(conn, tid)
             return _ok(
                 task_id=tid,
                 run_id=run.id if run else None,
-                status="blocked",
-                routed_to="blocked",
+                status=landed.status if landed else "blocked",
+                routed_to=landed.status if landed else "blocked",
+                block_kind=kind,
             )
         finally:
             conn.close()
@@ -1157,6 +1170,7 @@ def _handle_create(args: dict, **kw) -> str:
     # fall back to scratch as before. Explicit None path stays None.
     workspace_kind = args.get("workspace_kind")
     workspace_path = args.get("workspace_path")
+    project_id = args.get("project") or args.get("project_id")
     _inherit_workspace = workspace_kind is None and workspace_path is None
     if workspace_kind is None:
         workspace_kind = "scratch"
@@ -1197,6 +1211,10 @@ def _handle_create(args: dict, **kw) -> str:
                     if _self_task is not None and _self_task.workspace_kind:
                         workspace_kind = _self_task.workspace_kind
                         workspace_path = _self_task.workspace_path
+                        # Keep follow-up children inside the same project so the
+                        # whole subtree shares one repo + branch convention.
+                        if project_id is None and _self_task.project_id:
+                            project_id = _self_task.project_id
             new_tid = kb.create_task(
                 conn,
                 title=str(title).strip(),
@@ -1207,6 +1225,7 @@ def _handle_create(args: dict, **kw) -> str:
                 priority=int(priority) if priority is not None else 0,
                 workspace_kind=str(workspace_kind),
                 workspace_path=workspace_path,
+                project_id=project_id,
                 triage=triage,
                 idempotency_key=idempotency_key,
                 max_runtime_seconds=(
@@ -1524,6 +1543,16 @@ KANBAN_BLOCK_SCHEMA = {
         "operator routes/unblocks the task. State the concrete blocker; do "
         "not decide whether it needs the user unless the task explicitly "
         "requires that label."
+        "Stop work on this task and route it according to WHY you're stuck. "
+        "Set ``kind`` to say which: 'dependency' (waiting on another task — "
+        "goes to todo and auto-resumes when that task finishes, no human "
+        "needed), 'needs_input' (you need a human decision/answer), "
+        "'capability' (a hard wall: no access, missing credentials, an action "
+        "no agent can do), or 'transient' (a flaky failure that may clear). "
+        "``reason`` is shown to the human on the board. If a task keeps "
+        "getting unblocked and re-blocked for the same reason, it is "
+        "auto-escalated to triage. Use for genuine blockers only — don't "
+        "block on things you can resolve yourself."
     ),
     "parameters": {
         "type": "object",
@@ -1556,6 +1585,18 @@ KANBAN_BLOCK_SCHEMA = {
                     "for ordinary QA, or kanban_request_decision / "
                     "kanban_request_orchestrator_handoff for active "
                     "orchestrator judgment."
+                    "What you need answered or what stopped you, in one or "
+                    "two sentences. Don't paste the whole conversation; the "
+                    "human has the board and can ask follow-ups via comments."
+                ),
+            },
+            "kind": {
+                "type": "string",
+                "enum": ["dependency", "needs_input", "capability", "transient"],
+                "description": (
+                    "Why you're blocked. 'dependency' waits in todo and "
+                    "resumes automatically; the others surface to a human. "
+                    "Omit only if none apply."
                 ),
             },
             "board": _board_schema_prop(),
@@ -1933,6 +1974,15 @@ KANBAN_CREATE_SCHEMA = {
                 "description": (
                     "Absolute path for 'dir' or 'worktree' workspace. "
                     "Relative paths are rejected at dispatch."
+                ),
+            },
+            "project": {
+                "type": "string",
+                "description": (
+                    "Optional project id or slug to link the task to. When "
+                    "set, the task becomes a git worktree under the project's "
+                    "primary repo with a deterministic branch (project slug + "
+                    "task id), instead of a random branch."
                 ),
             },
             "triage": {

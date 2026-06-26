@@ -25,25 +25,21 @@ import {
   stripGeneratedImageEchoes
 } from '@/lib/generated-images'
 import { triggerHaptic } from '@/lib/haptics'
-import {
-  invalidateLoopSourceFromEvent,
-  isLoopSourceInvalidationEvent,
-  type LoopSourceChangedEvent
-} from '@/lib/loop-source-events'
 import { isProviderSetupErrorMessage } from '@/lib/provider-setup-errors'
 import { parseTodos } from '@/lib/todos'
-import { setClarifyRequest } from '@/store/clarify'
+import { clearClarifyRequest, setClarifyRequest } from '@/store/clarify'
 import { setSessionCompacting } from '@/store/compaction'
 import { refreshBackgroundProcesses } from '@/store/composer-status'
 import { $gateway } from '@/store/gateway'
-import { loopagentSessionKeys, upsertLoopagent } from '@/store/loopagents'
 import { dispatchNativeNotification } from '@/store/native-notifications'
 import { notify } from '@/store/notifications'
 import { requestDesktopOnboarding } from '@/store/onboarding'
 import { flashPetActivity, markPetUnread, setPetActivity } from '@/store/pet'
 import { $activeGatewayProfile, normalizeProfileKey } from '@/store/profile'
+import { followActiveSessionCwd } from '@/store/projects'
 import { clearAllPrompts, setApprovalRequest, setSecretRequest, setSudoRequest } from '@/store/prompts'
 import {
+  $currentCwd,
   setCurrentBranch,
   setCurrentCwd,
   setCurrentFastMode,
@@ -53,13 +49,15 @@ import {
   setCurrentReasoningEffort,
   setCurrentServiceTier,
   setCurrentUsage,
+  setSessions,
   setTurnStartedAt,
   setYoloActive
 } from '@/store/session'
 import { broadcastSessionsChanged } from '@/store/session-sync'
 import { clearSessionSubagents, pruneDelegateFallbackSubagents, upsertSubagent } from '@/store/subagents'
-import { setSessionTodos, settleSessionTodos } from '@/store/todos'
+import { setSessionTodos } from '@/store/todos'
 import { recordToolDiff } from '@/store/tool-diffs'
+import { notifyWorkspaceChanged, toolMayMutateFiles } from '@/store/workspace-events'
 import type { RpcEvent } from '@/types/hermes'
 
 import type { ClientSessionState } from '../../types'
@@ -173,8 +171,6 @@ const SUBAGENT_EVENT_TYPES = new Set([
   'subagent.progress',
   'subagent.complete'
 ])
-
-const isLoopagentEventType = (eventType: string | undefined): boolean => Boolean(eventType?.startsWith('loopagent.'))
 
 // Anonymous progress events that carry todos but no name still belong to the
 // todo stream; named todo events are obviously routed there too.
@@ -348,6 +344,9 @@ export function useMessageStream({
   const nativeSubagentSessionsRef = useRef<Set<string>>(new Set())
   // Turns that auto-compacted: skip post-turn hydrate so live scrollback survives.
   const compactedTurnRef = useRef<Set<string>>(new Set())
+  // Last session we applied a session.info cwd for — lets us tell an agent
+  // relocating the SAME session (follow it) from a session switch (don't yank).
+  const lastCwdInfoSessionRef = useRef<null | string>(null)
 
   const flushQueuedDeltas = useCallback(
     (sessionId?: string) => {
@@ -665,8 +664,6 @@ export function useMessageStream({
         void hydrateFromStoredSession(3, completedState.storedSessionId, sessionId)
       }
 
-      settleSessionTodos(sessionId)
-
       dispatchNativeNotification({
         body: text.slice(0, 140) || translateNow('notifications.native.turnDoneBody'),
         kind: 'turnDone',
@@ -727,50 +724,16 @@ export function useMessageStream({
     (event: RpcEvent) => {
       const payload = event.payload as GatewayEventPayload | undefined
       const explicitSid = event.session_id || ''
-      const payloadRecord = asRecord(payload)
 
-      const payloadSessionId = firstString(
-        payloadRecord.current_session_id,
-        payloadRecord.logical_session_id,
-        payloadRecord.source_session_id,
-        payloadRecord.root_session_id,
-        payloadRecord.parent_session_id,
-        payloadRecord.worker_session_id
-      )
-
-      if (!explicitSid && gatewayEventRequiresSessionId(event.type) && !payloadSessionId) {
+      if (!explicitSid && gatewayEventRequiresSessionId(event.type)) {
         return
       }
 
-      const sessionId = explicitSid || payloadSessionId || activeSessionIdRef.current
+      const sessionId = explicitSid || activeSessionIdRef.current
       const isActiveEvent = !!sessionId && sessionId === activeSessionIdRef.current
 
       if (event.type === 'gateway.ready') {
         return
-      } else if (event.type === 'session.message.appended' || event.type === 'session.history.updated') {
-        const storedSessionId = firstString(
-          payloadRecord.stored_session_id,
-          payloadRecord.session_key,
-          payloadRecord.session_id,
-          payloadSessionId,
-          explicitSid
-        )
-
-        const runtimeSessionId = activeSessionIdRef.current
-
-        const activeStoredSessionId = runtimeSessionId
-          ? sessionStateByRuntimeIdRef.current.get(runtimeSessionId)?.storedSessionId
-          : null
-
-        if (
-          storedSessionId &&
-          runtimeSessionId &&
-          (runtimeSessionId === storedSessionId || activeStoredSessionId === storedSessionId)
-        ) {
-          void hydrateFromStoredSession(3, storedSessionId, runtimeSessionId)
-        }
-
-        void refreshSessions().catch(() => undefined)
       } else if (event.type === 'session.info') {
         // Apply session-scoped fields when the event targets the active
         // session, OR when it's a global broadcast and we have no session.
@@ -791,7 +754,20 @@ export function useMessageStream({
           }
 
           if (typeof payload?.cwd === 'string') {
+            // The active session's agent can relocate itself (new repo/worktree
+            // via the terminal). When the SAME active session's cwd actually
+            // moves, follow it — refresh the project tree + scope so the sidebar
+            // tracks the live thread. A fresh selection (different session id)
+            // is a switch, not a move, so it refreshes data without yanking scope.
+            const cwdMoved = payload.cwd !== $currentCwd.get()
+            const sameSession = !!sessionId && sessionId === lastCwdInfoSessionRef.current
+
+            lastCwdInfoSessionRef.current = sessionId
             setCurrentCwd(payload.cwd)
+
+            if (cwdMoved && sameSession) {
+              void followActiveSessionCwd(payload.cwd)
+            }
           }
 
           if (typeof payload?.branch === 'string') {
@@ -938,6 +914,7 @@ export function useMessageStream({
         // session so a background turn finishing can't wipe the active chat's
         // prompt, and vice versa.
         clearAllPrompts(sessionId)
+        clearClarifyRequest(undefined, sessionId)
         setSessionCompacting(sessionId, false)
 
         flushQueuedDeltas(sessionId)
@@ -967,6 +944,16 @@ export function useMessageStream({
 
         if (payload?.usage) {
           setCurrentUsage(current => ({ ...current, ...payload.usage }))
+        }
+      } else if (event.type === 'session.title') {
+        // Live auto-title push (titler runs async, after the turn's refresh).
+        const storedId = typeof payload?.session_id === 'string' ? payload.session_id : ''
+        const nextTitle = typeof payload?.title === 'string' ? payload.title.trim() : ''
+
+        if (storedId && nextTitle) {
+          setSessions(prev =>
+            prev.map(s => (s.id === storedId || s._lineage_root_id === storedId ? { ...s, title: nextTitle } : s))
+          )
         }
       } else if (event.type === 'tool.start' || event.type === 'tool.progress' || event.type === 'tool.generating') {
         if (!sessionId) {
@@ -1004,6 +991,13 @@ export function useMessageStream({
         if (typeof payload?.inline_diff === 'string' && payload.inline_diff.trim()) {
           recordToolDiff(payload.tool_id || payload.name || '', payload.inline_diff)
         }
+
+        // A file-mutating tool just finished — nudge the git-mirroring surfaces
+        // (coding rail, review pane, file tree) to refresh. Event-driven, not
+        // polled: fires exactly when the agent touches the tree.
+        if (payload && toolMayMutateFiles(payload)) {
+          notifyWorkspaceChanged()
+        }
       } else if (SUBAGENT_EVENT_TYPES.has(event.type)) {
         if (sessionId && payload && !sessionInterrupted(sessionId)) {
           if (!nativeSubagentSessionsRef.current.has(sessionId)) {
@@ -1018,26 +1012,6 @@ export function useMessageStream({
             event.type
           )
         }
-      } else if (isLoopagentEventType(event.type)) {
-        const sessionKeys = loopagentSessionKeys(payloadRecord, explicitSid || payloadSessionId)
-
-        if (sessionKeys.length > 0 && payload && !sessionKeys.some(id => sessionInterrupted(id))) {
-          upsertLoopagent(sessionKeys, payloadRecord, event.type)
-        }
-
-        void invalidateLoopSourceFromEvent(queryClient, {
-          activeProfile: normalizeProfileKey($activeGatewayProfile.get()),
-          activeSessionIds: [activeSessionIdRef.current, sessionId, ...sessionKeys],
-          event: payloadRecord as LoopSourceChangedEvent,
-          selectedTaskId: typeof payloadRecord.task_id === 'string' ? payloadRecord.task_id : undefined
-        })
-      } else if (isLoopSourceInvalidationEvent(event.type, payload)) {
-        void invalidateLoopSourceFromEvent(queryClient, {
-          activeProfile: normalizeProfileKey($activeGatewayProfile.get()),
-          activeSessionIds: [activeSessionIdRef.current, sessionId],
-          event: payloadRecord as LoopSourceChangedEvent,
-          selectedTaskId: typeof payloadRecord.task_id === 'string' ? payloadRecord.task_id : undefined
-        })
       } else if (event.type === 'clarify.request') {
         // Surface the clarify tool's overlay. The Python side is blocked on
         // `clarify.respond`, so without this handler the agent would hang
@@ -1213,6 +1187,7 @@ export function useMessageStream({
         // the failed turn (same intent as the message.complete clear).
         if (sessionId) {
           clearAllPrompts(sessionId)
+          clearClarifyRequest(undefined, sessionId)
           setSessionCompacting(sessionId, false)
           compactedTurnRef.current.delete(sessionId)
         }
@@ -1247,7 +1222,6 @@ export function useMessageStream({
         if (sessionId) {
           flushQueuedDeltas(sessionId)
           failAssistantMessage(sessionId, errorMessage)
-          settleSessionTodos(sessionId, 'cancelled')
         }
 
         if (isActiveEvent) {
@@ -1262,11 +1236,8 @@ export function useMessageStream({
       completeAssistantMessage,
       failAssistantMessage,
       flushQueuedDeltas,
-      hydrateFromStoredSession,
       queryClient,
       refreshHermesConfig,
-      refreshSessions,
-      sessionStateByRuntimeIdRef,
       sessionInterrupted,
       updateSessionState,
       upsertToolCall
