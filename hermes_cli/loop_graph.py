@@ -1,15 +1,16 @@
-"""Scheduled-task-backed Loop graph API.
+"""Lightweight Loop planning graph API.
 
-This module stores the Loop graph as real Kanban planning tasks plus
-``task_links`` dependency edges.  The model/tool surface intentionally stays
-compact: one mutation/read entry point with revision and mutation-id guards.
+The durable Loop root remains a real Kanban task, while interview/planning
+options live in Loop-owned planning tables rather than ``tasks`` / ``task_links``.
+The model/tool surface intentionally stays compact: one mutation/read entry
+point with revision and mutation-id guards.
 """
 from __future__ import annotations
 
 import json
-import os
 import sqlite3
 import time
+import uuid
 from typing import Any, Optional
 
 from hermes_cli import kanban_db as kb
@@ -24,6 +25,7 @@ _ALLOWED_HANDOFF_ATTENTION = {None, "needs-orchestrator", "needs-user"}
 _NODE_BRANCH_KINDS = {"alternative", "required"}
 _NODE_SELECTION_STATES = {"candidate", "chosen", "rejected"}
 _NODE_METADATA_KEYS = ("branch_kind", "decision_group_id", "selection_state")
+_PLAN_NODE_STATUS_VALUES = {"triage", "scheduled", "archived"}
 
 
 class LoopError(Exception):
@@ -46,20 +48,76 @@ def ensure_schema(conn: sqlite3.Connection) -> None:
         )
         """
     )
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS loop_plan_nodes (
+            root_task_id      TEXT NOT NULL,
+            node_id           TEXT NOT NULL,
+            client_id         TEXT,
+            title             TEXT NOT NULL,
+            body              TEXT,
+            status            TEXT NOT NULL DEFAULT 'scheduled',
+            suggested_owner   TEXT,
+            active            INTEGER NOT NULL DEFAULT 0,
+            frontier          INTEGER NOT NULL DEFAULT 0,
+            branch_kind       TEXT,
+            decision_group_id TEXT,
+            selection_state   TEXT,
+            execution_task_id TEXT,
+            created_at        INTEGER NOT NULL,
+            updated_at        INTEGER NOT NULL,
+            archived_at       INTEGER,
+            PRIMARY KEY (root_task_id, node_id)
+        )
+        """
+    )
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS loop_plan_edges (
+            root_task_id TEXT NOT NULL,
+            parent_id    TEXT NOT NULL,
+            child_id     TEXT NOT NULL,
+            created_at   INTEGER NOT NULL,
+            PRIMARY KEY (root_task_id, parent_id, child_id)
+        )
+        """
+    )
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS loop_plan_events (
+            id           INTEGER PRIMARY KEY AUTOINCREMENT,
+            root_task_id TEXT NOT NULL,
+            mutation_id  TEXT,
+            payload_json TEXT NOT NULL,
+            created_at   INTEGER NOT NULL
+        )
+        """
+    )
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_loop_plan_nodes_root ON loop_plan_nodes(root_task_id, status, created_at)")
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_loop_plan_nodes_client ON loop_plan_nodes(root_task_id, client_id)")
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_loop_plan_edges_child ON loop_plan_edges(root_task_id, child_id)")
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_loop_plan_events_root ON loop_plan_events(root_task_id, id)")
 
 
 def graph_revision(conn: sqlite3.Connection, root_task_id: str) -> int:
     ensure_schema(conn)
-    row = conn.execute(
+    event_row = conn.execute(
         """
-        SELECT MAX(e.id) AS rev
+        SELECT COUNT(DISTINCT e.id) AS rev
           FROM task_events e
-          JOIN tasks t ON t.id = e.task_id
-         WHERE t.created_by = ?
+          LEFT JOIN tasks t ON t.id = e.task_id
+         WHERE e.task_id = ? OR t.created_by = ?
         """,
-        (f"loop:{root_task_id}",),
+        (root_task_id, f"loop:{root_task_id}"),
     ).fetchone()
-    return int(row["rev"] or 0) if row else 0
+    plan_row = conn.execute(
+        "SELECT COUNT(*) AS rev FROM loop_plan_events WHERE root_task_id = ?",
+        (root_task_id,),
+    ).fetchone()
+    # Logical per-root revision. Counting both root/legacy task events and
+    # lightweight planning events preserves stale guards without requiring
+    # planning options to be real Kanban rows.
+    return int((event_row["rev"] or 0) if event_row else 0) + int((plan_row["rev"] or 0) if plan_row else 0)
 
 
 def _append_graph_event(
@@ -68,17 +126,22 @@ def _append_graph_event(
     task_ids: list[str],
     payload: dict[str, Any],
 ) -> int:
-    """Append a mutation event to a real Loop task; no container/root row exists."""
-    target_id = next((task_id for task_id in task_ids if task_id), None)
-    if not target_id:
-        return graph_revision(conn, root_task_id)
+    """Append a planning mutation event and mirror it to a real task when possible."""
     now = int(time.time())
     conn.execute(
-        "INSERT INTO task_events (task_id, run_id, kind, payload, created_at) "
-        "VALUES (?, NULL, ?, ?, ?)",
-        (target_id, LOOP_EVENT_KIND, json.dumps(payload, ensure_ascii=False), now),
+        "INSERT INTO loop_plan_events (root_task_id, mutation_id, payload_json, created_at) VALUES (?, ?, ?, ?)",
+        (root_task_id, payload.get("mutation_id"), json.dumps(payload, ensure_ascii=False), now),
     )
-    return int(conn.execute("SELECT last_insert_rowid()").fetchone()[0])
+    target_id = root_task_id if kb.get_task(conn, root_task_id) is not None else None
+    if target_id is None:
+        target_id = next((task_id for task_id in task_ids if kb.get_task(conn, task_id) is not None), None)
+    if target_id:
+        conn.execute(
+            "INSERT INTO task_events (task_id, run_id, kind, payload, created_at) "
+            "VALUES (?, NULL, ?, ?, ?)",
+            (target_id, LOOP_EVENT_KIND, json.dumps(payload, ensure_ascii=False), now),
+        )
+    return graph_revision(conn, root_task_id)
 
 
 def _append_node_event(
@@ -186,12 +249,281 @@ def _canonical_parent_ids(client_to_task: dict[str, str], parents: Any) -> list[
     return out
 
 
-def _assert_loop_parent_ids(conn: sqlite3.Connection, parent_ids: list[str], root_task_id: str) -> None:
-    missing = kb._find_missing_parents(conn, parent_ids)
-    if missing:
-        raise LoopError("validation_failed", f"unknown parent task(s): {', '.join(missing)}")
+def _plan_node_id_from_client(conn: sqlite3.Connection, root_task_id: str, client_id: Optional[str]) -> str:
+    if client_id:
+        existing = conn.execute(
+            "SELECT node_id FROM loop_plan_nodes WHERE root_task_id = ? AND client_id = ? AND status != 'archived' ORDER BY created_at DESC LIMIT 1",
+            (root_task_id, client_id),
+        ).fetchone()
+        if existing:
+            return str(existing["node_id"])
+        safe = "".join(ch if (ch.isalnum() or ch in {"-", "_"}) else "_" for ch in client_id).strip("_")
+        base = f"plan:{safe or uuid.uuid4().hex[:10]}"
+    else:
+        base = f"plan:{kb._new_task_id()}"
+
+    candidate = base
+    suffix = 2
+    while conn.execute(
+        "SELECT 1 FROM loop_plan_nodes WHERE root_task_id = ? AND node_id = ?",
+        (root_task_id, candidate),
+    ).fetchone():
+        candidate = f"{base}-{suffix}"
+        suffix += 1
+    return candidate
+
+
+def _plan_node_row(
+    conn: sqlite3.Connection,
+    root_task_id: str,
+    node_id: str,
+    *,
+    include_archived: bool = False,
+):
+    where = "root_task_id = ? AND node_id = ?"
+    params: list[Any] = [root_task_id, node_id]
+    if not include_archived:
+        where += " AND status != 'archived'"
+    return conn.execute(f"SELECT * FROM loop_plan_nodes WHERE {where}", tuple(params)).fetchone()
+
+
+def _resolve_plan_node_row(
+    conn: sqlite3.Connection,
+    root_task_id: str,
+    ref: str,
+    *,
+    include_archived: bool = False,
+):
+    row = _plan_node_row(conn, root_task_id, ref, include_archived=include_archived)
+    if row:
+        return row
+    where = "root_task_id = ? AND client_id = ?"
+    params: list[Any] = [root_task_id, ref]
+    if not include_archived:
+        where += " AND status != 'archived'"
+    return conn.execute(
+        f"SELECT * FROM loop_plan_nodes WHERE {where} ORDER BY created_at DESC LIMIT 1",
+        tuple(params),
+    ).fetchone()
+
+
+def _target_plan_node_or_none(
+    conn: sqlite3.Connection,
+    root_task_id: str,
+    node_id: str,
+    *,
+    include_archived: bool = False,
+):
+    row = _resolve_plan_node_row(conn, root_task_id, node_id, include_archived=include_archived)
+    if row:
+        return row
+    other = conn.execute(
+        "SELECT root_task_id FROM loop_plan_nodes WHERE (node_id = ? OR client_id = ?) AND root_task_id != ? AND status != 'archived' LIMIT 1",
+        (node_id, node_id, root_task_id),
+    ).fetchone()
+    if other:
+        raise LoopError(
+            "wrong_root",
+            f"refusing to mutate {node_id}: not a Loop planning node for root {root_task_id}",
+        )
+    return None
+
+
+def _assert_plan_parent_ids(conn: sqlite3.Connection, parent_ids: list[str], root_task_id: str) -> None:
     for parent_id in parent_ids:
-        _assert_loop_node(conn, parent_id, root_task_id)
+        if parent_id == root_task_id:
+            continue
+        if _resolve_plan_node_row(conn, root_task_id, parent_id):
+            continue
+        if conn.execute(
+            "SELECT 1 FROM loop_plan_nodes WHERE (node_id = ? OR client_id = ?) AND root_task_id != ? AND status != 'archived' LIMIT 1",
+            (parent_id, parent_id, root_task_id),
+        ).fetchone():
+            raise LoopError(
+                "wrong_root",
+                f"refusing to parent to {parent_id}: not a Loop planning node for root {root_task_id}",
+            )
+        task = kb.get_task(conn, parent_id)
+        if task is None:
+            raise LoopError("validation_failed", f"unknown parent node(s): {parent_id}")
+        if task.created_by != f"loop:{root_task_id}":
+            raise LoopError(
+                "wrong_root",
+                f"refusing to parent to {parent_id}: not a Loop node for root {root_task_id}",
+            )
+
+
+def _canonical_plan_parent_ids(conn: sqlite3.Connection, parent_ids: list[str], root_task_id: str) -> list[str]:
+    canonical: list[str] = []
+    for parent_id in parent_ids:
+        if parent_id == root_task_id:
+            canonical.append(parent_id)
+            continue
+        row = _resolve_plan_node_row(conn, root_task_id, parent_id)
+        canonical.append(str(row["node_id"]) if row else parent_id)
+    return canonical
+
+
+def _plan_edges(conn: sqlite3.Connection, root_task_id: str) -> list[sqlite3.Row]:
+    return list(
+        conn.execute(
+            "SELECT parent_id, child_id FROM loop_plan_edges WHERE root_task_id = ? ORDER BY created_at ASC, parent_id ASC, child_id ASC",
+            (root_task_id,),
+        ).fetchall()
+    )
+
+
+def _would_plan_cycle_with_replacement(
+    conn: sqlite3.Connection,
+    root_task_id: str,
+    child_id: str,
+    new_parent_ids: list[str],
+) -> bool:
+    edges = {
+        (row["parent_id"], row["child_id"])
+        for row in _plan_edges(conn, root_task_id)
+        if row["child_id"] != child_id
+    }
+    for parent_id in new_parent_ids:
+        edges.add((parent_id, child_id))
+    children: dict[str, list[str]] = {}
+    for parent_id, edge_child_id in edges:
+        children.setdefault(parent_id, []).append(edge_child_id)
+    for parent_id in new_parent_ids:
+        stack = [child_id]
+        seen: set[str] = set()
+        while stack:
+            node = stack.pop()
+            if node == parent_id:
+                return True
+            if node in seen:
+                continue
+            seen.add(node)
+            stack.extend(children.get(node, []))
+    return False
+
+
+def _set_plan_parents_in_txn(
+    conn: sqlite3.Connection,
+    root_task_id: str,
+    node_id: str,
+    parent_ids: list[str],
+) -> None:
+    row = _target_plan_node_or_none(conn, root_task_id, node_id)
+    if not row:
+        raise LoopError("not_found", f"unknown planning node {node_id}")
+    node_id = str(row["node_id"])
+    parent_ids = _canonical_plan_parent_ids(conn, parent_ids, root_task_id)
+    _assert_plan_parent_ids(conn, parent_ids, root_task_id)
+    if node_id in parent_ids:
+        raise LoopError("validation_failed", "a node cannot depend on itself")
+    if _would_plan_cycle_with_replacement(conn, root_task_id, node_id, parent_ids):
+        raise LoopError("validation_failed", "planning edge update would create a cycle")
+    conn.execute("DELETE FROM loop_plan_edges WHERE root_task_id = ? AND child_id = ?", (root_task_id, node_id))
+    now = int(time.time())
+    for parent_id in parent_ids:
+        conn.execute(
+            "INSERT OR IGNORE INTO loop_plan_edges (root_task_id, parent_id, child_id, created_at) VALUES (?, ?, ?, ?)",
+            (root_task_id, parent_id, node_id, now),
+        )
+
+
+def _create_plan_node_in_txn(
+    conn: sqlite3.Connection,
+    *,
+    title: str,
+    body: Optional[str],
+    root_task_id: str,
+    parents: list[str],
+    client_id: Optional[str],
+    suggested_owner: Optional[str],
+    status: str,
+    active: Optional[bool],
+    frontier: Optional[bool],
+    metadata: dict[str, str],
+    execution_task_id: Optional[str] = None,
+) -> str:
+    if status not in _PLAN_NODE_STATUS_VALUES - {"archived"}:
+        allowed = ", ".join(sorted(_PLAN_NODE_STATUS_VALUES - {"archived"}))
+        raise LoopError("validation_failed", f"add_node.status must be one of: {allowed}")
+    _assert_plan_parent_ids(conn, parents, root_task_id)
+    node_id = _plan_node_id_from_client(conn, root_task_id, client_id)
+    existing = _plan_node_row(conn, root_task_id, node_id)
+    if existing:
+        return node_id
+    now = int(time.time())
+    conn.execute(
+        """
+        INSERT INTO loop_plan_nodes (
+            root_task_id, node_id, client_id, title, body, status, suggested_owner,
+            active, frontier, branch_kind, decision_group_id, selection_state,
+            execution_task_id, created_at, updated_at
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """,
+        (
+            root_task_id,
+            node_id,
+            client_id,
+            title,
+            body,
+            status,
+            suggested_owner,
+            1 if active else 0,
+            1 if frontier else 0,
+            metadata.get("branch_kind"),
+            metadata.get("decision_group_id"),
+            metadata.get("selection_state"),
+            execution_task_id,
+            now,
+            now,
+        ),
+    )
+    _set_plan_parents_in_txn(conn, root_task_id, node_id, parents)
+    return node_id
+
+
+def _update_plan_node_in_txn(
+    conn: sqlite3.Connection,
+    root_task_id: str,
+    node_id: str,
+    op: dict[str, Any],
+    *,
+    metadata: dict[str, str],
+) -> None:
+    if not _target_plan_node_or_none(conn, root_task_id, node_id):
+        raise LoopError("not_found", f"unknown planning node {node_id}")
+    assignments = ["updated_at = ?"]
+    params: list[Any] = [int(time.time())]
+    if "title" in op:
+        title = str(op.get("title") or "").strip()
+        if not title:
+            raise LoopError("validation_failed", "update_node.title cannot be empty")
+        assignments.append("title = ?")
+        params.append(title)
+    if "body" in op:
+        assignments.append("body = ?")
+        params.append(str(op.get("body") or "").strip() or None)
+    if "suggested_owner" in op:
+        assignments.append("suggested_owner = ?")
+        params.append(_clean_optional_str(op.get("suggested_owner")))
+    if "active" in op:
+        assignments.append("active = ?")
+        params.append(1 if op.get("active") else 0)
+    if "frontier" in op:
+        assignments.append("frontier = ?")
+        params.append(1 if op.get("frontier") else 0)
+    if "execution_task_id" in op:
+        assignments.append("execution_task_id = ?")
+        params.append(_clean_optional_str(op.get("execution_task_id")))
+    for key in _NODE_METADATA_KEYS:
+        if key in metadata:
+            assignments.append(f"{key} = ?")
+            params.append(metadata[key])
+    params.extend([root_task_id, node_id])
+    conn.execute(
+        f"UPDATE loop_plan_nodes SET {', '.join(assignments)} WHERE root_task_id = ? AND node_id = ?",
+        params,
+    )
 
 
 def _provenance_body(
@@ -211,76 +543,6 @@ def _provenance_body(
         prov.append(f"suggested_owner: {suggested_owner}")
     parts.append("\n".join(prov))
     return "\n\n".join(parts)
-
-
-def _create_triage_task_in_txn(
-    conn: sqlite3.Connection,
-    *,
-    title: str,
-    body: str,
-    root_task_id: str,
-    tenant: Optional[str],
-    parents: list[str],
-    idempotency_key: Optional[str],
-    status: str = "scheduled",
-) -> str:
-    """Create a Loop planning row inside the caller's write transaction."""
-    if status not in _SAFE_MUTATION_STATUSES:
-        allowed = ", ".join(sorted(_SAFE_MUTATION_STATUSES))
-        raise LoopError("validation_failed", f"add_node.status must be one of: {allowed}")
-    if idempotency_key:
-        existing = conn.execute(
-            "SELECT id FROM tasks WHERE idempotency_key = ? AND status != 'archived' "
-            "ORDER BY created_at DESC LIMIT 1",
-            (idempotency_key,),
-        ).fetchone()
-        if existing:
-            return existing["id"]
-    missing = kb._find_missing_parents(conn, parents)
-    if missing:
-        raise LoopError("validation_failed", f"unknown parent task(s): {', '.join(missing)}")
-    now = int(time.time())
-    task_id = kb._new_task_id()
-    conn.execute(
-        """
-        INSERT INTO tasks (
-            id, title, body, assignee, status, priority,
-            created_by, created_at, workspace_kind, workspace_path,
-            branch_name, tenant, idempotency_key, max_runtime_seconds,
-            skills, max_retries, goal_mode, goal_max_turns, session_id
-        ) VALUES (?, ?, ?, NULL, ?, 0, ?, ?, 'scratch', NULL, NULL, ?, ?, NULL, NULL, NULL, 0, NULL, ?)
-        """,
-        (
-            task_id,
-            title,
-            body,
-            status,
-            f"loop:{root_task_id}",
-            now,
-            tenant,
-            idempotency_key,
-            os.environ.get("HERMES_SESSION_ID"),
-        ),
-    )
-    for parent_id in parents:
-        conn.execute(
-            "INSERT OR IGNORE INTO task_links (parent_id, child_id) VALUES (?, ?)",
-            (parent_id, task_id),
-        )
-    kb._append_event(
-        conn,
-        task_id,
-        "created",
-        {
-            "assignee": None,
-            "status": status,
-            "parents": list(parents),
-            "tenant": tenant,
-            "source": "loop",
-            "root_task_id": root_task_id,
-        },
-    )
-    return task_id
 
 
 def _graph_task_rows(conn: sqlite3.Connection, root_task_id: str) -> list[sqlite3.Row]:
@@ -478,14 +740,30 @@ def read_graph(
 
     rows = _graph_task_rows(conn, root_task_id)
     task_ids = {row["id"] for row in rows}
+    plan_rows = list(
+        conn.execute(
+            "SELECT * FROM loop_plan_nodes WHERE root_task_id = ? AND status != 'archived' ORDER BY created_at ASC, node_id ASC",
+            (root_task_id,),
+        ).fetchall()
+    )
+    plan_ids = {row["node_id"] for row in plan_rows}
+    node_ids = task_ids | plan_ids
     flags = _latest_node_flags(conn, task_ids, root_task_id)
     handoff_payloads = _latest_handoffs_for_tasks(conn, task_ids, root_task_id)
     parent_map = {tid: kb.parent_ids(conn, tid) for tid in task_ids}
-    children: dict[str, list[str]] = {tid: [] for tid in task_ids}
+    children: dict[str, list[str]] = {tid: [] for tid in node_ids}
     for child, parents in parent_map.items():
         for parent in parents:
             if parent in task_ids:
                 children.setdefault(parent, []).append(child)
+    for edge in _plan_edges(conn, root_task_id):
+        child_id = edge["child_id"]
+        parent_id = edge["parent_id"]
+        if child_id not in plan_ids:
+            continue
+        parent_map.setdefault(child_id, []).append(parent_id)
+        if parent_id in node_ids or parent_id == root_task_id:
+            children.setdefault(parent_id, []).append(child_id)
     depth_cache: dict[str, int] = {}
 
     def depth(tid: str, visiting: Optional[set[str]] = None) -> int:
@@ -495,15 +773,17 @@ def read_graph(
         if tid in visiting:
             return 0
         visiting.add(tid)
-        graph_parents = [pid for pid in parent_map.get(tid, []) if pid in task_ids]
+        graph_parents = [pid for pid in parent_map.get(tid, []) if pid in node_ids]
         value = 0 if not graph_parents else 1 + max(depth(pid, visiting) for pid in graph_parents)
         depth_cache[tid] = value
         return value
 
     nodes = []
+    order: dict[str, int] = {}
     pending_handoffs: list[dict[str, Any]] = []
-    for row in rows:
+    for index, row in enumerate(rows):
         tid = row["id"]
+        order[tid] = index
         state = flags.get(tid, {"active": False, "frontier": False})
         node = {
             "task_id": tid,
@@ -538,7 +818,32 @@ def read_graph(
                         pending[key] = handoff[key]
                 pending_handoffs.append(pending)
         nodes.append(node)
-    nodes.sort(key=lambda n: (n["depth"], rows.index(next(r for r in rows if r["id"] == n["task_id"]))))
+    for index, row in enumerate(plan_rows, start=len(rows)):
+        node_id = row["node_id"]
+        order[node_id] = index
+        node = {
+            "task_id": node_id,
+            "node_id": row["client_id"] or node_id,
+            "title": row["title"],
+            "body": row["body"],
+            "status": row["status"],
+            "parents": parent_map.get(node_id, []),
+            "children": children.get(node_id, []),
+            "depth": depth(node_id),
+            "active": bool(row["active"]),
+            "frontier": bool(row["frontier"]),
+            "root_task_id": root_task_id,
+            "is_plan_node": True,
+        }
+        for key in _NODE_METADATA_KEYS:
+            if row[key]:
+                node[key] = row[key]
+        if row["suggested_owner"]:
+            node["suggested_owner"] = row["suggested_owner"]
+        if row["execution_task_id"]:
+            node["execution_task_id"] = row["execution_task_id"]
+        nodes.append(node)
+    nodes.sort(key=lambda n: (n["depth"], order.get(n["task_id"], 0)))
     out["nodes"] = nodes
     out["pending_handoffs"] = pending_handoffs
     return out
@@ -703,43 +1008,35 @@ def apply_patch(
                 if not title:
                     raise LoopError("validation_failed", "add_node.title is required")
                 status = str(op.get("status") or "scheduled").strip().lower()
-                if status not in _SAFE_MUTATION_STATUSES:
-                    allowed = ", ".join(sorted(_SAFE_MUTATION_STATUSES))
-                    raise LoopError("validation_failed", f"add_node.status must be one of: {allowed}")
                 client_id = str(op.get("client_id") or "").strip() or None
                 metadata = _node_metadata_from_op(op, prefix="add_node")
                 parents = _canonical_parent_ids(client_to_task, op.get("parents"))
-                _assert_loop_parent_ids(conn, parents, root_task_id)
-                body = _provenance_body(
-                    op.get("body"),
-                    root_task_id=root_task_id,
-                    client_id=client_id,
-                    suggested_owner=(str(op.get("suggested_owner")).strip() if op.get("suggested_owner") else None),
-                )
-                task_id = _create_triage_task_in_txn(
+                task_id = _create_plan_node_in_txn(
                     conn,
                     title=title,
-                    body=body,
+                    body=str(op.get("body") or "").strip() or None,
                     root_task_id=root_task_id,
-                    tenant=root_task_id,
                     parents=parents,
-                    idempotency_key=(f"loop:{root_task_id}:{client_id}" if client_id else None),
+                    client_id=client_id,
+                    suggested_owner=_clean_optional_str(op.get("suggested_owner")),
                     status=status,
+                    active=op.get("active") if "active" in op else None,
+                    frontier=op.get("frontier") if "frontier" in op else None,
+                    metadata=metadata,
+                    execution_task_id=_clean_optional_str(op.get("execution_task_id")),
                 )
                 if client_id:
                     client_to_task[client_id] = task_id
-                _append_node_event(
-                    conn,
-                    task_id,
-                    root_task_id=root_task_id,
-                    active=op.get("active") if "active" in op else None,
-                    frontier=op.get("frontier") if "frontier" in op else None,
-                    client_id=client_id,
-                    **metadata,
-                )
                 created.append({"client_id": client_id or "", "task_id": task_id})
             elif kind == "update_node":
                 task_id = str(op.get("task_id") or "").strip()
+                metadata = _node_metadata_from_op(op, prefix="update_node")
+                plan_row = _target_plan_node_or_none(conn, root_task_id, task_id)
+                if plan_row:
+                    task_id = str(plan_row["node_id"])
+                    _update_plan_node_in_txn(conn, root_task_id, task_id, op, metadata=metadata)
+                    updated.append(task_id)
+                    continue
                 task = _assert_loop_node(conn, task_id, root_task_id)
                 assignments: list[str] = []
                 params: list[Any] = []
@@ -762,7 +1059,6 @@ def apply_patch(
                 if assignments:
                     params.append(task_id)
                     conn.execute(f"UPDATE tasks SET {', '.join(assignments)} WHERE id = ?", params)
-                metadata = _node_metadata_from_op(op, prefix="update_node")
                 if "active" in op or "frontier" in op or metadata:
                     _append_node_event(
                         conn,
@@ -775,6 +1071,20 @@ def apply_patch(
                 updated.append(task_id)
             elif kind in {"archive_node", "delete_node"}:
                 task_id = str(op.get("task_id") or "").strip()
+                plan_row = _target_plan_node_or_none(conn, root_task_id, task_id)
+                if plan_row:
+                    task_id = str(plan_row["node_id"])
+                    now = int(time.time())
+                    conn.execute(
+                        "UPDATE loop_plan_nodes SET status = 'archived', archived_at = ?, updated_at = ? WHERE root_task_id = ? AND node_id = ?",
+                        (now, now, root_task_id, task_id),
+                    )
+                    conn.execute(
+                        "DELETE FROM loop_plan_edges WHERE root_task_id = ? AND (parent_id = ? OR child_id = ?)",
+                        (root_task_id, task_id, task_id),
+                    )
+                    archived.append(task_id)
+                    continue
                 _assert_loop_node(conn, task_id, root_task_id)
                 conn.execute(
                     "UPDATE tasks SET status = 'archived', claim_lock = NULL, claim_expires = NULL, worker_pid = NULL "
@@ -790,12 +1100,24 @@ def apply_patch(
             elif kind == "set_parents":
                 task_id = str(op.get("task_id") or "").strip()
                 parents = _canonical_parent_ids(client_to_task, op.get("parents"))
+                plan_row = _target_plan_node_or_none(conn, root_task_id, task_id)
+                if plan_row:
+                    task_id = str(plan_row["node_id"])
+                    _set_plan_parents_in_txn(conn, root_task_id, task_id, parents)
+                    updated.append(task_id)
+                    continue
                 _set_parents_in_txn(conn, root_task_id, task_id, parents)
                 updated.append(task_id)
             elif kind == "mark_node":
                 task_id = str(op.get("task_id") or "").strip()
-                _assert_loop_node(conn, task_id, root_task_id)
                 metadata = _node_metadata_from_op(op, prefix="mark_node")
+                plan_row = _target_plan_node_or_none(conn, root_task_id, task_id)
+                if plan_row:
+                    task_id = str(plan_row["node_id"])
+                    _update_plan_node_in_txn(conn, root_task_id, task_id, op, metadata=metadata)
+                    updated.append(task_id)
+                    continue
+                _assert_loop_node(conn, task_id, root_task_id)
                 _append_node_event(
                     conn,
                     task_id,

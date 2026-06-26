@@ -994,7 +994,7 @@ function loopIntakeBlocksSubmit(row: LoopRow): boolean {
 
 function loopSubmitTitle(row: LoopRow): string | undefined {
   return loopIntakeBlocksSubmit(row)
-    ? 'Submit approves Loop planning and keeps generated option tasks scheduled until activation.'
+    ? 'Submit approves Loop intake while keeping lightweight planning nodes non-dispatchable until activation.'
     : undefined
 }
 
@@ -1006,10 +1006,11 @@ function LoopTaskActions({
   row: LoopRow
 }) {
   const status = normalizedLoopValue(row.status)
+  const planningNode = row.planningNode === true
   const blocked = status === 'blocked'
   const archived = status === 'archived'
   const terminal = TERMINAL_LOOP_STATUSES.has(status)
-  const canSubmit = (status === 'triage' || status === 'scheduled') && !terminal && !isTentativeDecisionOptionEndpoint(row)
+  const canSubmit = !planningNode && (status === 'triage' || status === 'scheduled') && !terminal && !isTentativeDecisionOptionEndpoint(row)
   const statusAction: LoopTaskAction = blocked ? 'unblock' : 'block'
   const statusLabel = blocked ? 'Unblock' : 'Block'
 
@@ -1029,7 +1030,7 @@ function LoopTaskActions({
           <span>Submit</span>
         </Button>
       )}
-      {!terminal && (
+      {!planningNode && !terminal && (
         <Button
           aria-label={`${statusLabel} ${row.taskId}`}
           className="h-7 gap-1.5 px-2 text-xs"
@@ -1053,7 +1054,7 @@ function LoopTaskActions({
         <Codicon name="comment-discussion" size="0.82rem" />
         <span>Ask in chat</span>
       </Button>
-      {!archived && (
+      {!planningNode && !archived && (
         <Button
           aria-label={`Archive ${row.taskId}`}
           className="h-7 gap-1.5 px-2 text-xs"
@@ -2234,6 +2235,7 @@ function LoopTaskGraphActionTray({
 }) {
   const { row, x, y } = layout
   const blocked = normalizedLoopValue(row.status) === 'blocked'
+  const planningNode = row.planningNode === true
   const statusAction: LoopTaskAction = blocked ? 'unblock' : 'block'
   const statusLabel = blocked ? 'Unblock' : 'Block'
 
@@ -2267,20 +2269,22 @@ function LoopTaskGraphActionTray({
         <Codicon name="comment-discussion" size="0.72rem" />
         <span>Ask</span>
       </Button>
-      <Button
-        aria-label={`${statusLabel} ${row.taskId}`}
-        className="h-6 gap-1 px-1.5 text-[0.68rem]"
-        disabled={!onTaskAction}
-        onClick={event => {
-          event.stopPropagation()
-          onTaskAction?.(statusAction, row)
-        }}
-        type="button"
-        variant="outline"
-      >
-        <Codicon name={blocked ? 'unlock' : 'lock'} size="0.72rem" />
-        <span>{statusLabel}</span>
-      </Button>
+      {!planningNode && (
+        <Button
+          aria-label={`${statusLabel} ${row.taskId}`}
+          className="h-6 gap-1 px-1.5 text-[0.68rem]"
+          disabled={!onTaskAction}
+          onClick={event => {
+            event.stopPropagation()
+            onTaskAction?.(statusAction, row)
+          }}
+          type="button"
+          variant="outline"
+        >
+          <Codicon name={blocked ? 'unlock' : 'lock'} size="0.72rem" />
+          <span>{statusLabel}</span>
+        </Button>
+      )}
     </div>
   )
 }
@@ -3275,7 +3279,7 @@ function LoopTaskDetails({
         commentsError={commentsError}
         detail={detail}
         detailError={detailError}
-        onAddComment={onAddComment}
+        onAddComment={row.planningNode ? undefined : onAddComment}
         row={row}
       />
 

@@ -109,6 +109,11 @@ export function useLoopPanelController({
   const loopPanelRootKey = loopPanelState?.rootTaskId || ''
   const loopSourceBoard = loopSourceQuery.data?.board || undefined
 
+  const focusedLoopRow = useMemo(
+    () => loopPanelState?.rows.find(row => row.taskId === focusedLoopTaskId) || null,
+    [focusedLoopTaskId, loopPanelState]
+  )
+
   const selectedLoopTaskDetailQuery = useQuery({
     queryKey: [
       'loop-task-detail',
@@ -118,7 +123,12 @@ export function useLoopPanelController({
       loopPanelState?.revision || 0
     ],
     queryFn: () => getLoopTaskDetail(focusedLoopTaskId!, activeGatewayProfile, loopSourceBoard),
-    enabled: gatewayOpen && loopPanelOpen && Boolean(focusedLoopTaskId) && Boolean(tenantLoopPanelState?.rows.length),
+    enabled:
+      gatewayOpen &&
+      loopPanelOpen &&
+      Boolean(focusedLoopTaskId) &&
+      focusedLoopRow?.planningNode !== true &&
+      Boolean(tenantLoopPanelState?.rows.length),
     refetchInterval: query =>
       loopSessionSourceRefetchInterval({
         session_id: loopSourceSessionId,
@@ -256,8 +266,21 @@ export function useLoopPanelController({
       }
 
       if (action === 'ask-hermes') {
-        onAddContextRef(`@task:${row.taskId}`, row.title || row.taskId, `Loop task ${row.taskId}`)
+        if (!row.planningNode) {
+          onAddContextRef(`@task:${row.taskId}`, row.title || row.taskId, `Loop task ${row.taskId}`)
+        }
+
         requestComposerInsert(buildLoopChatDraft(row), { mode: 'block', target: 'main' })
+
+        return
+      }
+
+      if (row.planningNode) {
+        notify({
+          kind: 'warning',
+          title: 'Planning node only',
+          message: 'Planning nodes are visual decision records. Ask in chat to activate one with delegate_task(mode="loop").'
+        })
 
         return
       }

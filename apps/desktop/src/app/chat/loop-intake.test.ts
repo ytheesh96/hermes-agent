@@ -45,12 +45,56 @@ describe('Loop intake foreground trigger', () => {
     expect(draft).toContain('start the graph-first Loop intake path')
     expect(draft).toContain('Treat this row as the real Loop/Kanban root')
     expect(draft).toContain('Use the Loop graph as the exploration surface')
-    expect(draft).toContain('scheduled option tasks')
-    expect(draft).toContain('The clarify choices must match those option tasks')
-    expect(draft).toContain('delete/archive unchosen sibling option tasks')
+    expect(draft).toContain('lightweight planning nodes')
+    expect(draft).toContain('without creating scheduled Kanban tasks')
+    expect(draft).toContain('The clarify choices must match those planning nodes')
+    expect(draft).toContain('delete/archive unchosen sibling planning nodes')
+    expect(draft).toContain('delegate_task(mode="loop")')
+    expect(draft).toContain('Do not promote planning nodes to ready')
     expect(draft).toContain('origin activation')
+    expect(draft).not.toContain('scheduled option tasks')
     expect(draft).not.toContain('Interview me relentlessly')
     expect(draft).not.toContain('Resolved decisions')
+  })
+
+  it('shows planning nodes from the lightweight planning projection', () => {
+    const state = deriveLoopPanelStateFromTenantSource({
+      latest_event_id: 2,
+      planning_links: [{ parent_id: 't_intake', child_id: 'plan:option-a' }],
+      planning_nodes: [
+        {
+          active: true,
+          body: 'Description: option A',
+          branch_kind: 'alternative',
+          decision_group_id: 'choice-1',
+          execution_task_id: 't_exec',
+          frontier: true,
+          id: 'plan:option-a',
+          included_parent_ids: ['t_intake'],
+          is_planning_node: true,
+          selection_state: 'candidate',
+          status: 'scheduled',
+          suggested_owner: 'planner',
+          title: 'Option A'
+        }
+      ],
+      root_task_id: 't_intake',
+      session_id: 'session-intake',
+      tasks: titleOnlyIntakeSource.tasks
+    })
+
+    const planningRow = state!.rows.find(row => row.taskId === 'plan:option-a')!
+    expect(planningRow.planningNode).toBe(true)
+    expect(planningRow.parents).toEqual(['t_intake'])
+    expect(planningRow.active).toBe(true)
+    expect(planningRow.frontier).toBe(true)
+    expect(planningRow.executionTaskId).toBe('t_exec')
+    expect(planningRow.suggestedOwner).toBe('planner')
+
+    const draft = buildLoopChatDraft(planningRow)
+    expect(draft).toContain('lightweight planning node, not a dispatchable Kanban task')
+    expect(draft).toContain('delegate_task(mode="loop"')
+    expect(draft).toContain('execution_task_id')
   })
 
   it('keeps ordinary Loop chat drafts for rows without durable intake state', () => {

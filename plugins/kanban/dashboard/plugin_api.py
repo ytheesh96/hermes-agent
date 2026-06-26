@@ -360,6 +360,63 @@ def _task_dict_with_loop_intake(
     return item
 
 
+def _loop_planning_projection(
+    conn: sqlite3.Connection,
+    root_task_id: Optional[str],
+) -> tuple[list[dict[str, Any]], list[dict[str, str]], int]:
+    """Return lightweight planning nodes for a Loop root without task rows.
+
+    ``tasks`` / ``links`` stay reserved for real Kanban execution rows and
+    formal prerequisites. These planning nodes are rendered by the Loop UI as
+    graph/detail records only; they are not dispatchable queue items.
+    """
+    if not root_task_id:
+        return [], [], 0
+    try:
+        from hermes_cli import loop_graph
+
+        graph = loop_graph.read_graph(conn, root_task_id, include_nodes=True)
+    except Exception:
+        log.debug("loop planning projection failed for %s", root_task_id, exc_info=True)
+        return [], [], 0
+
+    nodes: list[dict[str, Any]] = []
+    links: list[dict[str, str]] = []
+    for node in graph.get("nodes") or []:
+        if not isinstance(node, dict) or node.get("is_plan_node") is not True:
+            continue
+        node_id = str(node.get("task_id") or "").strip()
+        if not node_id:
+            continue
+        parents = [str(parent) for parent in node.get("parents") or [] if str(parent)]
+        children = [str(child) for child in node.get("children") or [] if str(child)]
+        item: dict[str, Any] = {
+            "id": node_id,
+            "title": node.get("title") or node_id,
+            "body": node.get("body"),
+            "status": node.get("status") or "scheduled",
+            "tenant": root_task_id,
+            "created_by": f"loop_plan:{root_task_id}",
+            "is_planning_node": True,
+            "active": bool(node.get("active")),
+            "frontier": bool(node.get("frontier")),
+            "included_parent_ids": parents,
+            "included_child_ids": children,
+            "links": {"parents": parents, "children": children},
+            "parent_count": len(parents),
+            "child_count": len(children),
+            "branch_kind": node.get("branch_kind"),
+            "decision_group_id": node.get("decision_group_id"),
+            "selection_state": node.get("selection_state"),
+            "execution_task_id": node.get("execution_task_id"),
+            "suggested_owner": node.get("suggested_owner"),
+        }
+        nodes.append(item)
+        for parent_id in parents:
+            links.append({"parent_id": parent_id, "child_id": node_id})
+    return nodes, links, int(graph.get("graph_revision") or 0)
+
+
 def _task_has_unresolved_loop_intake(conn: sqlite3.Connection, task_id: str) -> bool:
     intake = _loop_intake_state_for_task(conn, task_id)
     if not intake:
@@ -1251,6 +1308,8 @@ def get_session_source(
         intake_states = _loop_intake_states_for_tasks(conn, task_ids)
         loop_node_metadata = _loop_node_metadata_for_tasks(conn, task_ids)
         root_task_id = _session_source_root_task_id(conn, tasks, included_links)
+        planning_nodes, planning_links, planning_revision = _loop_planning_projection(conn, root_task_id)
+        source_revision = max(source_revision, planning_revision)
         loop_handoffs = _loop_handoffs_by_task(
             conn,
             task_ids,
@@ -1294,6 +1353,8 @@ def get_session_source(
             "tenants": tenant_filters,
             "include_archived": include_archived,
             "tasks": payload_tasks,
+            "planning_nodes": planning_nodes,
+            "planning_links": planning_links,
             "workers": [
                 {**worker_activity[task.id], "task_title": task.title, "task_status": task.status}
                 for task in ordered_tasks

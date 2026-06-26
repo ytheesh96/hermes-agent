@@ -390,7 +390,7 @@ def test_loop_create_sync_timeout_and_completion_wait(loop_env):
     assert completed["summary"] == "completed during sync wait"
 
 
-def test_patch_creates_real_scheduled_tasks_with_dependencies_and_compact_response(loop_env):
+def test_patch_creates_lightweight_planning_nodes_without_tasks_or_task_links(loop_env):
     root = loop_env
     out = _call(
         {
@@ -438,22 +438,39 @@ def test_patch_creates_real_scheduled_tasks_with_dependencies_and_compact_respon
 
     conn = kb.connect()
     try:
-        first = kb.get_task(conn, created_by_client["a"])
-        second = kb.get_task(conn, created_by_client["b"])
-        assert first is not None and first.status == "scheduled" and first.assignee is None
-        assert second is not None and second.status == "scheduled" and second.assignee is None
-        assert second.tenant == "tenant-a"
-        assert first.created_by == "loop:tenant-a"
-        assert second.created_by == "loop:tenant-a"
-        assert kb.parent_ids(conn, first.id) == []
-        assert kb.parent_ids(conn, second.id) == [first.id]
-        loop_rows = [t for t in kb.list_tasks(conn, status="scheduled") if t.tenant == "tenant-a"]
-        assert {t.id for t in loop_rows} == {first.id, second.id}
-        assert not any(t.title in {"Loop root", "Loop root container"} for t in loop_rows)
-        assert "Loop provenance" in (first.body or "")
-        assert "suggested_owner: researcher-a" in (first.body or "")
+        assert kb.get_task(conn, created_by_client["a"]) is None
+        assert kb.get_task(conn, created_by_client["b"]) is None
+        assert [t for t in kb.list_tasks(conn, status="scheduled") if t.tenant == "tenant-a"] == []
+        assert conn.execute("SELECT COUNT(*) FROM task_links").fetchone()[0] == 0
+
+        plan_rows = conn.execute(
+            "SELECT node_id, title, body, status, suggested_owner, active, frontier "
+            "FROM loop_plan_nodes WHERE root_task_id = ? ORDER BY created_at ASC, node_id ASC",
+            (root,),
+        ).fetchall()
+        assert [row["node_id"] for row in plan_rows] == [created_by_client["a"], created_by_client["b"]]
+        assert [row["title"] for row in plan_rows] == ["Research options", "Synthesize plan"]
+        assert [row["status"] for row in plan_rows] == ["scheduled", "scheduled"]
+        assert plan_rows[0]["body"] == "Define research scope"
+        assert plan_rows[0]["suggested_owner"] == "researcher-a"
+        assert plan_rows[0]["active"] == 1
+        assert plan_rows[0]["frontier"] == 1
+
+        plan_edges = conn.execute(
+            "SELECT parent_id, child_id FROM loop_plan_edges WHERE root_task_id = ? ORDER BY parent_id, child_id",
+            (root,),
+        ).fetchall()
+        assert [(row["parent_id"], row["child_id"]) for row in plan_edges] == [
+            (created_by_client["a"], created_by_client["b"])
+        ]
     finally:
         conn.close()
+
+    read = _call({"action": "read", "root_task_id": root, "include_nodes": True})
+    by_id = {node["task_id"]: node for node in read["nodes"]}
+    assert by_id[created_by_client["a"]]["is_plan_node"] is True
+    assert by_id[created_by_client["a"]]["suggested_owner"] == "researcher-a"
+    assert by_id[created_by_client["b"]]["parents"] == [created_by_client["a"]]
 
 
 def test_patch_rejects_stale_revision_and_replays_duplicate_mutation(loop_env):
@@ -497,7 +514,11 @@ def test_patch_rejects_stale_revision_and_replays_duplicate_mutation(loop_env):
 
     conn = kb.connect()
     try:
-        rows = [t for t in kb.list_tasks(conn, status="scheduled") if t.title == "Only once"]
+        assert [t for t in kb.list_tasks(conn, status="scheduled") if t.title == "Only once"] == []
+        rows = conn.execute(
+            "SELECT node_id FROM loop_plan_nodes WHERE root_task_id = ? AND title = ? AND status != 'archived'",
+            (root, "Only once"),
+        ).fetchall()
         assert len(rows) == 1
     finally:
         conn.close()
@@ -560,9 +581,12 @@ def test_patch_rejects_mutation_targets_outside_requested_root(loop_env, op_name
     conn = kb.connect()
     try:
         unrelated_task = kb.get_task(conn, unrelated)
-        other_task = kb.get_task(conn, other_node)
+        other_task = conn.execute(
+            "SELECT title FROM loop_plan_nodes WHERE root_task_id = ? AND node_id = ?",
+            ("tenant-b", other_node),
+        ).fetchone()
         assert unrelated_task is not None and unrelated_task.title == "Unrelated triage"
-        assert other_task is not None and other_task.title == "Root B node"
+        assert other_task is not None and other_task["title"] == "Root B node"
     finally:
         conn.close()
 
@@ -617,8 +641,11 @@ def test_add_node_rejects_parents_outside_requested_root(loop_env, parent_kind):
 
     conn = kb.connect()
     try:
-        rows = [t for t in kb.list_tasks(conn, status="scheduled") if t.title == "Child"]
-        assert rows == []
+        assert [t for t in kb.list_tasks(conn, status="scheduled") if t.title == "Child"] == []
+        assert conn.execute(
+            "SELECT 1 FROM loop_plan_nodes WHERE root_task_id = ? AND client_id = ?",
+            (root, "child"),
+        ).fetchone() is None
     finally:
         conn.close()
 
@@ -656,8 +683,15 @@ def test_add_node_allows_existing_same_root_parent_and_prior_client_id_parent(lo
 
     conn = kb.connect()
     try:
-        assert kb.parent_ids(conn, ids["same-root-child"]) == [existing_id]
-        assert kb.parent_ids(conn, ids["prior-client-child"]) == [ids["same-root-child"]]
+        rows = conn.execute(
+            "SELECT parent_id, child_id FROM loop_plan_edges WHERE root_task_id = ? ORDER BY parent_id, child_id",
+            (root,),
+        ).fetchall()
+        assert {(row["parent_id"], row["child_id"]) for row in rows} == {
+            (existing_id, ids["same-root-child"]),
+            (ids["same-root-child"], ids["prior-client-child"]),
+        }
+        assert conn.execute("SELECT COUNT(*) FROM task_links").fetchone()[0] == 0
     finally:
         conn.close()
 
@@ -720,7 +754,11 @@ def test_patch_replays_duplicate_mutation_that_started_before_first_commit(loop_
 
     conn = kb.connect()
     try:
-        rows = [t for t in kb.list_tasks(conn, status="scheduled") if t.title == "Only once concurrently"]
+        assert [t for t in kb.list_tasks(conn, status="scheduled") if t.title == "Only once concurrently"] == []
+        rows = conn.execute(
+            "SELECT node_id FROM loop_plan_nodes WHERE root_task_id = ? AND title = ? AND status != 'archived'",
+            (root, "Only once concurrently"),
+        ).fetchall()
         assert len(rows) == 1
     finally:
         conn.close()

@@ -1030,18 +1030,31 @@ def test_session_source_includes_loop_graph_decision_metadata(client, monkeypatc
     from hermes_cli import loop_graph
 
     monkeypatch.setenv("HERMES_SESSION_ID", "session-decision-metadata")
+    draft = client.post(
+        "/api/plugins/kanban/loop-drafts",
+        json={
+            "title": "Decision root",
+            "session_id": "session-decision-metadata",
+            "tenant": "decision-session",
+        },
+    )
+    assert draft.status_code == 200, draft.text
+    root_task_id = draft.json()["task"]["id"]
+
     conn = kb.connect()
     try:
+        expected_revision = loop_graph.graph_revision(conn, root_task_id)
         result = loop_graph.apply_patch(
             conn,
-            "decision-session",
-            expected_revision=0,
+            root_task_id,
+            expected_revision=expected_revision,
             mutation_id="m-decision-option",
             operations=[
                 {
                     "op": "add_node",
                     "client_id": "option-a",
                     "title": "Option A",
+                    "parents": [root_task_id],
                     "branch_kind": "alternative",
                     "decision_group_id": "choice-1",
                     "selection_state": "candidate",
@@ -1060,10 +1073,27 @@ def test_session_source_includes_loop_graph_decision_metadata(client, monkeypatc
     assert response.status_code == 200, response.text
     data = response.json()
     [task] = data["tasks"]
-    assert task["id"] == option_id
-    assert task["branch_kind"] == "alternative"
-    assert task["decision_group_id"] == "choice-1"
-    assert task["selection_state"] == "candidate"
+    [planning_node] = data["planning_nodes"]
+    assert data["root_task_id"] == root_task_id
+    assert task["id"] == root_task_id
+    assert planning_node["id"] == option_id
+    assert planning_node["is_planning_node"] is True
+    assert planning_node["branch_kind"] == "alternative"
+    assert planning_node["decision_group_id"] == "choice-1"
+    assert planning_node["selection_state"] == "candidate"
+    assert planning_node["included_parent_ids"] == [root_task_id]
+    assert data["planning_links"] == [{"parent_id": root_task_id, "child_id": option_id}]
+    assert data["links"] == []
+
+    conn = kb.connect()
+    try:
+        assert kb.get_task(conn, option_id) is None
+        assert conn.execute(
+            "SELECT 1 FROM task_links WHERE parent_id = ? OR child_id = ?",
+            (option_id, option_id),
+        ).fetchone() is None
+    finally:
+        conn.close()
 
 
 def test_session_source_falls_back_to_board_containing_lineage_tenant(client, kanban_home):

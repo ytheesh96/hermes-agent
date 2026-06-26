@@ -19,6 +19,15 @@ function rowNeedsIntake(row: LoopRow): boolean {
 export function buildLoopChatDraft(row: LoopRow): string {
   const title = rowTitle(row)
 
+  if (row.planningNode) {
+    return [
+      `For Loop planning node ${row.taskId} (${title}): inspect the visible planning details and help me decide the next step.`,
+      'This is a lightweight planning node, not a dispatchable Kanban task. Do not block, archive, promote, or submit it as a task row.',
+      'If I explicitly activate this leaf, synthesize the selected decisions and node details into a self-contained durable work packet, then create real execution with delegate_task(mode="loop", assignee=<real profile>, board=<current board>, goal=..., context=...).',
+      'After delegate_task returns a real execution task id, record/reference that id on the planning node/root with loop_graph (execution_task_id) so the planning graph points at the actual work.'
+    ].join('\n')
+  }
+
   if (!rowNeedsIntake(row)) {
     return title ? `Help me with Loop task ${row.taskId}: ${title}` : `Help me with Loop task ${row.taskId}.`
   }
@@ -26,12 +35,13 @@ export function buildLoopChatDraft(row: LoopRow): string {
   return [
     `For Loop row ${row.taskId} (${title}): start the graph-first Loop intake path for this slash-created title-only draft.`,
     'Treat this row as the real Loop/Kanban root. Keep it in intake/planning; do not dispatch it or promote planning/options to ready until the user explicitly activates an executable leaf.',
-    'Use the Loop graph as the exploration surface, not a prose-only interview. First read the graph with loop_graph. Then create the next decision branch as scheduled option tasks with loop_graph add_node operations so the options are visible in the Loop overview/card UI and detail drawer. Parent each option to the root/current frontier node so the branch stays connected in the graph.',
-    'Every option task body must include: Description, Tradeoffs, Recommendation rationale, Dependencies/assumptions, and Likely downstream impact. Put the recommended option first and label it clearly in the title/body.',
-    'After the scheduled option tasks exist, call clarify. The clarify choices must match those option tasks, with the recommended option first/labeled. Keep chat light; tell me I can inspect the graph/detail drawers before answering.',
-    'When I choose, make the graph lock and clarify choice the same operation: mark the selected option as the chosen/frontier path, delete/archive unchosen sibling option tasks, leave the selected option in the graph, then expand only that selected option into the next scheduled branch.',
+    'Use the Loop graph as the exploration surface, not a prose-only interview. First read the graph with loop_graph. Then create the next decision branch as lightweight planning nodes with loop_graph add_node operations so the options are visible in the Loop overview/card UI and detail drawer without creating scheduled Kanban tasks. Parent each option to the root/current frontier node so the branch stays connected in the visual graph.',
+    'Every planning node body must include: Description, Tradeoffs, Recommendation rationale, Dependencies/assumptions, and Likely downstream impact. Put the recommended option first and label it clearly in the title/body.',
+    'After the planning nodes exist, call clarify. The clarify choices must match those planning nodes, with the recommended option first/labeled. Keep chat light; tell me I can inspect the graph/detail drawers before answering.',
+    'When I choose, make the graph lock and clarify choice the same operation: mark the selected planning node as the chosen/frontier path, delete/archive unchosen sibling planning nodes, leave the selected option in the graph, then expand only that selected option into the next lightweight planning branch.',
     'Do not write a root-body decision ledger or duplicate locked-choice section. The surviving graph path is the durable record: chosen options remain, rejected sibling options are deleted/archived.',
-    'Repeat until the frontier is an executable leaf. On origin activation, subscribe/route the origin session first, then move only the executable scheduled leaf to ready; parent completion must not auto-run scheduled planning children.',
+    'Repeat until the frontier is an executable leaf. On explicit origin activation, subscribe/route the origin session first, synthesize the selected graph path into a self-contained work packet, then call delegate_task(mode="loop") to create the real durable execution task. Do not promote planning nodes to ready and do not create task_links prerequisites from planning edges.',
+    'After delegate_task returns, record/reference the real execution task id on the selected planning node/root with loop_graph execution_task_id so the visual plan links to actual work.',
     'When a worker re-enters with done, treat it only as candidate completion. Judge it against the root goal, the task criteria, acceptance criteria, and whether it moved the needle; accept, rework, split, or block before advancing the graph.'
   ].join('\n')
 }

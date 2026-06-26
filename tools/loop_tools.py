@@ -452,15 +452,15 @@ def _handle_loop_request_review(args: dict[str, Any], **_kwargs) -> str:
 LOOP_GRAPH_SCHEMA = {
     "name": "loop_graph",
     "description": (
-        "Read or patch the scheduled-task-backed Loop graph. Patch operations create/update/archive "
-        "real Kanban planning tasks and dependency links with expected_revision + mutation_id guards. "
+        "Read or patch the lightweight Loop planning graph. Patch operations create/update/archive "
+        "planning nodes and visual planning edges (not Kanban tasks/task_links) with expected_revision + mutation_id guards. "
         "Responses are compact: success/error plus graph revision data."
     ),
     "parameters": {
         "type": "object",
         "properties": {
             "action": {"type": "string", "enum": ["read", "patch"]},
-            "root_task_id": {"type": "string", "description": "Loop identity / session tenant id (legacy field name; not a Kanban root task)."},
+            "root_task_id": {"type": "string", "description": "Durable Loop root task id, or a legacy Loop identity/tenant id."},
             "include_nodes": {"type": "boolean", "description": "For read only, include compact dependency-derived nodes."},
             "expected_revision": {"type": "integer", "description": "For patch, graph_revision from the last read."},
             "mutation_id": {"type": "string", "description": "For patch, caller-stable idempotency key for this mutation."},
@@ -471,11 +471,13 @@ LOOP_GRAPH_SCHEMA = {
                     "set_parents, mark_node, resolve_handoff, validate. add_node/update_node/mark_node support "
                     "client_id/title/body/parents/suggested_owner/status/active/frontier plus graph metadata "
                     "branch_kind ('alternative' or 'required'), decision_group_id, and selection_state; "
-                    "status defaults to scheduled so planning options are visible but "
-                    "non-dispatchable. "
+                    "status defaults to scheduled for visible, non-dispatchable planning nodes. "
                     "Parent option nodes to the root/current frontier so they stay connected "
-                    "in Loop overview/detail graphs. resolve_handoff records foreground "
-                    "approval/rejection without promoting downstream rows."
+                    "in Loop overview/detail graphs. When the user explicitly activates a leaf, "
+                    "call delegate_task(mode='loop') to create real durable work, then update the "
+                    "planning node with execution_task_id; do not promote planning nodes to ready "
+                    "or use planning edges as task_links prerequisites. resolve_handoff records "
+                    "foreground approval/rejection without promoting downstream rows."
                 ),
                 "items": {"type": "object"},
             },

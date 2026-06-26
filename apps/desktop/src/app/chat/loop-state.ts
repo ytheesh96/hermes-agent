@@ -142,6 +142,7 @@ export interface LoopIntakeState {
 
 export interface TenantLoopTask {
   age?: Record<string, null | number>
+  active?: boolean
   assignee?: null | string
   branch_kind?: null | string
   body?: null | string
@@ -155,11 +156,13 @@ export interface TenantLoopTask {
   current_step_key?: null | string
   decision_group_id?: null | string
   diagnostics?: unknown[]
+  execution_task_id?: null | string
   external_child_tasks?: CompactLoopTask[]
   external_parent_tasks?: CompactLoopTask[]
   id: string
   included_child_ids?: string[]
   included_parent_ids?: string[]
+  is_planning_node?: boolean
   latest_run?: null | LoopLatestRun
   latest_summary?: null | string
   loop_intake?: null | LoopIntakeState
@@ -179,8 +182,10 @@ export interface TenantLoopTask {
   selection_state?: null | string
   foreground_parent_session_id?: null | string
   foreground_fork_session_id?: null | string
+  frontier?: boolean
   started_at?: null | number
   status: string
+  suggested_owner?: null | string
   tenant?: null | string
   title: string
   warnings?: unknown
@@ -198,6 +203,8 @@ export interface TenantLoopSource {
   lineage_session_ids?: string[]
   links?: { child_id?: string; parent_id?: string }[]
   now?: number
+  planning_links?: { child_id?: string; parent_id?: string }[]
+  planning_nodes?: TenantLoopTask[]
   root_task_id?: null | string
   session_id?: string
   tasks?: TenantLoopTask[]
@@ -265,6 +272,7 @@ export interface LoopRow {
   externalChildTasks?: CompactLoopTask[]
   externalParentTasks?: CompactLoopTask[]
   decisionGroupId?: null | string
+  executionTaskId?: null | string
   frontier: boolean
   latestRun?: null | LoopLatestRun
   latestSummary?: null | string
@@ -273,6 +281,7 @@ export interface LoopRow {
   parentCount: number
   parents: string[]
   priority?: number
+  planningNode?: boolean
   rawTask?: TenantLoopTask
   reviewKind?: null | string
   resumeMode?: null | string
@@ -283,6 +292,7 @@ export interface LoopRow {
   foregroundParentSessionId?: null | string
   foregroundForkSessionId?: null | string
   status: string
+  suggestedOwner?: null | string
   taskId: string
   tenant?: null | string
   title: string
@@ -611,7 +621,7 @@ function taskNeighborMap(
     }
   }
 
-  for (const sourceLink of [...(source.links || []), ...(source.external_links || [])]) {
+  for (const sourceLink of [...(source.links || []), ...(source.external_links || []), ...(source.planning_links || [])]) {
     link(sourceLink.parent_id, sourceLink.child_id)
   }
 
@@ -833,9 +843,12 @@ function tenantRowFromTask(
   const latestRunActive = ACTIVE_STATUSES.has(normalizedStatus(latestRun?.status))
   const latestWorkerActive = ACTIVE_STATUSES.has(normalizedStatus(workerActivity?.status))
   const unfinishedRunnable = RUNNABLE_STATUSES.has(status) && !COMPLETE_STATUSES.has(status)
+  const planningNode = task.is_planning_node === true
 
   return {
-    active: ACTIVE_STATUSES.has(status) || latestRunActive || latestWorkerActive || Boolean(task.current_run_id),
+    active: planningNode
+      ? Boolean(task.active)
+      : ACTIVE_STATUSES.has(status) || latestRunActive || latestWorkerActive || Boolean(task.current_run_id),
     assignee: task.assignee,
     branchKind: task.branch_kind,
     body: task.body,
@@ -846,7 +859,8 @@ function tenantRowFromTask(
     externalChildTasks: task.external_child_tasks || [],
     externalParentTasks: task.external_parent_tasks || [],
     decisionGroupId: task.decision_group_id,
-    frontier: unfinishedRunnable,
+    executionTaskId: task.execution_task_id,
+    frontier: planningNode ? Boolean(task.frontier) : unfinishedRunnable,
     latestRun,
     latestSummary:
       task.latest_summary || workerActivity?.summary || workerActivity?.summary_preview || latestRun?.summary || null,
@@ -854,6 +868,7 @@ function tenantRowFromTask(
     loopHandoffs: task.loop_handoffs || [],
     parentCount: parents.length || task.parent_count || task.parents_count || 0,
     parents,
+    planningNode,
     priority: task.priority,
     rawTask: task,
     reviewKind: task.review_kind,
@@ -865,6 +880,7 @@ function tenantRowFromTask(
     foregroundParentSessionId: task.foreground_parent_session_id,
     foregroundForkSessionId: task.foreground_fork_session_id,
     status,
+    suggestedOwner: task.suggested_owner,
     taskId: task.id,
     tenant: task.tenant,
     title: task.title || task.id,
@@ -881,7 +897,7 @@ export function deriveLoopPanelStateFromTenantSource(
     return null
   }
 
-  const tasks = (source.tasks || []).filter(
+  const tasks = [...(source.tasks || []), ...(source.planning_nodes || [])].filter(
     task => task.id && (source.include_archived || !ARCHIVED_STATUSES.has(normalizedStatus(task.status)))
   )
 
@@ -923,17 +939,21 @@ function rowFromNode(value: unknown): LoopRow | null {
   return {
     active: booleanField(node, 'active'),
     branchKind: stringField(node, 'branch_kind') || undefined,
+    body: stringField(node, 'body') || undefined,
     childCount: numberField(node, 'child_count'),
     children: stringArrayField(node, 'children'),
     commentCount: numberField(node, 'comment_count'),
     depth: numberField(node, 'depth'),
     decisionGroupId: stringField(node, 'decision_group_id') || undefined,
+    executionTaskId: stringField(node, 'execution_task_id') || undefined,
     frontier: booleanField(node, 'frontier'),
     parentCount: parents.length || numberField(node, 'parent_count'),
     parents,
+    planningNode: booleanField(node, 'is_plan_node') || booleanField(node, 'is_planning_node'),
     priority: numberField(node, 'priority') || undefined,
     selectionState: stringField(node, 'selection_state') || undefined,
     status: stringField(node, 'status') || 'triage',
+    suggestedOwner: stringField(node, 'suggested_owner') || undefined,
     taskId,
     title: title || taskId
   }
