@@ -740,6 +740,18 @@ export function useMessageStream({
         return
       }
 
+      if (event.type.startsWith('kanban.worker.')) {
+        const sessionIds = loopagentSessionKeys(payloadRecord, explicitSid)
+
+        if (sessionIds.length > 0) {
+          upsertLoopagent(sessionIds, payloadRecord, event.type)
+        }
+
+        void queryClient.invalidateQueries({ queryKey: ['loop-session-source'] })
+
+        return
+      }
+
       if (!explicitSid && gatewayEventRequiresSessionId(event.type)) {
         return
       }

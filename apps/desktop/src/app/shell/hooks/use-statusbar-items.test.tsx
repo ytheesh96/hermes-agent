@@ -1,18 +1,12 @@
-import { QueryClient, QueryClientProvider } from '@tanstack/react-query'
-import { cleanup, renderHook, waitFor } from '@testing-library/react'
-import type { ReactNode } from 'react'
+import { cleanup, renderHook } from '@testing-library/react'
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 
-import { getLoopSessionSource } from '@/hermes'
-import { $activeGatewayProfile } from '@/store/profile'
+import { $kanbanStatusBySession, reconcileKanbanSessionSourceForComposer } from '@/store/composer-status'
+import { $loopagentsBySession, upsertLoopagent } from '@/store/loopagents'
 import { $activeSessionId } from '@/store/session'
+import { $subagentsBySession, upsertSubagent } from '@/store/subagents'
 
 import { useStatusbarItems } from './use-statusbar-items'
-
-vi.mock('@/hermes', async importOriginal => ({
-  ...(await importOriginal<Record<string, unknown>>()),
-  getLoopSessionSource: vi.fn()
-}))
 
 vi.mock('@/i18n', () => ({
   useI18n: () => ({
@@ -53,7 +47,7 @@ vi.mock('@/i18n', () => ({
           runtimeSessionElapsed: 'Runtime session elapsed',
           session: 'Session',
           showTerminal: 'Show terminal',
-          subagents: (count: number) => `${count} subagents`,
+          subagents: (count: number) => `${count} subagent${count === 1 ? '' : 's'}`,
           switchModel: 'Switch model',
           turnRunning: 'Turn running',
           unknown: 'unknown',
@@ -84,57 +78,87 @@ const baseOptions = {
   toggleCommandCenter: vi.fn()
 }
 
-function wrapper({ children }: { children: ReactNode }) {
-  const client = new QueryClient({ defaultOptions: { queries: { retry: false } } })
-
-  return <QueryClientProvider client={client}>{children}</QueryClientProvider>
-}
-
-describe('useStatusbarItems Kanban workers', () => {
+describe('useStatusbarItems agent activity', () => {
   beforeEach(() => {
     $activeSessionId.set('session-with-workers')
-    $activeGatewayProfile.set('peacock')
-    vi.mocked(getLoopSessionSource).mockResolvedValue({
-      now: 1_000,
-      workers: [
-        {
-          last_heartbeat_at: 990,
-          run_id: 1,
-          started_at: 900,
-          status: 'running',
-          task_id: 't_running',
-          task_title: 'Running task'
-        },
-        {
-          ended_at: 950,
-          error: 'needs review',
-          outcome: 'failed',
-          run_id: 2,
-          started_at: 800,
-          status: 'completed',
-          task_id: 't_failed',
-          task_title: 'Failed task'
-        }
-      ]
-    })
+    $kanbanStatusBySession.set({})
+    $loopagentsBySession.set({})
+    $subagentsBySession.set({})
   })
 
   afterEach(() => {
     cleanup()
-    vi.mocked(getLoopSessionSource).mockReset()
     $activeSessionId.set(null)
-    $activeGatewayProfile.set('default')
+    $kanbanStatusBySession.set({})
+    $loopagentsBySession.set({})
+    $subagentsBySession.set({})
   })
 
-  it('folds durable Kanban worker activity into the Agents statusbar item', async () => {
-    const { result } = renderHook(() => useStatusbarItems(baseOptions), { wrapper })
-
-    await waitFor(() => {
-      const agents = result.current.leftStatusbarItems.find(item => item.id === 'agents')
-
-      expect(agents?.detail).toBe('1 Loop worker need attention · 1 Loop worker running')
+  it('keeps the Subagent label for ordinary spawned subagents', () => {
+    upsertSubagent('session-with-workers', {
+      goal: 'Inspect activity',
+      status: 'running',
+      subagent_id: 'subagent:inspect'
     })
 
-    expect(getLoopSessionSource).toHaveBeenCalledWith('session-with-workers', 'peacock')
+    const { result } = renderHook(() => useStatusbarItems(baseOptions))
+    const agents = result.current.leftStatusbarItems.find(item => item.id === 'agents')
+
+    expect(agents?.detail).toBe('1 subagent')
+  })
+
+  it('folds durable Kanban worker activity into the Agents statusbar item', () => {
+    reconcileKanbanSessionSourceForComposer({
+      sourceSessionId: 'session-with-workers',
+      source: {
+        now: 1_000,
+        workers: [
+          {
+            last_heartbeat_at: 990,
+            run_id: 1,
+            started_at: 900,
+            status: 'running',
+            task_id: 't_running',
+            task_title: 'Running task'
+          },
+          {
+            ended_at: 950,
+            error: 'needs review',
+            outcome: 'failed',
+            run_id: 2,
+            started_at: 800,
+            status: 'completed',
+            task_id: 't_failed',
+            task_title: 'Failed task'
+          }
+        ]
+      }
+    })
+
+    const { result } = renderHook(() => useStatusbarItems(baseOptions))
+    const agents = result.current.leftStatusbarItems.find(item => item.id === 'agents')
+
+    expect(agents?.detail).toBe('1 failed · 1 running')
+  })
+
+  it('deduplicates live Loopagent activity written under origin and worker session keys', () => {
+    upsertLoopagent(
+      ['session-with-workers', 'worker-session-3'],
+      {
+        current_tool: 'terminal',
+        run_id: 3,
+        run_status: 'running',
+        source_session_id: 'session-with-workers',
+        task_id: 't_live',
+        task_title: 'Live Loop worker',
+        worker_session_id: 'worker-session-3'
+      },
+      'kanban.worker.tool_start'
+    )
+
+    const { result } = renderHook(() => useStatusbarItems(baseOptions))
+    const agents = result.current.leftStatusbarItems.find(item => item.id === 'agents')
+
+    expect(agents?.detail).toBe('1 running')
   })
 })

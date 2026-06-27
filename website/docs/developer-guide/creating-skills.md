@@ -263,6 +263,91 @@ Use `required_environment_variables` for simple API keys and tokens (strings sto
 
 See the `skills/productivity/google-workspace/SKILL.md` for a complete example using both.
 
+## Review Standards for Bundled and Optional Skills
+
+Every new or modernized skill that ships in `skills/` or `optional-skills/`
+must meet these standards before merge. Reviewers should reject PRs that
+violate them.
+
+### Frontmatter and attribution
+
+1. **`description` is short and useful.** Keep it to one sentence, at most 60
+   characters, ending with a period. State the capability, not the
+   implementation. Avoid marketing words such as "powerful", "comprehensive",
+   "seamless", or "advanced", and do not repeat the skill name.
+
+   ```python
+   import re, pathlib
+
+   m = re.search(
+       r'^description: (.*)$',
+       pathlib.Path('skills/<cat>/<name>/SKILL.md').read_text(),
+       re.MULTILINE,
+   )
+   assert len(m.group(1)) <= 60, len(m.group(1))
+   ```
+
+2. **`author` credits the human contributor first.** For external
+   contributions, put the contributor's real name and GitHub handle first;
+   "Hermes Agent" is only a secondary collaborator. If a contributor used
+   Hermes to draft a skill and the commit author is the tool, replace it with
+   the human's name.
+
+3. **`platforms:` matches the actual implementation.** Audit scripts and
+   snippets for platform-specific assumptions. Skills that use POSIX-only
+   primitives (`fcntl`, `termios`, `os.setsid`, `os.kill(pid, 0)`, `/proc`,
+   hardcoded `/tmp`, `signal.SIGKILL`, bash heredocs, `apt`, `systemctl`) or
+   macOS-only commands such as `osascript` must declare the supported
+   platforms. Prefer cross-platform stdlib alternatives first:
+   `tempfile.gettempdir`, `pathlib.Path`, `psutil.pid_exists`, and Python-level
+   filtering instead of shelling out to `grep`.
+
+### Body structure and tool references
+
+4. **Use the modern section order.** A skill body should start with
+   `# <Skill> Skill`, include a two- or three-sentence intro that says what it
+   does and does not do, then use these sections when applicable:
+   `## When to Use`, `## Prerequisites`, `## How to Run`,
+   `## Quick Reference`, `## Procedure`, `## Pitfalls`, and
+   `## Verification`. As a rough target, keep simple skills near 100 lines and
+   complex skills near 200 lines. Cut redundant intro fluff, marketing prose,
+   and repeated env-var explanations already covered in prerequisites.
+
+5. **Reference Hermes tools, not their shell equivalents.** SKILL.md prose
+   should name native Hermes tools or expected MCP servers in backticks:
+   `terminal`, `web_extract`, `read_file`, `patch`, `search_files`,
+   `vision_analyze`, `browser_navigate`, `delegate_task`, and so on. Do not
+   make wrapped shell utilities the headline interaction surface:
+   `grep` → `search_files`, `cat`/`head`/`tail` → `read_file`,
+   `sed`/`awk` → `patch`, `find`/`ls` → `search_files target='files'`.
+   Third-party CLIs and shell pipelines are fine inside helper scripts when the
+   skill genuinely needs them.
+
+6. **Document MCP expectations explicitly.** If a skill depends on an MCP
+   server, name that server and describe setup in `## Prerequisites` so the
+   agent does not hallucinate unavailable tools.
+
+### Supporting files, tests, and examples
+
+7. **Put substantial logic in supporting files.** Scripts go in `scripts/`,
+   long references in `references/`, reusable output/input templates in
+   `templates/`, and binary/static assets in `assets/`. Reference these paths
+   relative to the skill directory. Do not expect the model to inline-write
+   parsers, XML walkers, or other non-trivial logic every time.
+
+8. **Add focused skill tests.** Tests belong in
+   `tests/skills/test_<skill>_skill.py` and should use only stdlib, pytest, and
+   `unittest.mock`. No live network calls. Run them with:
+
+   ```bash
+   scripts/run_tests.sh tests/skills/test_<skill>_skill.py -q
+   ```
+
+9. **Keep `.env.example` edits isolated.** When a skill adds environment
+   variables, place them in a clearly delimited block and do not touch
+   surrounding lines; contributor branches often carry stale copies of that
+   file.
+
 ## Skill Guidelines
 
 ### No External Dependencies

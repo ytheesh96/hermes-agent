@@ -109,7 +109,7 @@ Context files are loaded by `build_context_files_prompt()` in `agent/prompt_buil
 1. **Scan working directory** — checks for `.hermes.md` → `AGENTS.md` → `CLAUDE.md` → `.cursorrules` (first match wins)
 2. **Content is read** — each file is read as UTF-8 text
 3. **Security scan** — content is checked for prompt injection patterns
-4. **Truncation** — files exceeding `context_file_max_chars` characters (default 20,000) are head/tail truncated (70% head, 20% tail, with a marker in the middle)
+4. **Truncation** — files exceeding the resolved context-file cap are head/tail truncated (70% head, 20% tail, with a marker in the middle). An explicit `context_file_max_chars` config value wins; otherwise Hermes uses a dynamic cap based on the model context window, with a 20,000-character floor.
 5. **Assembly** — all sections are combined under a `# Project Context` header
 6. **Injection** — the assembled content is added to the system prompt
 
@@ -171,15 +171,15 @@ This scanner protects against common injection patterns, but it's not a substitu
 
 | Limit | Value |
 |-------|-------|
-| Max chars per file | `context_file_max_chars` (default 20,000, ~7,000 tokens) |
+| Max chars per file | `context_file_max_chars` when configured; otherwise dynamic by model context window, with a 20,000-character floor |
 | Head truncation ratio | 70% |
 | Tail truncation ratio | 20% |
 | Truncation marker | 10% (shows char counts and suggests using file tools) |
 
-When a file exceeds the configured limit, the truncation message reads:
+When a file exceeds the resolved cap, the truncation message reads:
 
 ```
-[...truncated AGENTS.md: kept 14000+4000 of 25000 chars. Use file tools to read the full file.]
+[...truncated AGENTS.md: kept 14000+4000 of 25000 chars. The middle is omitted — if you need the full instructions, read the complete file with the read_file tool: /path/to/AGENTS.md]
 ```
 
 ## Tips for Effective Context Files

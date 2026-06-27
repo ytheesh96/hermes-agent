@@ -63,6 +63,52 @@ describe('useMessageStream loopagent events', () => {
     expect($loopagentsBySession.get()['source-root']?.[0]?.id).toBe('loopagent:worker:t_loop:7')
   })
 
+  it('projects kanban worker events into Loopagent activity when no loopagent upsert arrives', () => {
+    const queryClient = new QueryClient()
+    const activeSessionIdRef = { current: 'runtime-tip' }
+    const sessionStateByRuntimeIdRef = { current: new Map<string, ClientSessionState>() }
+
+    const { result } = renderHook(() =>
+      useMessageStream({
+        activeSessionIdRef,
+        hydrateFromStoredSession: vi.fn(async () => undefined),
+        queryClient,
+        refreshHermesConfig: vi.fn(async () => undefined),
+        refreshSessions: vi.fn(async () => undefined),
+        sessionStateByRuntimeIdRef,
+        updateSessionState: vi.fn()
+      })
+    )
+
+    act(() => {
+      result.current.handleGatewayEvent({
+        payload: {
+          current_tool: 'read_file',
+          run_id: 9,
+          run_status: 'running',
+          source_session_id: 'origin-session',
+          task_id: 't_worker',
+          task_title: 'Active Loop worker',
+          tool_name: 'read_file',
+          worker_session_id: 'worker-session-9'
+        },
+        session_id: 'worker-session-9',
+        type: 'kanban.worker.tool_start'
+      } as RpcEvent)
+    })
+
+    expect($loopagentsBySession.get()['origin-session']?.[0]).toMatchObject({
+      currentTool: 'read_file',
+      id: 'loopagent:worker:t_worker:9',
+      kind: 'worker',
+      status: 'running',
+      taskId: 't_worker',
+      title: 'Active Loop worker',
+      workerSessionId: 'worker-session-9'
+    })
+    expect($loopagentsBySession.get()['worker-session-9']?.[0]?.id).toBe('loopagent:worker:t_worker:9')
+  })
+
   it('refreshes Loop session-source snapshots when a live task row changes', () => {
     const queryClient = new QueryClient()
     const invalidateQueries = vi.spyOn(queryClient, 'invalidateQueries')

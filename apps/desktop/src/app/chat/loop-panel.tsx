@@ -19,6 +19,13 @@ import { StatusRow } from '@/components/chat/status-row'
 import { StatusSection } from '@/components/chat/status-section'
 import { Button } from '@/components/ui/button'
 import { Codicon } from '@/components/ui/codicon'
+import {
+  DropdownMenu,
+  DropdownMenuContent,
+  DropdownMenuItem,
+  DropdownMenuLabel,
+  DropdownMenuTrigger
+} from '@/components/ui/dropdown-menu'
 import { LogView } from '@/components/ui/log-view'
 import { Tip } from '@/components/ui/tooltip'
 import { useResizeObserver } from '@/hooks/use-resize-observer'
@@ -348,6 +355,37 @@ interface LoopDependencyGroup {
   hasDependencyLink: boolean
   ids: Set<string>
   rows: LoopRow[]
+}
+
+function recentLoopRootRows(groups: LoopDependencyGroup[], currentRootTaskId?: null | string): LoopRow[] {
+  const seen = new Set<string>()
+  const roots: LoopRow[] = []
+
+  // LoopPanelState has no reliable recency timestamp; keep session-source order
+  // and pin the active/current root first so "Recent Loops" stays predictable.
+  for (const group of groups) {
+    const row = group.anchor
+
+    if (seen.has(row.taskId)) {
+      continue
+    }
+
+    seen.add(row.taskId)
+
+    if (row.taskId !== currentRootTaskId && normalizedLoopValue(row.status) === 'archived') {
+      continue
+    }
+
+    roots.push(row)
+  }
+
+  const currentIndex = currentRootTaskId ? roots.findIndex(row => row.taskId === currentRootTaskId) : -1
+
+  if (currentIndex <= 0) {
+    return roots
+  }
+
+  return [roots[currentIndex]!, ...roots.slice(0, currentIndex), ...roots.slice(currentIndex + 1)]
 }
 
 const LOOP_DELEGATION_CREATED_BY_PREFIX = 'loop_delegation:'
@@ -3040,12 +3078,16 @@ function loopRelatedTaskAgentStatusItem(
 function LoopRootAgentsCard({
   groups,
   onOpenTaskTab,
+  onSwitchLoop,
   onTaskAction,
+  recentLoops,
   root
 }: {
   groups: RootOverviewGroups
   onOpenTaskTab?: (row: LoopRow) => void
+  onSwitchLoop?: (row: LoopRow) => void
   onTaskAction?: (action: LoopTaskAction, row: LoopRow) => void
+  recentLoops: LoopRow[]
   root: LoopRow
 }) {
   const [view, setView] = useState<'canvas' | 'list'>('canvas')
@@ -3070,21 +3112,28 @@ function LoopRootAgentsCard({
       data-root-overview-canvas="true"
       data-testid="loop-root-agents-card"
     >
-      <Tip label={showCanvas ? 'Show agents list' : 'Show graph canvas'} side="left">
-        <Button
-          aria-label={showCanvas ? 'Show agents list' : 'Show graph canvas'}
-          className={cn(
-            'absolute right-2 top-2 z-40 text-muted-foreground/80 shadow-nous hover:text-foreground',
-            showCanvas && 'bg-(--ui-surface-background) text-(--ui-text-primary)'
-          )}
-          onClick={() => setView(value => (value === 'canvas' ? 'list' : 'canvas'))}
-          size="icon-xs"
-          type="button"
-          variant="ghost"
-        >
-          {showCanvas ? <Codicon name="list-unordered" size="0.875rem" /> : <GitBranch aria-hidden className="size-3.5" />}
-        </Button>
-      </Tip>
+      <div className="absolute right-2 top-2 z-40 flex items-center gap-1">
+        <LoopSwitchMenu currentRoot={root} onSwitchLoop={onSwitchLoop} roots={recentLoops} />
+        <Tip label={showCanvas ? 'Show agents list' : 'Show graph canvas'} side="left">
+          <Button
+            aria-label={showCanvas ? 'Show agents list' : 'Show graph canvas'}
+            className={cn(
+              'text-muted-foreground/80 shadow-nous hover:text-foreground',
+              showCanvas && 'bg-(--ui-surface-background) text-(--ui-text-primary)'
+            )}
+            onClick={() => setView(value => (value === 'canvas' ? 'list' : 'canvas'))}
+            size="icon-xs"
+            type="button"
+            variant="ghost"
+          >
+            {showCanvas ? (
+              <Codicon name="list-unordered" size="0.875rem" />
+            ) : (
+              <GitBranch aria-hidden className="size-3.5" />
+            )}
+          </Button>
+        </Tip>
+      </div>
       {rows.length === 0 ? (
         <EmptyDetail>No agents yet.</EmptyDetail>
       ) : showCanvas ? (
@@ -3112,6 +3161,66 @@ function LoopRootAgentsCard({
         </div>
       )}
     </section>
+  )
+}
+
+function LoopSwitchMenu({
+  currentRoot,
+  onSwitchLoop,
+  roots
+}: {
+  currentRoot: LoopRow
+  onSwitchLoop?: (row: LoopRow) => void
+  roots: LoopRow[]
+}) {
+  if (roots.length === 0) {
+    return null
+  }
+
+  return (
+    <DropdownMenu>
+      <Tip label="Switch Loop" side="left">
+        <DropdownMenuTrigger asChild>
+          <Button
+            aria-label="Switch Loop"
+            className="bg-(--ui-surface-background) px-2 text-[0.68rem] text-(--ui-text-primary) shadow-nous"
+            size="xs"
+            type="button"
+            variant="ghost"
+          >
+            Switch Loop
+          </Button>
+        </DropdownMenuTrigger>
+      </Tip>
+      <DropdownMenuContent align="end" aria-label="Recent Loops" className="w-72 p-1" sideOffset={6}>
+        <DropdownMenuLabel className="px-2 pb-1 pt-0.5 text-[0.625rem] font-semibold uppercase tracking-wider text-(--ui-text-tertiary)">
+          Recent Loops
+        </DropdownMenuLabel>
+        {roots.map(row => {
+          const current = row.taskId === currentRoot.taskId
+
+          return (
+            <DropdownMenuItem
+              className="items-start gap-2 px-2 py-1.5"
+              data-testid={`loop-switch-row-${row.taskId}`}
+              disabled={!onSwitchLoop}
+              key={row.taskId}
+              onSelect={() => onSwitchLoop?.(row)}
+            >
+              <div className="min-w-0 flex-1">
+                <div className="truncate text-[0.73rem] font-medium text-(--ui-text-primary)">{row.title || row.taskId}</div>
+                <div className="truncate text-[0.64rem] text-(--ui-text-tertiary)">
+                  {current ? 'Current Loop' : 'Attach to this session'} · {row.status || 'unknown'}
+                </div>
+              </div>
+              <span className="shrink-0 pt-0.5 text-[0.62rem] text-(--ui-text-tertiary)">
+                {current ? 'Current' : 'Open graph'}
+              </span>
+            </DropdownMenuItem>
+          )
+        })}
+      </DropdownMenuContent>
+    </DropdownMenu>
   )
 }
 
@@ -3231,10 +3340,14 @@ function LoopTaskAgentsCard({
 function LoopRootOverview({
   group,
   onOpenTaskTab,
+  onSwitchLoop,
+  recentLoops,
   onTaskAction
 }: {
   group: LoopDependencyGroup
   onOpenTaskTab?: (row: LoopRow) => void
+  onSwitchLoop?: (row: LoopRow) => void
+  recentLoops: LoopRow[]
   onTaskAction?: (action: LoopTaskAction, row: LoopRow) => void
 }) {
   const root = group.anchor
@@ -3242,7 +3355,14 @@ function LoopRootOverview({
 
   return (
     <div className="flex h-full min-h-0 min-w-0 max-w-full flex-col">
-      <LoopRootAgentsCard groups={groups} onOpenTaskTab={onOpenTaskTab} onTaskAction={onTaskAction} root={root} />
+      <LoopRootAgentsCard
+        groups={groups}
+        onOpenTaskTab={onOpenTaskTab}
+        onSwitchLoop={onSwitchLoop}
+        onTaskAction={onTaskAction}
+        recentLoops={recentLoops}
+        root={root}
+      />
     </div>
   )
 }
@@ -3632,6 +3752,11 @@ export function LoopPanel({
   const overviewAnchor = selectedOverviewGroup?.anchor || null
   const loopOverviewEligible = loopDependencyGroupShowsOverview(selectedOverviewGroup)
 
+  const recentLoops = useMemo(
+    () => recentLoopRootRows(dependencyGroups, overviewAnchor?.taskId || focusedTaskId || stateRootTaskId || null),
+    [dependencyGroups, focusedTaskId, overviewAnchor?.taskId, stateRootTaskId]
+  )
+
   const showingLoopOverview = Boolean(
     loopOverviewEligible && overviewAnchor && (!focusedTaskId || focusedTaskId === overviewAnchor.taskId)
   )
@@ -3969,6 +4094,16 @@ export function LoopPanel({
       }
     : openTaskTab
 
+  const switchLoopRoot = useCallback(
+    (row: LoopRow) => {
+      setActiveTaskTabId(null)
+      setActiveArtifactTabId(null)
+      setNavigationStack([])
+      focusDrawerTask(row.taskId)
+    },
+    [focusDrawerTask]
+  )
+
   const loopTabTitle = overviewAnchor?.title || selected?.title || 'Loop'
 
   const baseTabLabel =
@@ -4149,7 +4284,9 @@ export function LoopPanel({
                 <LoopRootOverview
                   group={selectedOverviewGroup}
                   onOpenTaskTab={openLoopOverviewTask}
+                  onSwitchLoop={switchLoopRoot}
                   onTaskAction={onTaskAction}
+                  recentLoops={recentLoops}
                 />
               </div>
             ) : selected ? (

@@ -203,6 +203,59 @@ function quickActionGraphState() {
   })!
 }
 
+function switchableLoopsState() {
+  return deriveLoopPanelStateFromTenantSource({
+    session_id: 'sess-switch-loop',
+    root_task_id: 't_current_loop',
+    tenant: 'tenant-a',
+    tasks: [
+      {
+        id: 't_recent_loop',
+        title: 'Recent planning Loop',
+        status: 'ready',
+        tenant: 'tenant-a',
+        created_by: 'loop_delegation:agent',
+        included_child_ids: ['t_recent_child'],
+        included_parent_ids: []
+      },
+      {
+        id: 't_recent_child',
+        title: 'Recent child',
+        status: 'todo',
+        tenant: 'tenant-a',
+        included_child_ids: [],
+        included_parent_ids: ['t_recent_loop']
+      },
+      {
+        id: 't_current_loop',
+        title: 'Current Loop',
+        status: 'running',
+        tenant: 'tenant-a',
+        created_by: 'loop_delegation:agent',
+        included_child_ids: ['t_current_child'],
+        included_parent_ids: []
+      },
+      {
+        id: 't_current_child',
+        title: 'Current child',
+        status: 'running',
+        tenant: 'tenant-a',
+        included_child_ids: [],
+        included_parent_ids: ['t_current_loop']
+      },
+      {
+        id: 't_archived_loop',
+        title: 'Archived Loop',
+        status: 'archived',
+        tenant: 'tenant-a',
+        created_by: 'loop_delegation:agent',
+        included_child_ids: [],
+        included_parent_ids: []
+      }
+    ]
+  })!
+}
+
 function collapsedAttentionState() {
   return deriveLoopPanelStateFromTenantSource({
     session_id: 'sess-attention',
@@ -681,6 +734,45 @@ describe('LoopPanel', () => {
     expect(screen.getByTestId('loop-task-tab-t_root')).toBeTruthy()
     expect(screen.getByTestId('loop-task-card')).toBeTruthy()
     expect(screen.getByRole('heading', { name: /Root Task/i })).toBeTruthy()
+  })
+
+  it('lists recent Loop roots and switches the overview graph from the menu', () => {
+    const state = switchableLoopsState()
+    const onSelectTaskId = vi.fn()
+
+    render(<LoopPanel onSelectTaskId={onSelectTaskId} open selectedTaskId="t_current_loop" state={state} />)
+
+    const rootAgentsCard = screen.getByTestId('loop-root-agents-card')
+    const switchButton = within(rootAgentsCard).getByRole('button', { name: 'Switch Loop' })
+    expect(switchButton).toBeTruthy()
+
+    fireEvent.pointerDown(switchButton, { button: 0, ctrlKey: false })
+
+    const menu = screen.getByRole('menu', { name: 'Switch Loop' })
+    const currentRow = within(menu).getByTestId('loop-switch-row-t_current_loop')
+    const recentRow = within(menu).getByTestId('loop-switch-row-t_recent_loop')
+    const menuRows = within(menu).getAllByRole('menuitem')
+
+    expect(menu.textContent).toContain('Recent Loops')
+    expect(menuRows[0]).toBe(currentRow)
+    expect(currentRow.textContent).toContain('Current Loop')
+    expect(currentRow.textContent).toContain('Current')
+    expect(recentRow.textContent).toContain('Recent planning Loop')
+    expect(recentRow.textContent).toContain('Attach to this session')
+    expect(recentRow.textContent).toContain('Open graph')
+    expect(within(menu).queryByText('Archived Loop')).toBeNull()
+
+    fireEvent.click(recentRow)
+
+    expect(onSelectTaskId).toHaveBeenCalledWith('t_recent_loop')
+
+    const switchedCard = screen.getByTestId('loop-root-agents-card')
+    expect(within(switchedCard).getByTestId('loop-task-graph-node-t_recent_loop')).toBeTruthy()
+    expect(within(switchedCard).getByTestId('loop-task-graph-node-t_recent_child')).toBeTruthy()
+
+    fireEvent.click(within(switchedCard).getByRole('button', { name: 'Show agents list' }))
+    const agentsList = within(switchedCard).getByTestId('loop-root-agents-list')
+    expect(within(agentsList).getByRole('button', { name: /Recent planning Loop/i })).toBeTruthy()
   })
 
   it('reveals graph quick action tray on node hover and keyboard focus', () => {

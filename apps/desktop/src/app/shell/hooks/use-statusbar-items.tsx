@@ -12,6 +12,7 @@ import type { RuntimeReadinessResult } from '@/lib/runtime-readiness'
 import { contextBarLabel, LiveDuration, usageContextLabel } from '@/lib/statusbar'
 import { cn } from '@/lib/utils'
 import { setGlobalYolo, setSessionYolo } from '@/lib/yolo-session'
+import { $statusItemsBySession, type ComposerStatusItem } from '@/store/composer-status'
 import {
   $activeSessionId,
   $busy,
@@ -22,7 +23,6 @@ import {
   $yoloActive,
   setYoloActive
 } from '@/store/session'
-import { $subagentsBySession, activeSubagentCount, failedSubagentCount } from '@/store/subagents'
 import { $gatewayRestarting } from '@/store/system-actions'
 import {
   $backendUpdateApply,
@@ -54,6 +54,53 @@ interface StatusbarItemsOptions {
   toggleCommandCenter: () => void
 }
 
+const AGENT_STATUS_ITEM_TYPES = new Set(['kanban-agent', 'subagent'])
+
+function isAgentStatusItem(item: ComposerStatusItem): boolean {
+  return AGENT_STATUS_ITEM_TYPES.has(item.type)
+}
+
+function agentStatusItemKey(item: ComposerStatusItem): string {
+  return item.id || `${item.type}:${item.sessionId ?? ''}:${item.title}`
+}
+
+function summarizeAgentStatusItems(bySession: Record<string, ComposerStatusItem[]>) {
+  const byId = new Map<string, ComposerStatusItem>()
+
+  for (const items of Object.values(bySession)) {
+    for (const item of items) {
+      if (!isAgentStatusItem(item)) {
+        continue
+      }
+
+      const key = agentStatusItemKey(item)
+      const previous = byId.get(key)
+
+      if (!previous || (item.state === 'failed' && previous.state !== 'failed')) {
+        byId.set(key, item)
+      }
+    }
+  }
+
+  let durableAgents = 0
+  let failed = 0
+  let running = 0
+
+  for (const item of byId.values()) {
+    if (item.id.startsWith('kanban-agent:')) {
+      durableAgents += 1
+    }
+
+    if (item.state === 'failed') {
+      failed += 1
+    } else if (item.state === 'running') {
+      running += 1
+    }
+  }
+
+  return { durableAgents, failed, running }
+}
+
 export function useStatusbarItems({
   agentsOpen,
   chatOpen,
@@ -80,7 +127,7 @@ export function useStatusbarItems({
   const gatewayRestarting = useStore($gatewayRestarting)
   const sessionStartedAt = useStore($sessionStartedAt)
   const turnStartedAt = useStore($turnStartedAt)
-  const subagentsBySession = useStore($subagentsBySession)
+  const statusItemsBySession = useStore($statusItemsBySession)
   const updateStatus = useStore($updateStatus)
   const updateApply = useStore($updateApply)
   const backendUpdateStatus = useStore($backendUpdateStatus)
@@ -144,16 +191,27 @@ export function useStatusbarItems({
   )
 
   // The indicator must speak the same scope as the Spawn-tree panel it opens:
-  // every session's subagents, never background system actions (gateway
-  // restarts, toolset installs) which surface in their own panels.
-  const { subagentsFailed, subagentsRunning } = useMemo(() => {
-    const lists = Object.values(subagentsBySession)
+  // every session's live agent rows. Read the composer projection instead of
+  // only the raw subagent store so durable Loop/Kanban workers surfaced as
+  // `kanban-agent:*` rows drive the Agents button too. Background system actions
+  // (gateway restarts, toolset installs) still surface in their own panels.
+  const agentsStatus = useMemo(() => summarizeAgentStatusItems(statusItemsBySession), [statusItemsBySession])
 
-    return {
-      subagentsFailed: lists.reduce((sum, items) => sum + failedSubagentCount(items), 0),
-      subagentsRunning: lists.reduce((sum, items) => sum + activeSubagentCount(items), 0)
+  const agentsDetail = useMemo(() => {
+    if (agentsStatus.failed > 0 && agentsStatus.running > 0) {
+      return `${copy.failed(agentsStatus.failed)} · ${copy.running(agentsStatus.running)}`
     }
-  }, [subagentsBySession])
+
+    if (agentsStatus.running > 0) {
+      return agentsStatus.durableAgents > 0 ? copy.running(agentsStatus.running) : copy.subagents(agentsStatus.running)
+    }
+
+    if (agentsStatus.failed > 0) {
+      return copy.failed(agentsStatus.failed)
+    }
+
+    return undefined
+  }, [agentsStatus.durableAgents, agentsStatus.failed, agentsStatus.running, copy])
 
   const gatewayOpen = gatewayState === 'open'
   const gatewayConnecting = gatewayState === 'connecting'
@@ -298,18 +356,13 @@ export function useStatusbarItems({
       {
         className: cn(
           agentsOpen && 'bg-accent/55 text-foreground',
-          subagentsFailed > 0 && 'text-destructive hover:text-destructive'
+          agentsStatus.failed > 0 && 'text-destructive hover:text-destructive'
         ),
-        detail:
-          subagentsRunning > 0
-            ? copy.subagents(subagentsRunning)
-            : subagentsFailed > 0
-              ? copy.failed(subagentsFailed)
-              : undefined,
+        detail: agentsDetail,
         icon:
-          subagentsFailed > 0 ? (
+          agentsStatus.failed > 0 ? (
             <AlertCircle className="size-3" />
-          ) : subagentsRunning > 0 ? (
+          ) : agentsStatus.running > 0 ? (
             <Loader2 className="size-3 animate-spin" />
           ) : (
             <Codicon name="hubot" size="0.75rem" />
@@ -339,9 +392,10 @@ export function useStatusbarItems({
       gatewayRestarting,
       inferenceReady,
       inferenceStatus?.reason,
+      agentsDetail,
+      agentsStatus.failed,
+      agentsStatus.running,
       openAgents,
-      subagentsFailed,
-      subagentsRunning,
       toggleCommandCenter
     ]
   )
