@@ -42,6 +42,6 @@ export function buildLoopChatDraft(row: LoopRow): string {
     'Do not write a root-body decision ledger, duplicate locked-choice section, or keep prior locked options visible in the default graph. The dispatched task packet will carry the locked choices; the visible graph should stay focused on the current open branch plus real execution tasks.',
     'Repeat until the frontier is an executable leaf. On explicit origin activation, subscribe/route the origin session first, synthesize the selected graph path into a self-contained work packet, then call delegate_task(mode="loop") to create the real durable execution task. Do not promote planning nodes to ready and do not create task_links prerequisites from planning edges.',
     'After delegate_task returns, record/reference the real execution task id on the selected planning node/root with loop_graph execution_task_id so the visual plan links to actual work.',
-    'When a worker re-enters with done, treat it only as candidate completion. Judge it against the root goal, the task criteria, acceptance criteria, and whether it moved the needle; accept, rework, split, or block before advancing the graph.'
+    'When a worker re-enters with done, treat it only as candidate completion. Judge it against the root goal, the task criteria, acceptance criteria, and whether it moved the needle; accept, rework, split, or block before advancing the graph. Keep the origin chat verdict compact: task id, decision, and artifact/path pointers only unless I ask for the full evidence.'
   ].join('\n')
 }

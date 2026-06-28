@@ -323,6 +323,8 @@ def test_loop_status_list_update_block_and_request_review(loop_env):
     assert status["ok"] is True
     assert status["item"]["id"] == task_id
     assert status["item"]["status"] == "ready"
+    assert "comments" not in status
+    assert status["counts"]["comments"] == 0
 
     listed = _call_loop("loop_list_queue", {"tenant": loop_env})
     assert listed["ok"] is True
@@ -340,6 +342,13 @@ def test_loop_status_list_update_block_and_request_review(loop_env):
     assert updated["ok"] is True
     assert updated["status"] == "ready"
     assert updated["comment_id"] is not None
+
+    detailed = _call_loop(
+        "loop_status",
+        {"loop_item_id": task_id, "include_details": True},
+    )
+    assert detailed["counts"]["comments"] == 1
+    assert detailed["comments"][0]["body"] == "bounded implementation note"
 
     blocked = _call_loop(
         "loop_block",

@@ -1,6 +1,6 @@
 import { useStore } from '@nanostores/react'
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
-import { useCallback, useEffect, useMemo, useState } from 'react'
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 
 import {
   addLoopTaskComment,
@@ -64,6 +64,25 @@ function shouldApproveLoopIntakeOnSubmit(row: LoopRow): boolean {
   return true
 }
 
+function loopPanelAutoOpenParams(): { enabled: boolean; taskId: null | string } {
+  if (typeof window === 'undefined') {
+    return { enabled: false, taskId: null }
+  }
+
+  try {
+    const params = new URLSearchParams(window.location.search)
+    const mode = (params.get('loop') || params.get('openLoop') || '').trim().toLowerCase()
+    const taskId = (params.get('loopTask') || params.get('loop_task') || '').trim()
+
+    return {
+      enabled: mode === '1' || mode === 'true' || mode === 'open',
+      taskId: taskId || null
+    }
+  } catch {
+    return { enabled: false, taskId: null }
+  }
+}
+
 export function useLoopPanelController({
   activeSessionId,
   gatewayOpen,
@@ -105,6 +124,7 @@ export function useLoopPanelController({
   const [loopFocusRequestKey, setLoopFocusRequestKey] = useState(0)
   const [loopPanelOpen, setLoopPanelOpen] = useState(false)
   const [loopPanelHidden, setLoopPanelHidden] = useState(false)
+  const autoOpenedLoopPanelRef = useRef<string | null>(null)
 
   const loopPanelRootKey = loopPanelState?.rootTaskId || ''
   const loopSourceBoard = loopSourceQuery.data?.board || undefined
@@ -238,6 +258,34 @@ export function useLoopPanelController({
     setLoopPanelOpen(false)
     setLoopPanelHidden(false)
   }, [loopPanelRootKey])
+
+  useEffect(() => {
+    const autoOpen = loopPanelAutoOpenParams()
+
+    if (!autoOpen.enabled || !loopPanelState?.rows.length || !loopPanelRootKey) {
+      return
+    }
+
+    if (autoOpen.taskId && !loopPanelState.rows.some(row => row.taskId === autoOpen.taskId)) {
+      return
+    }
+
+    const targetTaskId = autoOpen.taskId || loopPanelRootKey
+    const autoOpenKey = `${loopPanelRootKey}:${targetTaskId}`
+
+    if (autoOpenedLoopPanelRef.current === autoOpenKey) {
+      return
+    }
+
+    autoOpenedLoopPanelRef.current = autoOpenKey
+
+    setPaneOpen(PREVIEW_PANE_ID, true)
+    setSelectedLoopTaskId(targetTaskId)
+    setFocusedLoopTaskId(targetTaskId)
+    setLoopFocusRequestKey(key => key + 1)
+    setLoopPanelOpen(true)
+    setLoopPanelHidden(false)
+  }, [loopPanelRootKey, loopPanelState])
 
   const handleSelectLoopTaskId = useCallback((taskId: string) => {
     setPaneOpen(PREVIEW_PANE_ID, true)

@@ -855,10 +855,15 @@ export function usePromptActions({
       } catch (err) {
         releaseBusy()
 
-        // A queued drain that raced a not-yet-settled turn gets a transient
-        // "session busy" (4009). Don't surface an error bubble/toast — the entry
-        // stays queued and the composer's bounded auto-drain retries when idle.
-        if (options?.fromQueue && isSessionBusyError(err)) {
+        if (isSessionBusyError(err)) {
+          dropOptimistic(sessionId)
+
+          if (!options?.fromQueue) {
+            enqueueQueuedPrompt(selectedStoredSessionIdRef.current || sessionId, { text: rawText, attachments })
+
+            return true
+          }
+
           return false
         }
 

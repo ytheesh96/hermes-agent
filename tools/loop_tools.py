@@ -381,19 +381,36 @@ def _handle_loop_status(args: dict[str, Any], **_kwargs) -> str:
     task_id = _loop_item_id(args)
     if not task_id:
         return tool_error("loop_item_id is required")
+    include_details = bool(args.get("include_details") or args.get("details"))
     try:
         kb, conn = _connect(board=args.get("board"))
         try:
             task = kb.get_task(conn, task_id)
             if task is None:
                 return tool_error(f"unknown Loop item: {task_id}")
+            comments = kb.list_comments(conn, task_id)
+            events = kb.list_events(conn, task_id)
+            runs = kb.list_runs(conn, task_id)
+            handoffs = kb.list_loop_handoffs(conn, task_id=task_id)
+            payload = {
+                "item": _task_summary(kb, conn, task),
+                "summary": _latest_summary(kb, conn, task_id),
+                "counts": {
+                    "comments": len(comments),
+                    "events": len(events),
+                    "runs": len(runs),
+                    "handoffs": len(handoffs),
+                },
+            }
+            if include_details:
+                payload.update(
+                    comments=[{"id": c.id, "author": c.author, "body": c.body, "created_at": c.created_at} for c in comments],
+                    events=[{"id": e.id, "kind": e.kind, "payload": e.payload, "created_at": e.created_at, "run_id": e.run_id} for e in events[-20:]],
+                    runs=[r.__dict__ for r in runs],
+                    handoffs=handoffs,
+                )
             return _json_ok(
-                item=_task_summary(kb, conn, task),
-                comments=[{"id": c.id, "author": c.author, "body": c.body, "created_at": c.created_at} for c in kb.list_comments(conn, task_id)],
-                events=[{"id": e.id, "kind": e.kind, "payload": e.payload, "created_at": e.created_at, "run_id": e.run_id} for e in kb.list_events(conn, task_id)[-20:]],
-                runs=[r.__dict__ for r in kb.list_runs(conn, task_id)],
-                handoffs=kb.list_loop_handoffs(conn, task_id=task_id),
-                summary=_latest_summary(kb, conn, task_id),
+                **payload,
             )
         finally:
             conn.close()
@@ -609,12 +626,13 @@ LOOP_CREATE_SCHEMA = {
 
 LOOP_STATUS_SCHEMA = {
     "name": "loop_status",
-    "description": "Read one durable Loop item plus recent events, comments, runs, and handoffs.",
+    "description": "Read one durable Loop item. Compact by default; pass include_details=true for recent events, comments, runs, and handoffs.",
     "parameters": {
         "type": "object",
         "properties": {
             "loop_item_id": {"type": "string"},
             "board": {"type": "string"},
+            "include_details": {"type": "boolean"},
         },
         "required": ["loop_item_id"],
     },

@@ -5,6 +5,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 
 import { textPart } from '@/lib/chat-messages'
 import { $composerAttachments, type ComposerAttachment } from '@/store/composer'
+import { $queuedPromptsBySession, getQueuedPrompts } from '@/store/composer-queue'
 import { $busy, $connection, $messages, $sessions, setSessions } from '@/store/session'
 import type { SessionInfo } from '@/types/hermes'
 
@@ -341,6 +342,8 @@ describe('usePromptActions desktop slash pickers', () => {
 describe('usePromptActions submit / queue drain semantics', () => {
   afterEach(() => {
     cleanup()
+    $queuedPromptsBySession.set({})
+    vi.useRealTimers()
     vi.restoreAllMocks()
   })
 
@@ -471,6 +474,39 @@ describe('usePromptActions submit / queue drain semantics', () => {
     expect(seeds.some(s => Array.isArray(s.messages) && (s.messages as { error?: string }[]).some(m => m.error))).toBe(
       false
     )
+  })
+
+  it('queues a normal submit when the gateway stays busy past the retry window', async () => {
+    vi.useFakeTimers()
+    const states: Record<string, unknown>[] = []
+    const requestGateway = vi.fn(async (method: string) => {
+      if (method === 'prompt.submit') {
+        throw new Error('4009: session busy')
+      }
+
+      return {} as never
+    })
+
+    let handle: HarnessHandle | null = null
+    render(
+      <Harness
+        onReady={h => (handle = h)}
+        onSeedState={state => states.push(state)}
+        refreshSessions={async () => undefined}
+        requestGateway={requestGateway}
+      />
+    )
+
+    const result = handle!.submitText('send after current work')
+    await vi.advanceTimersByTimeAsync(6_200)
+
+    await expect(result).resolves.toBe(true)
+    expect(getQueuedPrompts(RUNTIME_SESSION_ID).map(entry => entry.text)).toEqual(['send after current work'])
+    expect(
+      states.some(state =>
+        ((state.messages as Array<{ error?: string }> | undefined) ?? []).some(message => message.error?.includes('busy'))
+      )
+    ).toBe(false)
   })
 
   it('a normal (non-queue) submit still respects the busyRef guard', async () => {
