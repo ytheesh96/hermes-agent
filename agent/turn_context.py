@@ -28,6 +28,7 @@ import uuid
 from dataclasses import dataclass
 from typing import Any, Dict, List, Optional
 
+from agent.conversation_compression import conversation_history_after_compression
 from agent.iteration_budget import IterationBudget
 from agent.model_metadata import (
     estimate_messages_tokens_rough,
@@ -401,7 +402,9 @@ def build_turn_context(
                     _orig_len, len(messages), _orig_tokens, _preflight_tokens
                 ):
                     break  # Cannot compress further: neither rows nor tokens moved
-                conversation_history = None
+                conversation_history = conversation_history_after_compression(
+                    agent, messages
+                )
                 agent._set_active_turn_persistence_history(conversation_history)
                 agent._empty_content_retries = 0
                 agent._thinking_prefill_retries = 0
