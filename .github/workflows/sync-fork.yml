@@ -91,19 +91,19 @@ jobs:
           **Repository:** \`${GITHUB_REPOSITORY}\`
           **Workflow run:** ${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}
 
-          ```
+          ~~~
           ${SYNC_DETAILS}
-          ```
+          ~~~
 
           Suggested manual recovery:
 
-          ```bash
+          ~~~bash
           git fetch origin upstream
           git checkout ${SYNC_BRANCH}
           git merge upstream/${SYNC_BRANCH}
           # Resolve conflicts, run tests, then:
           git push origin ${SYNC_BRANCH}
-          ```
+          ~~~
           EOF
 
           if [ -n "${existing_issue}" ]; then
