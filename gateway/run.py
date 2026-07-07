@@ -1197,17 +1197,21 @@ def _turn_persistence_fingerprint(message: Dict[str, Any]) -> tuple:
     return tuple(items)
 
 
-def _persisted_turn_prefix_len(
-    session_db: Any,
+async def _persisted_turn_prefix_len(
+    db_handle: Any,
     session_id: str,
     history_len: int,
     turn_entries: List[Dict[str, Any]],
 ) -> int:
     """Count current-turn entries already present in SQLite after history_len."""
-    if not session_db or not turn_entries:
+    if not db_handle or not turn_entries:
         return 0
     try:
-        db_messages = session_db.get_messages_as_conversation(session_id)
+        maybe_messages = db_handle.get_messages_as_conversation(session_id)
+        if hasattr(maybe_messages, "__await__"):
+            db_messages = await maybe_messages
+        else:
+            db_messages = maybe_messages
     except Exception:
         logger.debug("Could not inspect DB transcript for persistence de-dupe", exc_info=True)
         return 0
@@ -11765,6 +11769,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             # the flag (default = self._session_db is not None) keeps the
             # persistence contract explicit and lets any future non-persisting
             # runtime opt into a gateway-side write by returning False.
+            _agent_persisted_explicit = "agent_persisted" in agent_result
             agent_persisted = agent_result.get("agent_persisted", self._session_db is not None)
 
             # Find only the NEW messages from this turn (skip history we loaded).
@@ -11862,12 +11867,25 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                             _user_msg_id_attached = True
                         turn_entries.append(entry)
 
-            persisted_prefix = _persisted_turn_prefix_len(
-                self._session_db,
-                session_entry.session_id,
-                history_len,
-                turn_entries,
-            )
+            if (
+                agent_persisted
+                and not _agent_persisted_explicit
+                and self._session_db is not None
+                and self._session_db.__class__.__name__ == "AsyncSessionDB"
+            ):
+                # Default production contract: a normal AIAgent with a real
+                # AsyncSessionDB persists its own current-turn transcript. Keep
+                # the gateway as a JSONL/transcript mirror, plus the first-turn
+                # session_meta row below. Tests/future runtimes can opt into the
+                # DB-proof fallback by returning agent_persisted explicitly.
+                persisted_prefix = len(turn_entries)
+            else:
+                persisted_prefix = await _persisted_turn_prefix_len(
+                    self._session_db,
+                    session_entry.session_id,
+                    history_len,
+                    turn_entries,
+                )
             if turn_entries and persisted_prefix:
                 logger.debug(
                     "Gateway transcript DB de-dupe: skipping %d/%d already persisted row(s) for %s",
