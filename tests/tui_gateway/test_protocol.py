@@ -38,6 +38,11 @@ def server():
         # next test a clean slate; _methods is NOT cleared because it's
         # populated at module import time and re-registration only happens
         # via reload (which we don't do).
+        for _session in list(mod._sessions.values()):
+            try:
+                mod._release_active_session_slot(_session)
+            except Exception:
+                pass
         mod._sessions.clear()
         mod._pending.clear()
         mod._answers.clear()
@@ -994,9 +999,14 @@ def test_sync_session_key_after_compress_reanchors_active_session_lease(
     monkeypatch.setenv("HERMES_HOME", str(home))
 
     from hermes_cli.active_sessions import (
+        _state_path,
         active_session_registry_snapshot,
         try_acquire_active_session,
     )
+    try:
+        _state_path().unlink()
+    except FileNotFoundError:
+        pass
 
     lease, message = try_acquire_active_session(
         session_id="session-old",
