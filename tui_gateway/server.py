@@ -4909,6 +4909,35 @@ def _make_agent(
     )
 
 
+def _make_agent_compat(sid: str, key: str, **kwargs):
+    """Call _make_agent while tolerating legacy monkeypatch signatures.
+
+    Some tests and out-of-tree shims replace _make_agent with a smaller
+    signature. Production keeps passing the full resume/runtime surface, but
+    compatibility callers should not fail just because a shim lacks newer
+    keyword parameters like platform_override.
+    """
+    try:
+        signature = inspect.signature(_make_agent)
+    except (TypeError, ValueError):
+        return _make_agent(sid, key, **kwargs)
+    if any(
+        param.kind is inspect.Parameter.VAR_KEYWORD
+        for param in signature.parameters.values()
+    ):
+        return _make_agent(sid, key, **kwargs)
+    allowed = {
+        name
+        for name, param in signature.parameters.items()
+        if param.kind
+        in (inspect.Parameter.POSITIONAL_OR_KEYWORD, inspect.Parameter.KEYWORD_ONLY)
+    }
+    allowed.discard("sid")
+    allowed.discard("_sid")
+    allowed.discard("key")
+    return _make_agent(sid, key, **{k: v for k, v in kwargs.items() if k in allowed})
+
+
 def _init_session(
     sid: str,
     key: str,
@@ -6092,7 +6121,7 @@ def _(rid, params: dict) -> dict:
             # stored session row so switching chats does not inherit whatever
             # global model another chat last selected.
             stored_runtime_overrides = _stored_session_runtime_overrides(found)
-            agent = _make_agent(
+            agent = _make_agent_compat(
                 sid,
                 target,
                 session_id=target,
@@ -6154,7 +6183,7 @@ def _(rid, params: dict) -> dict:
                 except TypeError as exc:
                     # Tests and out-of-tree shims sometimes monkeypatch
                     # _init_session with the legacy signature. Production keeps
-                    # passing cwd/session_db so profile-scoped resumes persist
+                    # passing cwd/session_db/source so profile-scoped resumes persist
                     # to the right DB, but the compatibility fallback preserves
                     # the older contract when the replacement rejects the new
                     # keyword arguments.
@@ -9406,6 +9435,9 @@ def _notification_poller_loop(
             emit_status=emit_status,
         ):
             process_registry.completion_queue.put(evt)
+            # Back off before re-polling: the re-queued event keeps the queue
+            # non-empty, so without a sleep this loop spins at full speed
+            # for as long as the session stays busy.
             time.sleep(0.25)
             continue
 
