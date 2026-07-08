@@ -1,4 +1,4 @@
-# Hermes Loop 
+# Hermes Loop
 
 Hermes Loop is built on top of [Nous Research's Hermes Agent](https://github.com/NousResearch/hermes-agent).
 It keeps the upstream agent framework intact while exploring how long-running
@@ -6,6 +6,9 @@ AI work can feel like a visible, resumable branch: planned in a task graph,
 executed by durable workers, reviewed through explicit handoffs, and resumed
 from the original conversation.
 
+## Demo
+
+https://github.com/user-attachments/assets/48ea333a-3fe8-4a4a-b2e5-66af5b055fee
 
 ## What this fork adds
 
@@ -29,6 +32,3 @@ from the original conversation.
 - **Session lineage and resumption fixes**: Loop rows prefer stable session keys
   over rotating runtime session IDs so Desktop/TUI-owned work remains attached
   to the user's visible conversation.
-
-
-
