@@ -1,3 +1,49 @@
+# Hermes Loop & Durable Agent Workflows
+
+This fork is Vaitheesh Jeypalan's Hermes Loop / durable-agent-workflow
+build on top of [Nous Research's Hermes Agent](https://github.com/NousResearch/hermes-agent).
+It keeps the upstream agent framework intact while exploring how long-running
+AI work can feel like a visible, resumable branch: planned in a task graph,
+executed by durable workers, reviewed through explicit handoffs, and resumed
+from the original conversation.
+
+This is a public fork for the "Hermes Loop: Hermes Hackathon Submission" work.
+It is not the canonical Nous Research distribution; for installation, docs,
+and upstream support, use the official project links preserved below.
+
+## What this fork adds
+
+- **Durable Loop/Kanban task engine**: Loop mode routes work into persistent
+  Kanban tasks with dependencies, child rows, blockers, review lanes, and
+  resumable worker context instead of process-local background jobs.
+- **Desktop Loop panel and task graph**: the Electron desktop UI has a Loop work
+  rail, overview graph, selected-node actions, composer status rows, and
+  session-linked Loop activity so users can watch background work like a branch
+  graph.
+- **Long-running delegation**: `delegate_task(mode="loop")` creates durable work
+  that survives the parent turn and can re-enter the origin session when
+  complete, while ordinary subagents remain lightweight for short parallel
+  tasks.
+- **External worker orchestration**: Kanban workers can be dispatched across
+  profiles/workspaces with profile-aware session context, task dependencies,
+  and worker lifecycle proof packets.
+- **Review, handoff, and proof-packet flow**: implementation workers can request
+  QA or orchestrator review on the same task row, attach structured metadata,
+  and leave auditable result packets for downstream agents.
+- **Session lineage and resumption fixes**: Loop rows prefer stable session keys
+  over rotating runtime session IDs so Desktop/TUI-owned work remains attached
+  to the user's visible conversation.
+
+## Relationship to upstream
+
+This fork is based on `NousResearch/hermes-agent` and preserves upstream credit,
+license, docs, and the original README below. The fork-specific section above is
+intended to explain what is different about `ytheesh96/hermes-agent` for GitHub
+visitors and resume links; the rest of this file remains the upstream Hermes
+Agent landing page.
+
+---
+
 <p align="center">
   <img src="assets/banner.png" alt="Hermes Agent" width="100%">
 </p>
