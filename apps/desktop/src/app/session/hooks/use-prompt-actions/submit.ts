@@ -21,9 +21,9 @@ import {
   _submitInFlight,
   type GatewayRequest,
   inlineErrorMessage,
+  isGatewayTimeoutError,
   isProviderSetupError,
   isSessionBusyError,
-  isGatewayTimeoutError,
   isSessionNotFoundError,
   type SubmitTextOptions,
   withSessionBusyRetry
@@ -115,7 +115,8 @@ export function useSubmitPrompt(deps: SubmitPromptDeps) {
 
       // One submit in flight per session — drop any concurrent re-fire so a
       // stalled turn can't stack the same prompt into multiple real turns.
-      const submitLockKey = selectedStoredSessionIdRef.current || activeSessionId || '__pending_new__'
+      const currentSessionId = activeSessionId || activeSessionIdRef.current
+      const submitLockKey = selectedStoredSessionIdRef.current || currentSessionId || '__pending_new__'
 
       if (_submitInFlight.has(submitLockKey)) {
         return false
@@ -206,7 +207,7 @@ export function useSubmitPrompt(deps: SubmitPromptDeps) {
       setAwaitingResponse(true)
       clearNotifications()
 
-      let sessionId: null | string = activeSessionId
+      let sessionId: null | string = currentSessionId
 
       if (sessionId) {
         seedOptimistic(sessionId)

@@ -64,6 +64,10 @@ def test_loop_graph_tool_is_in_core_but_minimal_and_gated(monkeypatch, tmp_path)
     names = {s["function"].get("name") for s in schema if "function" in s}
     assert "loop_graph" in names
     assert not any(n.startswith("loop_") and n != "loop_graph" for n in names)
+    loop_schema = next(s["function"] for s in schema if s["function"].get("name") == "loop_graph")
+    exposed = json.dumps(loop_schema).lower()
+    for obsolete in ("add_node", "branch_kind", "decision_group_id", "frontier", "planning node", "selection_state"):
+        assert obsolete not in exposed
 
     (home / "config.yaml").write_text("loop:\n  enabled: false\n")
     invalidate_check_fn_cache()
@@ -437,7 +441,7 @@ def test_loop_create_sync_timeout_and_completion_wait(loop_env):
     assert completed["summary"] == "completed during sync wait"
 
 
-def test_patch_creates_lightweight_planning_nodes_without_tasks_or_task_links(loop_env):
+def test_legacy_patch_round_trips_planning_nodes_without_tasks_or_task_links(loop_env):
     root = loop_env
     out = _call(
         {

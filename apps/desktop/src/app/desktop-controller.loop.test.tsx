@@ -9,8 +9,10 @@ const mocks = vi.hoisted(() => {
     focusRequestKey: number
     hidden: boolean
     onAddTaskComment: ReturnType<typeof vi.fn>
+    onCreateTask: ReturnType<typeof vi.fn>
     onFocusTaskId: ReturnType<typeof vi.fn>
     onHide: ReturnType<typeof vi.fn>
+    onOpen: ReturnType<typeof vi.fn>
     onSelectTaskId: ReturnType<typeof vi.fn>
     onTaskAction: ReturnType<typeof vi.fn>
     open: boolean
@@ -29,14 +31,18 @@ const mocks = vi.hoisted(() => {
   }
 
   const selectLoopTask = vi.fn()
+  const createLoopTask = vi.fn(async () => 't_created')
+  const submitText = vi.fn(async () => true)
 
   const defaultLoopController = (): MockLoopController => ({
     focusedTaskId: null,
     focusRequestKey: 0,
     hidden: false,
     onAddTaskComment: vi.fn(),
+    onCreateTask: createLoopTask,
     onFocusTaskId: vi.fn(),
     onHide: vi.fn(),
+    onOpen: vi.fn(),
     onSelectTaskId: selectLoopTask,
     onTaskAction: vi.fn(),
     open: true,
@@ -49,7 +55,7 @@ const mocks = vi.hoisted(() => {
 
   const useLoopPanelController = vi.fn(defaultLoopController)
 
-  return { defaultLoopController, selectLoopTask, useLoopPanelController }
+  return { createLoopTask, defaultLoopController, selectLoopTask, submitText, useLoopPanelController }
 })
 
 vi.mock('@/components/pane-shell', () => ({
@@ -110,13 +116,19 @@ vi.mock('./chat/right-rail', () => ({
   ChatPreviewRail: () => <div data-testid="chat-preview-rail" />,
   ChatWorkRail: ({
     loop,
+    onCreateLoopTask,
     previewOpen
   }: {
     loop: ReturnType<typeof mocks.defaultLoopController>
+    onCreateLoopTask?: (idea: string, assignee: string) => Promise<null | string>
     previewOpen: boolean
   }) =>
-    previewOpen || (loop.open && !loop.hidden && (loop.state || loop.selectedTaskId || loop.focusedTaskId)) ? (
-      <div data-testid="chat-work-rail" />
+    previewOpen || (loop.open && !loop.hidden) ? (
+      <div data-testid="chat-work-rail">
+        <button onClick={() => void onCreateLoopTask?.('Fix flaky auth test', 'peacock')} type="button">
+          Add test Loop task
+        </button>
+      </div>
     ) : null,
   PREVIEW_RAIL_MAX_WIDTH: '38rem',
   PREVIEW_RAIL_MIN_WIDTH: '18rem',
@@ -168,7 +180,7 @@ vi.mock('./session/hooks/use-prompt-actions', () => ({
     reloadFromMessage: vi.fn(),
     restoreToMessage: vi.fn(),
     steerPrompt: vi.fn(),
-    submitText: vi.fn(),
+    submitText: mocks.submitText,
     transcribeVoiceAudio: vi.fn()
   })
 }))
@@ -255,6 +267,8 @@ describe('DesktopController Loop session-source wiring', () => {
     $freshDraftReady.set(false)
     $paneStates.set({ [PREVIEW_PANE_ID]: { open: false } })
     mocks.selectLoopTask.mockClear()
+    mocks.createLoopTask.mockClear()
+    mocks.submitText.mockClear()
     mocks.useLoopPanelController.mockReset()
     mocks.useLoopPanelController.mockImplementation(mocks.defaultLoopController)
   })
@@ -306,5 +320,30 @@ describe('DesktopController Loop session-source wiring', () => {
       })
     )
     expect(screen.queryByTestId('chat-work-rail')).toBeNull()
+  })
+
+  it('renders an explicitly opened Loop canvas before session-source data exists', () => {
+    mocks.useLoopPanelController.mockReturnValue({
+      ...mocks.defaultLoopController(),
+      focusedTaskId: null,
+      hidden: false,
+      open: true,
+      selectedTaskId: null,
+      state: null,
+      tabKey: ''
+    })
+
+    renderController()
+
+    expect(screen.getByTestId('chat-work-rail')).toBeTruthy()
+  })
+
+  it('routes empty-canvas creation directly through the Loop controller', () => {
+    renderController()
+
+    fireEvent.click(screen.getByRole('button', { name: 'Add test Loop task' }))
+
+    expect(mocks.createLoopTask).toHaveBeenCalledWith('Fix flaky auth test', 'peacock')
+    expect(mocks.submitText).not.toHaveBeenCalled()
   })
 })

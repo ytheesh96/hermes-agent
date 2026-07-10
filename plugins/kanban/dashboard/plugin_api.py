@@ -38,6 +38,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import math
 import os
 import sqlite3
 import time
@@ -1819,6 +1820,214 @@ def create_loop_draft(payload: CreateLoopDraftBody, board: Optional[str] = Query
         conn.close()
 
 
+class LoopCanvasPosition(BaseModel):
+    task_id: str
+    x: float
+    y: float
+
+
+class PutLoopCanvasPositionsBody(BaseModel):
+    positions: list[LoopCanvasPosition] = Field(default_factory=list)
+
+
+_LOOP_CANVAS_COORD_LIMIT = 1_000_000.0
+
+
+def _ensure_loop_canvas_positions_schema(conn: sqlite3.Connection) -> None:
+    """Create the dashboard-only Loop layout table on first use."""
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS loop_canvas_positions (
+            root_task_id TEXT NOT NULL,
+            task_id      TEXT NOT NULL,
+            x            REAL NOT NULL,
+            y            REAL NOT NULL,
+            updated_at   INTEGER NOT NULL,
+            PRIMARY KEY (root_task_id, task_id)
+        )
+        """
+    )
+
+
+def _loop_canvas_positions_payload(
+    conn: sqlite3.Connection,
+    root_task_id: str,
+    members: Optional[set[str]] = None,
+) -> dict[str, Any]:
+    rows = conn.execute(
+        """
+        SELECT p.task_id, p.x, p.y, p.updated_at
+        FROM loop_canvas_positions p
+        JOIN tasks t ON t.id = p.task_id
+        WHERE p.root_task_id = ?
+          AND t.status != 'archived'
+        ORDER BY p.task_id
+        """,
+        (root_task_id,),
+    ).fetchall()
+    return {
+        "root_task_id": root_task_id,
+        "positions": [
+            {
+                "task_id": row["task_id"],
+                "x": float(row["x"]),
+                "y": float(row["y"]),
+                "updated_at": int(row["updated_at"]),
+            }
+            for row in rows
+            if members is None or row["task_id"] in members
+        ],
+    }
+
+
+def _require_loop_canvas_root(conn: sqlite3.Connection, root_task_id: str) -> kanban_db.Task:
+    root = kanban_db.get_task(conn, root_task_id)
+    if root is None:
+        raise HTTPException(status_code=404, detail=f"task {root_task_id} not found")
+    return root
+
+
+def _loop_canvas_task_ids(conn: sqlite3.Connection, root_task_id: str) -> set[str]:
+    """Return the root's undirected component plus its session peers."""
+    root = _require_loop_canvas_root(conn, root_task_id)
+    adjacency: dict[str, set[str]] = {}
+    for row in conn.execute("SELECT parent_id, child_id FROM task_links").fetchall():
+        adjacency.setdefault(row["parent_id"], set()).add(row["child_id"])
+        adjacency.setdefault(row["child_id"], set()).add(row["parent_id"])
+
+    members = {root_task_id}
+    pending = [root_task_id]
+    while pending:
+        for task_id in adjacency.get(pending.pop(), ()):
+            if task_id not in members:
+                members.add(task_id)
+                pending.append(task_id)
+
+    if root.session_id and root.session_id.strip():
+        members.update(
+            row["id"]
+            for row in conn.execute(
+                "SELECT id FROM tasks WHERE session_id = ?",
+                (root.session_id,),
+            ).fetchall()
+        )
+    return members
+
+
+def _loop_session_source_task_ids(conn: sqlite3.Connection, session_id: str) -> set[str]:
+    lineage_session_ids = _session_compression_lineage(session_id)
+    referenced_task_ids = _loop_tool_task_ids_for_sessions(lineage_session_ids)
+    rows, _, _ = _query_session_source_rows(
+        conn,
+        lineage_session_ids,
+        explicit_tenant=None,
+        include_archived=False,
+        referenced_task_ids=referenced_task_ids,
+    )
+    return {row["id"] for row in rows}
+
+
+def _require_loop_canvas_tasks(
+    conn: sqlite3.Connection,
+    root_task_id: str,
+    task_ids: list[str],
+    *,
+    session_id: Optional[str] = None,
+) -> set[str]:
+    source_session_id = (session_id or "").strip()
+    members = (
+        _loop_session_source_task_ids(conn, source_session_id)
+        if source_session_id
+        else _loop_canvas_task_ids(conn, root_task_id)
+    )
+    required = dict.fromkeys([root_task_id, *task_ids])
+    outside = [task_id for task_id in required if task_id not in members]
+    if outside:
+        raise HTTPException(
+            status_code=400,
+            detail=f"task(s) outside Loop canvas {root_task_id}: {', '.join(outside)}",
+        )
+    return members
+
+
+@router.get("/loop-canvas/{root_task_id}/positions")
+def get_loop_canvas_positions(
+    root_task_id: str,
+    board: Optional[str] = Query(None),
+    session_id: Optional[str] = Query(None),
+):
+    """Return saved world-space coordinates for a Loop canvas."""
+    board = _resolve_board(board)
+    conn = _conn(board=board)
+    try:
+        members = _require_loop_canvas_tasks(conn, root_task_id, [], session_id=session_id)
+        _ensure_loop_canvas_positions_schema(conn)
+        return _loop_canvas_positions_payload(conn, root_task_id, members)
+    finally:
+        conn.close()
+
+
+@router.put("/loop-canvas/{root_task_id}/positions")
+def put_loop_canvas_positions(
+    root_task_id: str,
+    payload: PutLoopCanvasPositionsBody,
+    board: Optional[str] = Query(None),
+    session_id: Optional[str] = Query(None),
+):
+    """Replace all saved world-space coordinates for a Loop canvas."""
+    board = _resolve_board(board)
+    conn = _conn(board=board)
+    try:
+        _require_loop_canvas_root(conn, root_task_id)
+        _ensure_loop_canvas_positions_schema(conn)
+
+        task_ids: list[str] = []
+        coordinates: list[tuple[str, float, float]] = []
+        for item in payload.positions:
+            task_id = item.task_id.strip()
+            if not task_id:
+                raise HTTPException(status_code=400, detail="position task_id is required")
+            if task_id in task_ids:
+                raise HTTPException(status_code=400, detail=f"duplicate position for task {task_id}")
+            if not math.isfinite(item.x) or not math.isfinite(item.y):
+                raise HTTPException(status_code=400, detail=f"position for {task_id} must be finite")
+            if abs(item.x) > _LOOP_CANVAS_COORD_LIMIT or abs(item.y) > _LOOP_CANVAS_COORD_LIMIT:
+                raise HTTPException(
+                    status_code=400,
+                    detail=f"position for {task_id} exceeds the canvas coordinate limit",
+                )
+            task_ids.append(task_id)
+            coordinates.append((task_id, float(item.x), float(item.y)))
+
+        if task_ids:
+            placeholders = ",".join("?" for _ in task_ids)
+            existing = {
+                row["id"]
+                for row in conn.execute(
+                    f"SELECT id FROM tasks WHERE id IN ({placeholders})",
+                    tuple(task_ids),
+                ).fetchall()
+            }
+            missing = [task_id for task_id in task_ids if task_id not in existing]
+            if missing:
+                raise HTTPException(status_code=400, detail=f"unknown task(s): {', '.join(missing)}")
+
+        members = _require_loop_canvas_tasks(conn, root_task_id, task_ids, session_id=session_id)
+
+        now = int(time.time())
+        with kanban_db.write_txn(conn):
+            conn.execute("DELETE FROM loop_canvas_positions WHERE root_task_id = ?", (root_task_id,))
+            conn.executemany(
+                "INSERT INTO loop_canvas_positions (root_task_id, task_id, x, y, updated_at) "
+                "VALUES (?, ?, ?, ?, ?)",
+                [(root_task_id, task_id, x, y, now) for task_id, x, y in coordinates],
+            )
+
+        return {"ok": True, **_loop_canvas_positions_payload(conn, root_task_id, members)}
+    finally:
+        conn.close()
+
+
 class LoopGraphPatchBody(BaseModel):
     expected_revision: int
     mutation_id: str
@@ -2467,6 +2676,8 @@ def add_comment(task_id: str, payload: CommentBody, board: Optional[str] = Query
 class LinkBody(BaseModel):
     parent_id: str
     child_id: str
+    root_task_id: Optional[str] = None
+    session_id: Optional[str] = None
 
 
 @router.post("/links")
@@ -2474,6 +2685,15 @@ def add_link(payload: LinkBody, board: Optional[str] = Query(None)):
     board = _resolve_board(board)
     conn = _conn(board=board)
     try:
+        if payload.session_id and not payload.root_task_id:
+            raise HTTPException(status_code=400, detail="root_task_id is required with session_id")
+        if payload.root_task_id:
+            _require_loop_canvas_tasks(
+                conn,
+                payload.root_task_id,
+                [payload.parent_id, payload.child_id],
+                session_id=payload.session_id,
+            )
         kanban_db.link_tasks(conn, payload.parent_id, payload.child_id)
         return {"ok": True}
     except ValueError as e:

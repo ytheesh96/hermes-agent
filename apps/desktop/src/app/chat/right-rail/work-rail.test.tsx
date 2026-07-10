@@ -48,15 +48,23 @@ function loopController(): LoopPanelController {
   })
 
   return {
+    canvasScopeKey: 'session-1',
     focusedTaskId: 't_root',
     focusRequestKey: 0,
     hidden: false,
     onAddTaskComment: vi.fn(),
+    onCreateTask: vi.fn(async () => null),
     onFocusTaskId: vi.fn(),
     onHide: vi.fn(),
+    onLinkTasks: vi.fn(async () => true),
+    onUnlinkTasks: vi.fn(async () => true),
+    onOpen: vi.fn(),
+    onSavePositions: vi.fn(async () => true),
     onSelectTaskId: vi.fn(),
     onTaskAction: vi.fn(),
     open: true,
+    positions: [],
+    rootTaskId: 't_root',
     selectedTaskDetail: undefined,
     selectedTaskDetailError: null,
     selectedTaskId: 't_root',
@@ -70,23 +78,17 @@ describe('ChatWorkRail', () => {
     const target = previewTarget()
     setPreviewTarget(target)
 
-    render(
-      <ChatWorkRail
-        loop={loopController()}
-        previewKey={target.url}
-        previewLabel={target.label}
-        previewOpen
-      />
-    )
+    render(<ChatWorkRail loop={loopController()} previewKey={target.url} previewLabel={target.label} previewOpen />)
 
     expect(screen.getByTestId('work-rail-tab-loop')).toBeTruthy()
     expect(screen.getByTestId('work-rail-tab-preview')).toBeTruthy()
     expect(within(screen.getByTestId('work-rail-tab-loop')).getByRole('tab', { name: 'Loop' })).toBeTruthy()
     expect(within(screen.getByTestId('work-rail-tab-preview')).getByRole('tab', { name: 'Preview' })).toBeTruthy()
-    expect(within(screen.getByTestId('work-rail-tabbar')).getAllByRole('tab').map(tab => tab.textContent)).toEqual([
-      'Loop',
-      'Preview'
-    ])
+    expect(
+      within(screen.getByTestId('work-rail-tabbar'))
+        .getAllByRole('tab')
+        .map(tab => tab.textContent)
+    ).toEqual(['Loop', 'Preview'])
     expect((await screen.findByTestId('preview-pane')).textContent).toBe('Preview artifact')
 
     fireEvent.click(screen.getByRole('tab', { name: 'Loop' }))
@@ -112,6 +114,29 @@ describe('ChatWorkRail', () => {
     expect(screen.getByTestId('work-rail-tab-loop')).toBeTruthy()
     expect(screen.getByTestId('loop-panel')).toBeTruthy()
     expect(screen.getByTestId('loop-panel-loading').textContent).toContain('t_pending')
+  })
+
+  it('opens an empty Loop canvas without a selected task', () => {
+    const onCreateLoopTask = vi.fn(async () => 't_created')
+
+    const loop = {
+      ...loopController(),
+      focusedTaskId: null,
+      selectedTaskId: null,
+      state: null,
+      tabKey: ''
+    } as LoopPanelController
+
+    render(<ChatWorkRail loop={loop} onCreateLoopTask={onCreateLoopTask} previewOpen={false} />)
+
+    expect(screen.getByTestId('work-rail-tab-loop')).toBeTruthy()
+    expect(screen.getByRole('region', { name: 'Add a Loop task' })).toBeTruthy()
+    expect(screen.queryByTestId('loop-panel-loading')).toBeNull()
+
+    const idea = screen.getByRole('textbox', { name: 'Rough idea' })
+    fireEvent.change(idea, { target: { value: 'Fix flaky auth test' } })
+    fireEvent.keyDown(idea, { key: 'Enter' })
+    expect(onCreateLoopTask).toHaveBeenCalledWith('Fix flaky auth test', 'orchestrator')
   })
 
   it('reactivates the Loop tab when the same root row is explicitly opened again', async () => {

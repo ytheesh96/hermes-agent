@@ -1,5 +1,3 @@
-import type { ChatMessage, ChatMessagePart } from '@/lib/chat-messages'
-
 export type LoopPanelStatus = 'error' | 'ready' | 'stale'
 
 export interface LoopLatestRun {
@@ -142,9 +140,7 @@ export interface LoopIntakeState {
 
 export interface TenantLoopTask {
   age?: Record<string, null | number>
-  active?: boolean
   assignee?: null | string
-  branch_kind?: null | string
   body?: null | string
   child_count?: number
   children_count?: number
@@ -154,15 +150,12 @@ export interface TenantLoopTask {
   created_by?: null | string
   current_run_id?: null | number
   current_step_key?: null | string
-  decision_group_id?: null | string
   diagnostics?: unknown[]
-  execution_task_id?: null | string
   external_child_tasks?: CompactLoopTask[]
   external_parent_tasks?: CompactLoopTask[]
   id: string
   included_child_ids?: string[]
   included_parent_ids?: string[]
-  is_planning_node?: boolean
   latest_run?: null | LoopLatestRun
   latest_summary?: null | string
   loop_intake?: null | LoopIntakeState
@@ -179,10 +172,8 @@ export interface TenantLoopTask {
   review_kind?: null | string
   resume_mode?: null | string
   review_subject_assignee?: null | string
-  selection_state?: null | string
   foreground_parent_session_id?: null | string
   foreground_fork_session_id?: null | string
-  frontier?: boolean
   started_at?: null | number
   status: string
   suggested_owner?: null | string
@@ -203,8 +194,6 @@ export interface TenantLoopSource {
   lineage_session_ids?: string[]
   links?: { child_id?: string; parent_id?: string }[]
   now?: number
-  planning_links?: { child_id?: string; parent_id?: string }[]
-  planning_nodes?: TenantLoopTask[]
   root_task_id?: null | string
   session_id?: string
   tasks?: TenantLoopTask[]
@@ -263,7 +252,6 @@ export interface LoopTaskDetail {
 export interface LoopRow {
   active: boolean
   assignee?: null | string
-  branchKind?: null | string
   body?: null | string
   childCount: number
   children: string[]
@@ -271,9 +259,6 @@ export interface LoopRow {
   depth: number
   externalChildTasks?: CompactLoopTask[]
   externalParentTasks?: CompactLoopTask[]
-  decisionGroupId?: null | string
-  executionTaskId?: null | string
-  frontier: boolean
   latestRun?: null | LoopLatestRun
   latestSummary?: null | string
   loopIntake?: null | LoopIntakeState
@@ -281,12 +266,10 @@ export interface LoopRow {
   parentCount: number
   parents: string[]
   priority?: number
-  planningNode?: boolean
   rawTask?: TenantLoopTask
   reviewKind?: null | string
   resumeMode?: null | string
   reviewSubjectAssignee?: null | string
-  selectionState?: null | string
   result?: null | string
   sourceSessionId?: null | string
   foregroundParentSessionId?: null | string
@@ -371,7 +354,6 @@ export function loopConnectedTaskIds(state?: LoopPanelState | null, rootTaskId?:
 const ARCHIVED_STATUSES = new Set(['archived'])
 const COMPLETE_STATUSES = new Set(['done', 'complete', 'completed', 'cancelled', 'archived'])
 const ACTIVE_STATUSES = new Set(['ready', 'running', 'claimed', 'in_progress'])
-const RUNNABLE_STATUSES = new Set(['ready', 'running', 'claimed', 'in_progress', 'todo'])
 const WAITING_WORKER_STATUSES = new Set(['queued', 'ready', 'todo'])
 const SUCCESS_RUN_OUTCOMES = new Set(['success', 'succeeded', 'ok'])
 
@@ -387,51 +369,6 @@ const FAILED_RUN_STATES = new Set([
 ])
 
 const DEFAULT_STALE_HEARTBEAT_SECONDS = 10 * 60
-
-function isRecord(value: unknown): value is Record<string, unknown> {
-  return Boolean(value && typeof value === 'object' && !Array.isArray(value))
-}
-
-function parseRecord(value: unknown): Record<string, unknown> | null {
-  if (isRecord(value)) {
-    return value
-  }
-
-  if (typeof value !== 'string' || !value.trim()) {
-    return null
-  }
-
-  try {
-    const parsed = JSON.parse(value)
-
-    return isRecord(parsed) ? parsed : null
-  } catch {
-    return null
-  }
-}
-
-function stringField(record: Record<string, unknown>, key: string): string {
-  const value = record[key]
-
-  return typeof value === 'string' ? value : ''
-}
-
-function numberField(record: Record<string, unknown>, key: string): number {
-  const value = record[key]
-  const n = typeof value === 'number' ? value : Number(value)
-
-  return Number.isFinite(n) ? n : 0
-}
-
-function booleanField(record: Record<string, unknown>, key: string): boolean {
-  return record[key] === true
-}
-
-function stringArrayField(record: Record<string, unknown>, key: string): string[] {
-  const value = record[key]
-
-  return Array.isArray(value) ? value.map(item => String(item)).filter(Boolean) : []
-}
 
 function rawJson(value: unknown): string {
   try {
@@ -587,108 +524,6 @@ function taskChildren(task: TenantLoopTask): string[] {
   return Array.from(new Set([...explicit, ...external]))
 }
 
-function isHiddenLockedPlanningOption(task: TenantLoopTask): boolean {
-  if (task.is_planning_node !== true || normalizedStatus(task.branch_kind) !== 'alternative') {
-    return false
-  }
-
-  const selectionState = normalizedStatus(task.selection_state)
-
-  return selectionState === 'chosen' || selectionState === 'rejected'
-}
-
-function loopTaskRelationMaps(
-  source: Omit<TenantLoopSource, 'tasks'> & { tasks?: readonly TenantLoopTask[] },
-  tasks: readonly TenantLoopTask[]
-): { childrenById: Map<string, Set<string>>; parentsById: Map<string, Set<string>> } {
-  const taskIds = new Set(tasks.map(task => task.id))
-  const childrenById = new Map(tasks.map(task => [task.id, new Set<string>()]))
-  const parentsById = new Map(tasks.map(task => [task.id, new Set<string>()]))
-
-  const link = (parentId?: null | string, childId?: null | string) => {
-    if (!parentId || !childId || !taskIds.has(parentId) || !taskIds.has(childId)) {
-      return
-    }
-
-    childrenById.get(parentId)?.add(childId)
-    parentsById.get(childId)?.add(parentId)
-  }
-
-  for (const task of tasks) {
-    for (const parentId of taskParents(task)) {
-      link(parentId, task.id)
-    }
-
-    for (const childId of taskChildren(task)) {
-      link(task.id, childId)
-    }
-  }
-
-  for (const sourceLink of [...(source.links || []), ...(source.external_links || []), ...(source.planning_links || [])]) {
-    link(sourceLink.parent_id, sourceLink.child_id)
-  }
-
-  return { childrenById, parentsById }
-}
-
-function resolveVisibleRelatedTaskIds(
-  taskId: string,
-  relationMap: Map<string, Set<string>>,
-  visibleTaskIds: Set<string>,
-  hiddenTaskIds: Set<string>,
-  seen = new Set<string>()
-): string[] {
-  if (seen.has(taskId)) {
-    return []
-  }
-
-  seen.add(taskId)
-
-  const relatedIds: string[] = []
-
-  for (const relatedId of relationMap.get(taskId) || []) {
-    if (visibleTaskIds.has(relatedId)) {
-      relatedIds.push(relatedId)
-    } else if (hiddenTaskIds.has(relatedId)) {
-      relatedIds.push(...resolveVisibleRelatedTaskIds(relatedId, relationMap, visibleTaskIds, hiddenTaskIds, seen))
-    }
-  }
-
-  return Array.from(new Set(relatedIds.filter(relatedId => relatedId !== taskId)))
-}
-
-function compactLockedPlanningOptions(
-  source: Omit<TenantLoopSource, 'tasks'> & { tasks?: readonly TenantLoopTask[] },
-  tasks: readonly TenantLoopTask[]
-): TenantLoopTask[] {
-  const hiddenTaskIds = new Set(tasks.filter(isHiddenLockedPlanningOption).map(task => task.id))
-
-  if (hiddenTaskIds.size === 0) {
-    return [...tasks]
-  }
-
-  const visibleTaskIds = new Set(tasks.filter(task => !hiddenTaskIds.has(task.id)).map(task => task.id))
-  const { childrenById, parentsById } = loopTaskRelationMaps(source, tasks)
-
-  return tasks
-    .filter(task => !hiddenTaskIds.has(task.id))
-    .map(task => {
-      const parents = resolveVisibleRelatedTaskIds(task.id, parentsById, visibleTaskIds, hiddenTaskIds)
-      const children = resolveVisibleRelatedTaskIds(task.id, childrenById, visibleTaskIds, hiddenTaskIds)
-
-      return {
-        ...task,
-        included_child_ids: children,
-        included_parent_ids: parents,
-        links: {
-          ...task.links,
-          children,
-          parents
-        }
-      }
-    })
-}
-
 const LOOP_DELEGATION_CREATED_BY_PREFIX = 'loop_delegation:'
 
 const isDelegatedLoopRootTask = (task: TenantLoopTask): boolean =>
@@ -723,7 +558,7 @@ function taskNeighborMap(
     }
   }
 
-  for (const sourceLink of [...(source.links || []), ...(source.external_links || []), ...(source.planning_links || [])]) {
+  for (const sourceLink of [...(source.links || []), ...(source.external_links || [])]) {
     link(sourceLink.parent_id, sourceLink.child_id)
   }
 
@@ -944,15 +779,10 @@ function tenantRowFromTask(
   const workerActivity = task.worker_activity || latestWorkerForTask(task, workers)
   const latestRunActive = ACTIVE_STATUSES.has(normalizedStatus(latestRun?.status))
   const latestWorkerActive = ACTIVE_STATUSES.has(normalizedStatus(workerActivity?.status))
-  const unfinishedRunnable = RUNNABLE_STATUSES.has(status) && !COMPLETE_STATUSES.has(status)
-  const planningNode = task.is_planning_node === true
 
   return {
-    active: planningNode
-      ? Boolean(task.active)
-      : ACTIVE_STATUSES.has(status) || latestRunActive || latestWorkerActive || Boolean(task.current_run_id),
+    active: ACTIVE_STATUSES.has(status) || latestRunActive || latestWorkerActive || Boolean(task.current_run_id),
     assignee: task.assignee,
-    branchKind: task.branch_kind,
     body: task.body,
     childCount: children.length || task.child_count || task.children_count || 0,
     children,
@@ -960,9 +790,6 @@ function tenantRowFromTask(
     depth: depths.get(task.id) || 0,
     externalChildTasks: task.external_child_tasks || [],
     externalParentTasks: task.external_parent_tasks || [],
-    decisionGroupId: task.decision_group_id,
-    executionTaskId: task.execution_task_id,
-    frontier: planningNode ? Boolean(task.frontier) : unfinishedRunnable,
     latestRun,
     latestSummary:
       task.latest_summary || workerActivity?.summary || workerActivity?.summary_preview || latestRun?.summary || null,
@@ -970,13 +797,11 @@ function tenantRowFromTask(
     loopHandoffs: task.loop_handoffs || [],
     parentCount: parents.length || task.parent_count || task.parents_count || 0,
     parents,
-    planningNode,
     priority: task.priority,
     rawTask: task,
     reviewKind: task.review_kind,
     resumeMode: task.resume_mode,
     reviewSubjectAssignee: task.review_subject_assignee,
-    selectionState: task.selection_state,
     result: task.result,
     sourceSessionId: task.session_id,
     foregroundParentSessionId: task.foreground_parent_session_id,
@@ -999,11 +824,9 @@ export function deriveLoopPanelStateFromTenantSource(
     return null
   }
 
-  const sourceTasks = [...(source.tasks || []), ...(source.planning_nodes || [])].filter(
+  const tasks = (source.tasks || []).filter(
     task => task.id && (source.include_archived || !ARCHIVED_STATUSES.has(normalizedStatus(task.status)))
   )
-
-  const tasks = compactLockedPlanningOptions(source, sourceTasks)
 
   const depths = depthByTaskId(tasks)
   const rows = tasks.map(task => tenantRowFromTask(task, depths, source.workers || []))
@@ -1018,127 +841,4 @@ export function deriveLoopPanelStateFromTenantSource(
     sourceNow: source.now,
     status: 'ready'
   }
-}
-
-function rootTaskIdFrom(args: unknown, result: Record<string, unknown>): string {
-  return stringField(result, 'root_task_id') || stringField(parseRecord(args) || {}, 'root_task_id')
-}
-
-function rowFromNode(value: unknown): LoopRow | null {
-  const node = parseRecord(value)
-
-  if (!node) {
-    return null
-  }
-
-  const taskId = stringField(node, 'task_id') || stringField(node, 'id')
-  const title = stringField(node, 'title')
-
-  if (!taskId || !title) {
-    return null
-  }
-
-  const parents = stringArrayField(node, 'parents')
-
-  return {
-    active: booleanField(node, 'active'),
-    branchKind: stringField(node, 'branch_kind') || undefined,
-    body: stringField(node, 'body') || undefined,
-    childCount: numberField(node, 'child_count'),
-    children: stringArrayField(node, 'children'),
-    commentCount: numberField(node, 'comment_count'),
-    depth: numberField(node, 'depth'),
-    decisionGroupId: stringField(node, 'decision_group_id') || undefined,
-    executionTaskId: stringField(node, 'execution_task_id') || undefined,
-    frontier: booleanField(node, 'frontier'),
-    parentCount: parents.length || numberField(node, 'parent_count'),
-    parents,
-    planningNode: booleanField(node, 'is_plan_node') || booleanField(node, 'is_planning_node'),
-    priority: numberField(node, 'priority') || undefined,
-    selectionState: stringField(node, 'selection_state') || undefined,
-    status: stringField(node, 'status') || 'triage',
-    suggestedOwner: stringField(node, 'suggested_owner') || undefined,
-    taskId,
-    title: title || taskId
-  }
-}
-
-function rowsFrom(result: Record<string, unknown>): LoopRow[] {
-  const nodes = result.nodes
-
-  if (!Array.isArray(nodes)) {
-    return []
-  }
-
-  return nodes.map(rowFromNode).filter((row): row is LoopRow => Boolean(row))
-}
-
-function statusFrom(result: Record<string, unknown>): LoopPanelStatus {
-  if (result.ok !== false) {
-    return 'ready'
-  }
-
-  return stringField(result, 'error') === 'stale_revision' ? 'stale' : 'error'
-}
-
-function messageFrom(status: LoopPanelStatus, result: Record<string, unknown>): string {
-  if (status === 'ready') {
-    return ''
-  }
-
-  return stringField(result, 'message') || stringField(result, 'error') || 'Loop graph update failed'
-}
-
-function loopToolParts(messages: readonly ChatMessage[]): Extract<ChatMessagePart, { type: 'tool-call' }>[] {
-  return messages.flatMap(message =>
-    message.parts.filter(
-      (part): part is Extract<ChatMessagePart, { type: 'tool-call' }> =>
-        part.type === 'tool-call' && part.toolName === 'loop_graph' && part.result !== undefined
-    )
-  )
-}
-
-export function deriveLoopPanelState(messages: readonly ChatMessage[]): LoopPanelState | null {
-  let state: LoopPanelState | null = null
-
-  for (const part of loopToolParts(messages)) {
-    const result = parseRecord(part.result)
-
-    if (!result) {
-      continue
-    }
-
-    const status = statusFrom(result)
-    const previousState = state
-    const rootTaskId: string = rootTaskIdFrom(part.args, result) || previousState?.rootTaskId || ''
-
-    const revision: number =
-      numberField(result, 'graph_revision') || numberField(result, 'current_revision') || previousState?.revision || 0
-
-    const nextRows = rowsFrom(result)
-
-    if (status === 'ready') {
-      state = {
-        message: '',
-        rawJson: rawJson(result),
-        revision,
-        rootTaskId,
-        rows: nextRows,
-        status
-      }
-
-      continue
-    }
-
-    state = {
-      message: messageFrom(status, result),
-      rawJson: rawJson(result),
-      revision: state?.revision || revision,
-      rootTaskId,
-      rows: state?.rows || [],
-      status
-    }
-  }
-
-  return state
 }

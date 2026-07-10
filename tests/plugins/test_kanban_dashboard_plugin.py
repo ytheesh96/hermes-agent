@@ -226,6 +226,298 @@ def test_create_loop_draft_anchors_session_source_and_real_root(client):
     assert runs == []
 
 
+def test_loop_canvas_positions_round_trip_replace_and_clear_without_task_events(client):
+    root = client.post(
+        "/api/plugins/kanban/loop-drafts",
+        json={"title": "Canvas root", "session_id": "session-canvas-layout"},
+    ).json()["task"]
+    child = client.post(
+        "/api/plugins/kanban/tasks",
+        json={"title": "Canvas child", "session_id": "session-canvas-layout", "triage": True},
+    ).json()["task"]
+
+    empty = client.get(f"/api/plugins/kanban/loop-canvas/{root['id']}/positions")
+    assert empty.status_code == 200, empty.text
+    assert empty.json() == {"root_task_id": root["id"], "positions": []}
+
+    conn = kb.connect()
+    try:
+        event_count = conn.execute("SELECT COUNT(*) AS n FROM task_events").fetchone()["n"]
+    finally:
+        conn.close()
+
+    saved = client.put(
+        f"/api/plugins/kanban/loop-canvas/{root['id']}/positions",
+        json={
+            "positions": [
+                {"task_id": child["id"], "x": 420.5, "y": -18.25},
+                {"task_id": root["id"], "x": 32, "y": 64},
+            ]
+        },
+    )
+    assert saved.status_code == 200, saved.text
+    payload = saved.json()
+    assert payload["ok"] is True
+    assert payload["root_task_id"] == root["id"]
+    assert [item["task_id"] for item in payload["positions"]] == sorted([root["id"], child["id"]])
+    assert {(item["task_id"], item["x"], item["y"]) for item in payload["positions"]} == {
+        (root["id"], 32.0, 64.0),
+        (child["id"], 420.5, -18.25),
+    }
+    assert all(isinstance(item["updated_at"], int) for item in payload["positions"])
+
+    read_back = client.get(f"/api/plugins/kanban/loop-canvas/{root['id']}/positions")
+    assert read_back.status_code == 200, read_back.text
+    assert read_back.json() == {"root_task_id": root["id"], "positions": payload["positions"]}
+
+    replaced = client.put(
+        f"/api/plugins/kanban/loop-canvas/{root['id']}/positions",
+        json={"positions": [{"task_id": child["id"], "x": 7, "y": 9}]},
+    )
+    assert replaced.status_code == 200, replaced.text
+    assert [(item["task_id"], item["x"], item["y"]) for item in replaced.json()["positions"]] == [
+        (child["id"], 7.0, 9.0)
+    ]
+
+    cleared = client.put(
+        f"/api/plugins/kanban/loop-canvas/{root['id']}/positions",
+        json={"positions": []},
+    )
+    assert cleared.status_code == 200, cleared.text
+    assert cleared.json() == {"ok": True, "root_task_id": root["id"], "positions": []}
+
+    conn = kb.connect()
+    try:
+        assert conn.execute("SELECT COUNT(*) AS n FROM task_events").fetchone()["n"] == event_count
+        assert kb.get_task(conn, root["id"]).status == "scheduled"
+        assert kb.get_task(conn, child["id"]).status == "triage"
+    finally:
+        conn.close()
+
+
+def test_loop_canvas_positions_validate_before_replacing_saved_layout(client):
+    root = client.post(
+        "/api/plugins/kanban/loop-drafts",
+        json={"title": "Validated canvas", "session_id": "session-canvas-validation"},
+    ).json()["task"]
+    path = f"/api/plugins/kanban/loop-canvas/{root['id']}/positions"
+
+    initial = client.put(
+        path,
+        json={"positions": [{"task_id": root["id"], "x": 1, "y": 2}]},
+    )
+    assert initial.status_code == 200, initial.text
+
+    unknown_root = client.get("/api/plugins/kanban/loop-canvas/t_missing/positions")
+    assert unknown_root.status_code == 404
+
+    unknown_task = client.put(
+        path,
+        json={"positions": [{"task_id": "t_missing", "x": 3, "y": 4}]},
+    )
+    assert unknown_task.status_code == 400
+    assert "unknown task" in unknown_task.json()["detail"]
+
+    duplicate = client.put(
+        path,
+        json={
+            "positions": [
+                {"task_id": root["id"], "x": 3, "y": 4},
+                {"task_id": root["id"], "x": 5, "y": 6},
+            ]
+        },
+    )
+    assert duplicate.status_code == 400
+    assert "duplicate position" in duplicate.json()["detail"]
+
+    too_large = client.put(
+        path,
+        json={"positions": [{"task_id": root["id"], "x": 1_000_001, "y": 0}]},
+    )
+    assert too_large.status_code == 400
+    assert "coordinate limit" in too_large.json()["detail"]
+
+    unchanged = client.get(path)
+    assert unchanged.status_code == 200, unchanged.text
+    [position] = unchanged.json()["positions"]
+    assert (position["task_id"], position["x"], position["y"]) == (root["id"], 1.0, 2.0)
+
+
+def test_loop_canvas_positions_are_scoped_to_root_component_and_session(client):
+    root = client.post(
+        "/api/plugins/kanban/loop-drafts",
+        json={"title": "Canvas root", "session_id": "session-canvas-a"},
+    ).json()["task"]
+    same_session = client.post(
+        "/api/plugins/kanban/tasks",
+        json={"title": "Disconnected card", "session_id": "session-canvas-a", "triage": True},
+    ).json()["task"]
+    connected = client.post(
+        "/api/plugins/kanban/tasks",
+        json={"title": "Cross-session card", "session_id": "session-canvas-b", "triage": True},
+    ).json()["task"]
+    unrelated = client.post(
+        "/api/plugins/kanban/tasks",
+        json={"title": "Other canvas", "session_id": "session-canvas-c", "triage": True},
+    ).json()["task"]
+    assert client.post(
+        "/api/plugins/kanban/links",
+        json={"parent_id": root["id"], "child_id": connected["id"]},
+    ).status_code == 200
+
+    path = f"/api/plugins/kanban/loop-canvas/{root['id']}/positions"
+    allowed = client.put(
+        path,
+        json={
+            "positions": [
+                {"task_id": same_session["id"], "x": 10, "y": 20},
+                {"task_id": connected["id"], "x": 30, "y": 40},
+            ]
+        },
+    )
+    assert allowed.status_code == 200, allowed.text
+
+    rejected = client.put(
+        path,
+        json={"positions": [{"task_id": unrelated["id"], "x": 50, "y": 60}]},
+    )
+    assert rejected.status_code == 400
+    assert "outside Loop canvas" in rejected.json()["detail"]
+    assert {position["task_id"] for position in client.get(path).json()["positions"]} == {
+        same_session["id"],
+        connected["id"],
+    }
+
+
+def test_loop_canvas_positions_omit_archived_cards_from_session_scope(client):
+    session_id = "session-canvas-archived-position"
+    root = client.post(
+        "/api/plugins/kanban/loop-drafts",
+        json={"title": "Canvas root", "session_id": session_id},
+    ).json()["task"]
+    card = client.post(
+        "/api/plugins/kanban/tasks",
+        json={"title": "Temporary card", "session_id": session_id, "triage": True},
+    ).json()["task"]
+    path = f"/api/plugins/kanban/loop-canvas/{root['id']}/positions"
+    scope = {"session_id": session_id}
+
+    saved = client.put(
+        path,
+        params=scope,
+        json={
+            "positions": [
+                {"task_id": root["id"], "x": 10, "y": 20},
+                {"task_id": card["id"], "x": 30, "y": 40},
+            ]
+        },
+    )
+    assert saved.status_code == 200, saved.text
+    assert client.patch(
+        f"/api/plugins/kanban/tasks/{card['id']}",
+        json={"status": "archived"},
+    ).status_code == 200
+
+    visible = client.get(path, params=scope)
+    assert visible.status_code == 200, visible.text
+    assert [position["task_id"] for position in visible.json()["positions"]] == [root["id"]]
+
+    round_trip = client.put(
+        path,
+        params=scope,
+        json={
+            "positions": [
+                {key: position[key] for key in ("task_id", "x", "y")}
+                for position in visible.json()["positions"]
+            ]
+        },
+    )
+    assert round_trip.status_code == 200, round_trip.text
+
+
+def test_loop_canvas_session_scope_matches_compression_lineage_source(client, kanban_home):
+    from hermes_state import SessionDB
+
+    session_db = SessionDB()
+    try:
+        session_db.create_session("canvas-root-session", "tui")
+        session_db.end_session("canvas-root-session", "compression")
+        session_db.create_session(
+            "canvas-tip-session",
+            "tui",
+            parent_session_id="canvas-root-session",
+        )
+    finally:
+        session_db.close()
+
+    root = client.post(
+        "/api/plugins/kanban/loop-drafts",
+        json={"title": "Pre-compression root", "session_id": "canvas-root-session"},
+    ).json()["task"]
+    second_root = client.post(
+        "/api/plugins/kanban/loop-drafts",
+        json={"title": "Post-compression root", "session_id": "canvas-tip-session"},
+    ).json()["task"]
+    unrelated = client.post(
+        "/api/plugins/kanban/loop-drafts",
+        json={"title": "Other session", "session_id": "unrelated-session"},
+    ).json()["task"]
+    path = f"/api/plugins/kanban/loop-canvas/{root['id']}/positions"
+    scope = {"board": "default", "session_id": "canvas-tip-session"}
+
+    saved = client.put(
+        path,
+        params=scope,
+        json={
+            "positions": [
+                {"task_id": root["id"], "x": 10, "y": 20},
+                {"task_id": second_root["id"], "x": 30, "y": 40},
+            ]
+        },
+    )
+    assert saved.status_code == 200, saved.text
+
+    linked = client.post(
+        "/api/plugins/kanban/links",
+        params={"board": "default"},
+        json={
+            "parent_id": root["id"],
+            "child_id": second_root["id"],
+            "root_task_id": root["id"],
+            "session_id": "canvas-tip-session",
+        },
+    )
+    assert linked.status_code == 200, linked.text
+
+    rejected_position = client.put(
+        path,
+        params=scope,
+        json={"positions": [{"task_id": unrelated["id"], "x": 50, "y": 60}]},
+    )
+    assert rejected_position.status_code == 400
+    assert "outside Loop canvas" in rejected_position.json()["detail"]
+
+    rejected_link = client.post(
+        "/api/plugins/kanban/links",
+        params={"board": "default"},
+        json={
+            "parent_id": root["id"],
+            "child_id": unrelated["id"],
+            "root_task_id": root["id"],
+            "session_id": "canvas-tip-session",
+        },
+    )
+    assert rejected_link.status_code == 400
+    assert "outside Loop canvas" in rejected_link.json()["detail"]
+
+    rejected_root = client.get(
+        f"/api/plugins/kanban/loop-canvas/{unrelated['id']}/positions",
+        params=scope,
+    )
+    assert rejected_root.status_code == 400
+    assert "outside Loop canvas" in rejected_root.json()["detail"]
+
+
 def test_create_loop_draft_preserves_explicit_tenant_metadata(client):
     first = client.post(
         "/api/plugins/kanban/loop-drafts",
@@ -1026,7 +1318,7 @@ def test_session_source_reports_decomposed_original_root_task_id(client, kanban_
     assert data["links"] == [{"parent_id": child_ids[0], "child_id": root}]
 
 
-def test_session_source_includes_loop_graph_decision_metadata(client, monkeypatch):
+def test_session_source_preserves_legacy_loop_planning_projection(client, monkeypatch):
     from hermes_cli import loop_graph
 
     monkeypatch.setenv("HERMES_SESSION_ID", "session-decision-metadata")
@@ -1704,6 +1996,60 @@ def test_add_link_and_delete_link(client):
     )
     assert r.status_code == 200
     assert r.json()["ok"] is True
+
+
+def test_add_link_can_be_scoped_to_loop_canvas_membership(client):
+    root = client.post(
+        "/api/plugins/kanban/loop-drafts",
+        json={"title": "Canvas root", "session_id": "session-links-a"},
+    ).json()["task"]
+    same_session = client.post(
+        "/api/plugins/kanban/tasks",
+        json={"title": "Disconnected card", "session_id": "session-links-a", "triage": True},
+    ).json()["task"]
+    connected = client.post(
+        "/api/plugins/kanban/tasks",
+        json={"title": "Cross-session card", "session_id": "session-links-b", "triage": True},
+    ).json()["task"]
+    unrelated = client.post(
+        "/api/plugins/kanban/tasks",
+        json={"title": "Other canvas", "session_id": "session-links-c", "triage": True},
+    ).json()["task"]
+    assert client.post(
+        "/api/plugins/kanban/links",
+        json={"parent_id": root["id"], "child_id": connected["id"]},
+    ).status_code == 200
+
+    same_session_link = client.post(
+        "/api/plugins/kanban/links",
+        json={
+            "parent_id": root["id"],
+            "child_id": same_session["id"],
+            "root_task_id": root["id"],
+        },
+    )
+    assert same_session_link.status_code == 200, same_session_link.text
+
+    connected_cross_session_link = client.post(
+        "/api/plugins/kanban/links",
+        json={
+            "parent_id": connected["id"],
+            "child_id": same_session["id"],
+            "root_task_id": root["id"],
+        },
+    )
+    assert connected_cross_session_link.status_code == 200, connected_cross_session_link.text
+
+    rejected = client.post(
+        "/api/plugins/kanban/links",
+        json={
+            "parent_id": root["id"],
+            "child_id": unrelated["id"],
+            "root_task_id": root["id"],
+        },
+    )
+    assert rejected.status_code == 400
+    assert "outside Loop canvas" in rejected.json()["detail"]
 
 
 def test_add_link_cycle_rejected(client):

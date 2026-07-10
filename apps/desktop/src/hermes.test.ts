@@ -9,14 +9,21 @@ import {
   getGlobalModelOptions,
   getHermesConfig,
   getHermesConfigDefaults,
+  getLoopAssignees,
+  getLoopCanvasPositions,
   getLoopSessionSource,
   getLoopTaskDetail,
   getProfiles,
   getSessionMessages,
   getStatus,
+  linkLoopTasks,
   listAllProfileSessions,
   listSessions,
+  loopSourceFromDraftResult,
+  mergeLoopDraftSource,
   reviewLoopHandoffForTask,
+  saveLoopCanvasPositions,
+  unlinkLoopTasks,
   updateLoopTaskStatus
 } from './hermes'
 import { refreshActiveProfile } from './store/profile'
@@ -161,17 +168,100 @@ describe('Hermes REST session helpers', () => {
   it('creates a draft Loop task through the profile-scoped kanban API', async () => {
     api.mockResolvedValue({ task: { id: 't_loop', title: 'Draft Loop root' } })
 
-    await createLoopDraftTask({ board: 'developer', profile: 'peacock', sessionId: 'session-1', title: 'Draft Loop root' })
+    await createLoopDraftTask({
+      assignee: 'peacock',
+      board: 'developer',
+      profile: 'peacock',
+      sessionId: 'session-1',
+      title: 'Draft Loop root'
+    })
 
     expect(api).toHaveBeenCalledWith({
       body: {
-        assignee: 'orchestrator',
+        assignee: 'peacock',
         body: undefined,
         session_id: 'session-1',
         title: 'Draft Loop root'
       },
       method: 'POST',
       path: '/api/plugins/kanban/loop-drafts?board=developer',
+      profile: 'peacock'
+    })
+  })
+
+  it('lists available Loop assignees from the profile-scoped kanban API', async () => {
+    api.mockResolvedValue({ assignees: [{ name: 'peacock', on_disk: true }] })
+
+    await getLoopAssignees('peacock', 'developer')
+
+    expect(api).toHaveBeenCalledWith({
+      path: '/api/plugins/kanban/assignees?board=developer',
+      profile: 'peacock'
+    })
+  })
+
+  it('reads and saves Loop canvas positions through the profile-scoped kanban API', async () => {
+    api
+      .mockResolvedValueOnce({
+        positions: [{ task_id: 't_child', updated_at: 42, x: 12.5, y: -8 }],
+        root_task_id: 't/root'
+      })
+      .mockResolvedValueOnce({
+        ok: true,
+        positions: [{ task_id: 't_child', updated_at: 43, x: 50, y: 75 }],
+        root_task_id: 't/root'
+      })
+
+    await expect(getLoopCanvasPositions('t/root', 'peacock', 'developer', 'session/one')).resolves.toEqual({
+      positions: [{ taskId: 't_child', updatedAt: 42, x: 12.5, y: -8 }],
+      rootTaskId: 't/root'
+    })
+    await expect(
+      saveLoopCanvasPositions('t/root', [{ taskId: 't_child', x: 50, y: 75 }], 'peacock', 'developer', 'session/one')
+    ).resolves.toEqual({
+      positions: [{ taskId: 't_child', updatedAt: 43, x: 50, y: 75 }],
+      rootTaskId: 't/root'
+    })
+
+    expect(api).toHaveBeenNthCalledWith(1, {
+      path: '/api/plugins/kanban/loop-canvas/t%2Froot/positions?board=developer&session_id=session%2Fone',
+      profile: 'peacock'
+    })
+    expect(api).toHaveBeenNthCalledWith(2, {
+      body: { positions: [{ task_id: 't_child', x: 50, y: 75 }] },
+      method: 'PUT',
+      path: '/api/plugins/kanban/loop-canvas/t%2Froot/positions?board=developer&session_id=session%2Fone',
+      profile: 'peacock'
+    })
+  })
+
+  it('mutates Loop dependency links through the canonical kanban endpoint', async () => {
+    api.mockResolvedValue({ ok: true })
+
+    await linkLoopTasks('t_parent', 't_child', 'peacock', 'developer')
+    await linkLoopTasks('t_parent', 't_child', 'peacock', 'developer', 't_root', 'session/one')
+    await unlinkLoopTasks('t_parent', 't_child', 'peacock', 'developer')
+
+    expect(api).toHaveBeenNthCalledWith(1, {
+      body: { child_id: 't_child', parent_id: 't_parent' },
+      method: 'POST',
+      path: '/api/plugins/kanban/links?board=developer',
+      profile: 'peacock'
+    })
+    expect(api).toHaveBeenNthCalledWith(2, {
+      body: {
+        child_id: 't_child',
+        parent_id: 't_parent',
+        root_task_id: 't_root',
+        session_id: 'session/one'
+      },
+      method: 'POST',
+      path: '/api/plugins/kanban/links?board=developer',
+      profile: 'peacock'
+    })
+    expect(api).toHaveBeenNthCalledWith(3, {
+      method: 'DELETE',
+      path: '/api/plugins/kanban/links?child_id=t_child&parent_id=t_parent&board=developer',
       profile: 'peacock'
     })
   })
@@ -198,6 +288,53 @@ describe('Hermes REST session helpers', () => {
       path: '/api/plugins/kanban/loop-drafts',
       profile: 'peacock'
     })
+  })
+
+  it('passes a caller-stable idempotency key for a deliberate Loop task add', async () => {
+    api.mockResolvedValue({ task: { id: 't_loop', title: 'Draft Loop root' } })
+
+    await createLoopDraftTask({
+      idempotencyKey: 'loop-draft:session-1:add-1',
+      profile: 'peacock',
+      sessionId: 'session-1',
+      title: 'Draft Loop root'
+    })
+
+    expect(api).toHaveBeenCalledWith({
+      body: {
+        assignee: 'orchestrator',
+        body: undefined,
+        idempotency_key: 'loop-draft:session-1:add-1',
+        session_id: 'session-1',
+        title: 'Draft Loop root'
+      },
+      method: 'POST',
+      path: '/api/plugins/kanban/loop-drafts',
+      profile: 'peacock'
+    })
+  })
+
+  it('merges a newly created Loop row without dropping the existing graph', () => {
+    const incoming = loopSourceFromDraftResult('session-1', {
+      task: { id: 't_second', status: 'scheduled', title: 'Second task' }
+    })!
+
+    const merged = mergeLoopDraftSource(
+      {
+        links: [{ child_id: 't_child', parent_id: 't_root' }],
+        root_task_id: 't_root',
+        session_id: 'session-1',
+        tasks: [
+          { id: 't_root', status: 'scheduled', title: 'Root task' },
+          { id: 't_child', status: 'scheduled', title: 'Child task' }
+        ]
+      },
+      incoming
+    )
+
+    expect(merged.root_task_id).toBe('t_root')
+    expect(merged.tasks?.map(task => task.id)).toEqual(['t_root', 't_child', 't_second'])
+    expect(merged.links).toEqual([{ child_id: 't_child', parent_id: 't_root' }])
   })
 
   it('posts Loop task comments through the profile-scoped kanban API', async () => {
@@ -256,20 +393,6 @@ describe('Hermes REST session helpers', () => {
 
     expect(api).toHaveBeenCalledWith({
       body: { approve_intake: true },
-      method: 'POST',
-      path: '/api/plugins/kanban/tasks/t_root/decompose?board=developer',
-      profile: 'peacock',
-      timeoutMs: 600_000
-    })
-  })
-
-  it('can request Loop-safe decomposition without making planning rows dispatchable', async () => {
-    api.mockResolvedValue({ child_ids: [], fanout: false, ok: true, task_id: 't_root' })
-
-    await decomposeLoopTask('t_root', 'peacock', { approveIntake: true, board: 'developer', loopSafe: true })
-
-    expect(api).toHaveBeenCalledWith({
-      body: { approve_intake: true, loop_safe: true },
       method: 'POST',
       path: '/api/plugins/kanban/tasks/t_root/decompose?board=developer',
       profile: 'peacock',

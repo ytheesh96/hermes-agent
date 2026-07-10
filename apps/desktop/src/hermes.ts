@@ -332,9 +332,27 @@ function kanbanBoardQuery(board?: null | string): string {
   return `?${query.toString()}`
 }
 
+function loopCanvasQuery(board?: null | string, sessionId?: null | string): string {
+  const query = new URLSearchParams()
+  const normalizedBoard = board?.trim()
+  const normalizedSessionId = sessionId?.trim()
+
+  if (normalizedBoard) {
+    query.set('board', normalizedBoard)
+  }
+
+  if (normalizedSessionId) {
+    query.set('session_id', normalizedSessionId)
+  }
+
+  return query.size ? `?${query.toString()}` : ''
+}
+
 export interface CreateLoopDraftTaskPayload {
+  assignee?: null | string
   body?: null | string
   board?: null | string
+  idempotencyKey?: null | string
   profile?: null | string
   sessionId: string
   tenant?: null | string
@@ -350,21 +368,188 @@ export interface CreateLoopDraftTaskResponse {
   tenant?: null | string
 }
 
+export function loopSourceFromDraftResult(
+  sessionId: string,
+  result: CreateLoopDraftTaskResponse
+): TenantLoopSource | null {
+  if (result.source) {
+    return result.source
+  }
+
+  if (!result.task) {
+    return null
+  }
+
+  return {
+    board: result.board,
+    root_task_id: result.task.id,
+    session_id: sessionId,
+    tasks: [result.task],
+    tenant: result.tenant
+  }
+}
+
+export function mergeLoopDraftSource(
+  current: TenantLoopSource | undefined,
+  incoming: TenantLoopSource
+): TenantLoopSource {
+  if (!current) {
+    return incoming
+  }
+
+  const incomingTaskIds = new Set((incoming.tasks || []).map(task => task.id))
+
+  return {
+    ...current,
+    board: incoming.board ?? current.board,
+    latest_event_id: Math.max(current.latest_event_id || 0, incoming.latest_event_id || 0),
+    now: incoming.now ?? current.now,
+    root_task_id: current.root_task_id || incoming.root_task_id,
+    tasks: [...(current.tasks || []).filter(task => !incomingTaskIds.has(task.id)), ...(incoming.tasks || [])],
+    tenant: current.tenant ?? incoming.tenant
+  }
+}
+
+export interface LoopAssignee {
+  name: string
+  on_disk: boolean
+}
+
+export interface LoopCanvasPosition {
+  taskId: string
+  updatedAt?: number
+  x: number
+  y: number
+}
+
+interface LoopCanvasPositionsResponse {
+  positions: Array<{
+    task_id: string
+    updated_at?: number
+    x: number
+    y: number
+  }>
+  root_task_id: string
+}
+
+export interface LoopCanvasPositions {
+  positions: LoopCanvasPosition[]
+  rootTaskId: string
+}
+
+function loopCanvasPositions(response: LoopCanvasPositionsResponse): LoopCanvasPositions {
+  return {
+    positions: response.positions.map(position => ({
+      taskId: position.task_id,
+      updatedAt: position.updated_at,
+      x: position.x,
+      y: position.y
+    })),
+    rootTaskId: response.root_task_id
+  }
+}
+
+export async function getLoopCanvasPositions(
+  rootTaskId: string,
+  profile?: null | string,
+  board?: null | string,
+  sessionId?: null | string
+): Promise<LoopCanvasPositions> {
+  const response = await window.hermesDesktop.api<LoopCanvasPositionsResponse>({
+    ...(profile ? { profile } : profileScoped()),
+    path: `/api/plugins/kanban/loop-canvas/${encodeURIComponent(rootTaskId)}/positions${loopCanvasQuery(board, sessionId)}`
+  })
+
+  return loopCanvasPositions(response)
+}
+
+export async function saveLoopCanvasPositions(
+  rootTaskId: string,
+  positions: LoopCanvasPosition[],
+  profile?: null | string,
+  board?: null | string,
+  sessionId?: null | string
+): Promise<LoopCanvasPositions> {
+  const response = await window.hermesDesktop.api<LoopCanvasPositionsResponse>({
+    ...(profile ? { profile } : profileScoped()),
+    body: { positions: positions.map(({ taskId, x, y }) => ({ task_id: taskId, x, y })) },
+    method: 'PUT',
+    path: `/api/plugins/kanban/loop-canvas/${encodeURIComponent(rootTaskId)}/positions${loopCanvasQuery(board, sessionId)}`
+  })
+
+  return loopCanvasPositions(response)
+}
+
+export function linkLoopTasks(
+  parentId: string,
+  childId: string,
+  profile?: null | string,
+  board?: null | string,
+  rootTaskId?: null | string,
+  sessionId?: null | string
+): Promise<{ ok: boolean }> {
+  return window.hermesDesktop.api<{ ok: boolean }>({
+    ...(profile ? { profile } : profileScoped()),
+    body: {
+      child_id: childId,
+      parent_id: parentId,
+      ...(rootTaskId ? { root_task_id: rootTaskId } : {}),
+      ...(sessionId ? { session_id: sessionId } : {})
+    },
+    method: 'POST',
+    path: `/api/plugins/kanban/links${kanbanBoardQuery(board)}`
+  })
+}
+
+export function unlinkLoopTasks(
+  parentId: string,
+  childId: string,
+  profile?: null | string,
+  board?: null | string
+): Promise<{ ok: boolean }> {
+  const query = new URLSearchParams({ child_id: childId, parent_id: parentId })
+  const normalizedBoard = board?.trim()
+
+  if (normalizedBoard) {
+    query.set('board', normalizedBoard)
+  }
+
+  return window.hermesDesktop.api<{ ok: boolean }>({
+    ...(profile ? { profile } : profileScoped()),
+    method: 'DELETE',
+    path: `/api/plugins/kanban/links?${query.toString()}`
+  })
+}
+
+export function getLoopAssignees(
+  profile?: null | string,
+  board?: null | string
+): Promise<{ assignees: LoopAssignee[] }> {
+  return window.hermesDesktop.api<{ assignees: LoopAssignee[] }>({
+    ...(profile ? { profile } : profileScoped()),
+    path: `/api/plugins/kanban/assignees${kanbanBoardQuery(board)}`
+  })
+}
+
 export function createLoopDraftTask({
+  assignee,
   body,
   board,
+  idempotencyKey,
   profile,
   sessionId,
   tenant,
   title
 }: CreateLoopDraftTaskPayload): Promise<CreateLoopDraftTaskResponse> {
   const normalizedTenant = tenant?.trim()
+  const normalizedIdempotencyKey = idempotencyKey?.trim()
 
   return window.hermesDesktop.api<CreateLoopDraftTaskResponse>({
     ...(profile ? { profile } : profileScoped()),
     body: {
-      assignee: 'orchestrator',
+      assignee: assignee?.trim() || 'orchestrator',
       body: body?.trim() || undefined,
+      ...(normalizedIdempotencyKey ? { idempotency_key: normalizedIdempotencyKey } : {}),
       session_id: sessionId,
       ...(normalizedTenant ? { tenant: normalizedTenant } : {}),
       title: title?.trim() || 'Loop draft'
@@ -554,12 +739,9 @@ export interface LoopTaskDecomposeResult {
 export function decomposeLoopTask(
   taskId: string,
   profile?: string | null,
-  options: { approveIntake?: boolean; board?: null | string; loopSafe?: boolean } = {}
+  options: { approveIntake?: boolean; board?: null | string } = {}
 ): Promise<LoopTaskDecomposeResult> {
-  const body = {
-    ...(options.approveIntake ? { approve_intake: true } : {}),
-    ...(options.loopSafe ? { loop_safe: true } : {})
-  }
+  const body = options.approveIntake ? { approve_intake: true } : {}
 
   return window.hermesDesktop.api<LoopTaskDecomposeResult>({
     ...(profile ? { profile } : profileScoped()),

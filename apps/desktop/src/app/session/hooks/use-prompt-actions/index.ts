@@ -159,6 +159,7 @@ interface PromptActionsOptions {
   branchCurrentSession: () => Promise<boolean>
   createBackendSessionForSend: (preview?: string | null) => Promise<string | null>
   handleSkinCommand: (arg: string) => string
+  onOpenLoop: (taskId?: string) => void
   openMemoryGraph: () => void
   refreshSessions: () => Promise<void>
   requestGateway: <T>(method: string, params?: Record<string, unknown>, timeoutMs?: number) => Promise<T>
@@ -187,6 +188,7 @@ export function usePromptActions({
   branchCurrentSession,
   createBackendSessionForSend,
   handleSkinCommand,
+  onOpenLoop,
   openMemoryGraph,
   refreshSessions,
   requestGateway,
@@ -450,10 +452,12 @@ export function usePromptActions({
     createBackendSessionForSend,
     handleSkinCommand,
     handoffSession,
+    onOpenLoop,
     openMemoryGraph,
     refreshSessions,
     requestGateway,
     resumeStoredSession,
+    selectedStoredSessionIdRef,
     startFreshSessionDraft,
     submitPromptText
   })
@@ -465,7 +469,7 @@ export function usePromptActions({
 
       if (!attachments.length && SLASH_COMMAND_RE.test(visibleText)) {
         triggerHaptic('selection')
-        await executeSlashCommand(visibleText)
+        await executeSlashCommand(visibleText, { loopAssignee: options?.loopAssignee })
 
         return true
       }

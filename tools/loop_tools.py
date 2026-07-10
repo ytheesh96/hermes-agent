@@ -533,8 +533,7 @@ def _handle_loop_request_review(args: dict[str, Any], **_kwargs) -> str:
 LOOP_GRAPH_SCHEMA = {
     "name": "loop_graph",
     "description": (
-        "Read or patch the lightweight Loop planning graph. Patch operations create/update/archive "
-        "planning nodes and visual planning edges (not Kanban tasks/task_links) with expected_revision + mutation_id guards. "
+        "Read or safely update a durable Loop task graph with expected_revision + mutation_id guards. "
         "Responses are compact: success/error plus graph revision data."
     ),
     "parameters": {
@@ -542,23 +541,15 @@ LOOP_GRAPH_SCHEMA = {
         "properties": {
             "action": {"type": "string", "enum": ["read", "patch"]},
             "root_task_id": {"type": "string", "description": "Durable Loop root task id, or a legacy Loop identity/tenant id."},
-            "include_nodes": {"type": "boolean", "description": "For read only, include compact dependency-derived nodes."},
+            "include_nodes": {"type": "boolean", "description": "For read only, include compact Kanban dependency tasks."},
             "expected_revision": {"type": "integer", "description": "For patch, graph_revision from the last read."},
             "mutation_id": {"type": "string", "description": "For patch, caller-stable idempotency key for this mutation."},
             "operations": {
                 "type": "array",
                 "description": (
-                    "Patch ops: add_node, update_node, archive_node/delete_node, "
-                    "set_parents, mark_node, resolve_handoff, validate. add_node/update_node/mark_node support "
-                    "client_id/title/body/parents/suggested_owner/status/active/frontier plus graph metadata "
-                    "branch_kind ('alternative' or 'required'), decision_group_id, and selection_state; "
-                    "status defaults to scheduled for visible, non-dispatchable planning nodes. "
-                    "Parent option nodes to the root/current frontier so they stay connected "
-                    "in Loop overview/detail graphs. When the user explicitly activates a leaf, "
-                    "call delegate_task(mode='loop') to create real durable work, then update the "
-                    "planning node with execution_task_id; do not promote planning nodes to ready "
-                    "or use planning edges as task_links prerequisites. resolve_handoff records "
-                    "foreground approval/rejection without promoting downstream rows."
+                    "Patch ops for current clients: update_node, resolve_handoff, validate. "
+                    "update_node edits title, body, or suggested_owner on a safe Loop root/task. "
+                    "Create executable work and dependencies through the normal Kanban task APIs."
                 ),
                 "items": {"type": "object"},
             },

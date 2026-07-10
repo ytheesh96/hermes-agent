@@ -4,10 +4,18 @@ import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 
 import {
   addLoopTaskComment,
+  createLoopDraftTask,
   decomposeLoopTask,
+  getLoopCanvasPositions,
   getLoopSessionSource,
   getLoopTaskDetail,
+  linkLoopTasks,
+  type LoopCanvasPosition,
+  loopSourceFromDraftResult,
+  mergeLoopDraftSource,
   reviewLoopHandoffForTask,
+  saveLoopCanvasPositions,
+  unlinkLoopTasks,
   updateLoopTaskStatus
 } from '@/hermes'
 import { reconcileKanbanSessionSourceForComposer } from '@/store/composer-status'
@@ -30,6 +38,7 @@ import {
 
 interface LoopPanelControllerOptions {
   activeSessionId: null | string
+  ensureLoopSourceSessionId?: () => Promise<null | string>
   gatewayOpen: boolean
   loopSourceSessionId: string
   onAddContextRef: (refText: string, label?: string, detail?: string) => void
@@ -85,6 +94,7 @@ function loopPanelAutoOpenParams(): { enabled: boolean; taskId: null | string } 
 
 export function useLoopPanelController({
   activeSessionId,
+  ensureLoopSourceSessionId,
   gatewayOpen,
   loopSourceSessionId,
   onAddContextRef
@@ -125,14 +135,18 @@ export function useLoopPanelController({
   const [loopPanelOpen, setLoopPanelOpen] = useState(false)
   const [loopPanelHidden, setLoopPanelHidden] = useState(false)
   const autoOpenedLoopPanelRef = useRef<string | null>(null)
+  const pendingSelectedLoopTaskIdRef = useRef<string | null>(null)
 
   const loopPanelRootKey = loopPanelState?.rootTaskId || ''
+  const loopCanvasScopeKey = loopSourceSessionId || activeSessionId || 'new'
   const loopSourceBoard = loopSourceQuery.data?.board || undefined
 
-  const focusedLoopRow = useMemo(
-    () => loopPanelState?.rows.find(row => row.taskId === focusedLoopTaskId) || null,
-    [focusedLoopTaskId, loopPanelState]
-  )
+  const loopCanvasPositionsQuery = useQuery({
+    queryKey: ['loop-canvas-positions', activeGatewayProfile, loopSourceBoard, loopPanelRootKey, loopSourceSessionId],
+    queryFn: () => getLoopCanvasPositions(loopPanelRootKey, activeGatewayProfile, loopSourceBoard, loopSourceSessionId),
+    enabled: gatewayOpen && Boolean(loopPanelRootKey),
+    staleTime: 2_000
+  })
 
   const selectedLoopTaskDetailQuery = useQuery({
     queryKey: [
@@ -143,12 +157,7 @@ export function useLoopPanelController({
       loopPanelState?.revision || 0
     ],
     queryFn: () => getLoopTaskDetail(focusedLoopTaskId!, activeGatewayProfile, loopSourceBoard),
-    enabled:
-      gatewayOpen &&
-      loopPanelOpen &&
-      Boolean(focusedLoopTaskId) &&
-      focusedLoopRow?.planningNode !== true &&
-      Boolean(tenantLoopPanelState?.rows.length),
+    enabled: gatewayOpen && loopPanelOpen && Boolean(focusedLoopTaskId) && Boolean(tenantLoopPanelState?.rows.length),
     refetchInterval: query =>
       loopSessionSourceRefetchInterval({
         session_id: loopSourceSessionId,
@@ -189,15 +198,8 @@ export function useLoopPanelController({
   })
 
   const loopTaskDecomposeMutation = useMutation({
-    mutationFn: ({
-      approveIntake,
-      loopSafe,
-      taskId
-    }: {
-      approveIntake?: boolean
-      loopSafe?: boolean
-      taskId: string
-    }) => decomposeLoopTask(taskId, activeGatewayProfile, { approveIntake, board: loopSourceBoard, loopSafe }),
+    mutationFn: ({ approveIntake, taskId }: { approveIntake?: boolean; taskId: string }) =>
+      decomposeLoopTask(taskId, activeGatewayProfile, { approveIntake, board: loopSourceBoard }),
     onSuccess: async result => {
       if (!result.ok) {
         notify({
@@ -257,12 +259,28 @@ export function useLoopPanelController({
     setFocusedLoopTaskId(null)
     setLoopPanelOpen(false)
     setLoopPanelHidden(false)
-  }, [loopPanelRootKey])
+  }, [loopSourceSessionId])
+
+  useEffect(() => {
+    const taskId = pendingSelectedLoopTaskIdRef.current
+
+    if (!taskId || !loopPanelState?.rows.some(row => row.taskId === taskId)) {
+      return
+    }
+
+    pendingSelectedLoopTaskIdRef.current = null
+    setPaneOpen(PREVIEW_PANE_ID, true)
+    setSelectedLoopTaskId(taskId)
+    setFocusedLoopTaskId(taskId)
+    setLoopFocusRequestKey(key => key + 1)
+    setLoopPanelOpen(true)
+    setLoopPanelHidden(false)
+  }, [loopPanelState])
 
   useEffect(() => {
     const autoOpen = loopPanelAutoOpenParams()
 
-    if (!autoOpen.enabled || !loopPanelState?.rows.length || !loopPanelRootKey) {
+    if (!autoOpen.enabled || !loopPanelState?.rows.length) {
       return
     }
 
@@ -270,8 +288,8 @@ export function useLoopPanelController({
       return
     }
 
-    const targetTaskId = autoOpen.taskId || loopPanelRootKey
-    const autoOpenKey = `${loopPanelRootKey}:${targetTaskId}`
+    const targetTaskId = autoOpen.taskId
+    const autoOpenKey = `${loopCanvasScopeKey}:${targetTaskId || 'canvas'}`
 
     if (autoOpenedLoopPanelRef.current === autoOpenKey) {
       return
@@ -285,27 +303,187 @@ export function useLoopPanelController({
     setLoopFocusRequestKey(key => key + 1)
     setLoopPanelOpen(true)
     setLoopPanelHidden(false)
-  }, [loopPanelRootKey, loopPanelState])
+  }, [loopCanvasScopeKey, loopPanelState])
 
-  const handleSelectLoopTaskId = useCallback((taskId: string) => {
-    setPaneOpen(PREVIEW_PANE_ID, true)
-    setSelectedLoopTaskId(taskId)
-    setFocusedLoopTaskId(taskId)
-    setLoopFocusRequestKey(key => key + 1)
-    setLoopPanelOpen(true)
-    setLoopPanelHidden(false)
-  }, [])
+  const handleSelectLoopTaskId = useCallback(
+    (taskId: string) => {
+      pendingSelectedLoopTaskIdRef.current = loopPanelState?.rows.some(row => row.taskId === taskId) ? null : taskId
+      setPaneOpen(PREVIEW_PANE_ID, true)
+      setSelectedLoopTaskId(taskId)
+      setFocusedLoopTaskId(taskId)
+      setLoopFocusRequestKey(key => key + 1)
+      setLoopPanelOpen(true)
+      setLoopPanelHidden(false)
+    },
+    [loopPanelState]
+  )
+
+  const handleOpenLoopPanel = useCallback(
+    (taskId?: string) => {
+      if (taskId) {
+        handleSelectLoopTaskId(taskId)
+
+        return
+      }
+
+      pendingSelectedLoopTaskIdRef.current = null
+      setPaneOpen(PREVIEW_PANE_ID, true)
+      setSelectedLoopTaskId(null)
+      setFocusedLoopTaskId(null)
+      setLoopFocusRequestKey(key => key + 1)
+      setLoopPanelOpen(true)
+      setLoopPanelHidden(false)
+    },
+    [handleSelectLoopTaskId]
+  )
 
   const handleHideLoopPanel = useCallback(() => {
     setLoopPanelOpen(false)
     setLoopPanelHidden(true)
   }, [])
 
+  const handleCreateLoopTask = useCallback(
+    async (idea: string, assignee: string): Promise<null | string> => {
+      const title = idea.trim()
+      const sourceSessionId = loopSourceSessionId || (await ensureLoopSourceSessionId?.())?.trim()
+
+      if (!title || !sourceSessionId) {
+        return null
+      }
+
+      try {
+        const result = await createLoopDraftTask({
+          assignee,
+          board: loopSourceBoard,
+          idempotencyKey: `loop-draft:${sourceSessionId}:${crypto.randomUUID()}`,
+          profile: activeGatewayProfile,
+          sessionId: sourceSessionId,
+          title
+        })
+
+        const source = loopSourceFromDraftResult(sourceSessionId, result)
+
+        if (source && !loopPanelRootKey) {
+          const queryKey = ['loop-session-source', activeGatewayProfile, sourceSessionId]
+
+          const reconciledSource = mergeLoopDraftSource(queryClient.getQueryData<TenantLoopSource>(queryKey), source)
+
+          queryClient.setQueryData(queryKey, reconciledSource)
+          reconcileKanbanSessionSourceForComposer({ activeSessionId, source: reconciledSource, sourceSessionId })
+        }
+
+        void queryClient.invalidateQueries({
+          queryKey: ['loop-session-source', activeGatewayProfile, sourceSessionId]
+        })
+
+        const taskId = result.task?.id
+
+        if (!loopPanelRootKey) {
+          handleOpenLoopPanel(taskId)
+        }
+
+        notify({ kind: 'success', message: `Task added · ${result.task?.title || title}` })
+
+        return taskId || null
+      } catch (error) {
+        notifyError(error, 'Create Loop task failed')
+
+        return null
+      }
+    },
+    [
+      activeGatewayProfile,
+      activeSessionId,
+      ensureLoopSourceSessionId,
+      handleOpenLoopPanel,
+      loopPanelRootKey,
+      loopSourceBoard,
+      loopSourceSessionId,
+      queryClient
+    ]
+  )
+
   const handleAddLoopTaskComment = useCallback(
     async (taskId: string, body: string) => {
       await loopTaskCommentMutation.mutateAsync({ body, taskId })
     },
     [loopTaskCommentMutation]
+  )
+
+  const handleSaveLoopCanvasPositions = useCallback(
+    async (positions: LoopCanvasPosition[], rootTaskId?: string): Promise<boolean> => {
+      const targetRootTaskId = rootTaskId?.trim() || loopPanelRootKey
+
+      if (!targetRootTaskId) {
+        return false
+      }
+
+      try {
+        const saved = await saveLoopCanvasPositions(
+          targetRootTaskId,
+          positions,
+          activeGatewayProfile,
+          loopSourceBoard,
+          loopSourceSessionId
+        )
+
+        queryClient.setQueryData(
+          ['loop-canvas-positions', activeGatewayProfile, loopSourceBoard, targetRootTaskId, loopSourceSessionId],
+          saved
+        )
+
+        return true
+      } catch (error) {
+        notifyError(error, 'Save Loop layout failed')
+
+        return false
+      }
+    },
+    [activeGatewayProfile, loopPanelRootKey, loopSourceBoard, loopSourceSessionId, queryClient]
+  )
+
+  const handleLinkLoopTasks = useCallback(
+    async (parentId: string, childId: string): Promise<boolean> => {
+      try {
+        await linkLoopTasks(
+          parentId,
+          childId,
+          activeGatewayProfile,
+          loopSourceBoard,
+          loopPanelRootKey,
+          loopSourceSessionId
+        )
+        await queryClient.invalidateQueries({
+          queryKey: ['loop-session-source', activeGatewayProfile, loopSourceSessionId]
+        })
+
+        return true
+      } catch (error) {
+        notifyError(error, 'Connect Loop tasks failed')
+
+        return false
+      }
+    },
+    [activeGatewayProfile, loopPanelRootKey, loopSourceBoard, loopSourceSessionId, queryClient]
+  )
+
+  const handleUnlinkLoopTasks = useCallback(
+    async (parentId: string, childId: string): Promise<boolean> => {
+      try {
+        const result = await unlinkLoopTasks(parentId, childId, activeGatewayProfile, loopSourceBoard)
+
+        await queryClient.invalidateQueries({
+          queryKey: ['loop-session-source', activeGatewayProfile, loopSourceSessionId]
+        })
+
+        return result.ok
+      } catch (error) {
+        notifyError(error, 'Delete Loop dependency failed')
+
+        return false
+      }
+    },
+    [activeGatewayProfile, loopSourceBoard, loopSourceSessionId, queryClient]
   )
 
   const handleLoopTaskAction = useCallback(
@@ -329,22 +507,9 @@ export function useLoopPanelController({
       }
 
       if (action === 'ask-hermes') {
-        if (!row.planningNode) {
-          onAddContextRef(`@task:${row.taskId}`, row.title || row.taskId, `Loop task ${row.taskId}`)
-        }
+        onAddContextRef(`@task:${row.taskId}`, row.title || row.taskId, `Loop task ${row.taskId}`)
 
         requestComposerInsert(buildLoopChatDraft(row), { mode: 'block', target: 'main' })
-
-        return
-      }
-
-      if (row.planningNode) {
-        notify({
-          kind: 'warning',
-          title: 'Planning node only',
-          message:
-            'Planning nodes are visual decision records. Ask in chat to activate one with delegate_task(mode="loop").'
-        })
 
         return
       }
@@ -352,7 +517,6 @@ export function useLoopPanelController({
       if (action === 'decompose') {
         loopTaskDecomposeMutation.mutate({
           approveIntake: shouldApproveLoopIntakeOnSubmit(row),
-          loopSafe: true,
           taskId: row.taskId
         })
 
@@ -403,20 +567,28 @@ export function useLoopPanelController({
   )
 
   return {
+    canvasScopeKey: loopCanvasScopeKey,
     focusedTaskId: focusedLoopTaskId,
     focusRequestKey: loopFocusRequestKey,
     hidden: loopPanelHidden,
     onAddTaskComment: handleAddLoopTaskComment,
+    onCreateTask: handleCreateLoopTask,
     onFocusTaskId: setFocusedLoopTaskId,
     onHide: handleHideLoopPanel,
+    onLinkTasks: handleLinkLoopTasks,
+    onOpen: handleOpenLoopPanel,
+    onSavePositions: handleSaveLoopCanvasPositions,
     onSelectTaskId: handleSelectLoopTaskId,
     onTaskAction: handleLoopTaskAction,
+    onUnlinkTasks: handleUnlinkLoopTasks,
     open: loopPanelOpen,
+    positions: loopCanvasPositionsQuery.data?.positions,
+    rootTaskId: loopPanelRootKey || undefined,
     selectedTaskDetail: selectedLoopTaskDetailQuery.data,
     selectedTaskDetailError: selectedLoopTaskDetailError,
     selectedTaskId: selectedLoopTaskId,
     state: loopPanelState,
-    tabKey: selectedLoopTaskId || focusedLoopTaskId || loopPanelRootKey
+    tabKey: selectedLoopTaskId || focusedLoopTaskId || ''
   }
 }
 

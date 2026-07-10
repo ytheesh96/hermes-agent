@@ -678,8 +678,19 @@ export function DesktopController() {
   // projects rows onto activeSessionId for the live composer stack.
   const loopSourceSessionId = routedSessionId || selectedStoredSessionId || activeSessionId || ''
 
+  const ensureLoopSourceSessionId = useCallback(async () => {
+    if (loopSourceSessionId) {
+      return loopSourceSessionId
+    }
+
+    const runtimeSessionId = await createBackendSessionForSend()
+
+    return selectedStoredSessionIdRef.current || runtimeSessionId
+  }, [createBackendSessionForSend, loopSourceSessionId, selectedStoredSessionIdRef])
+
   const loopController = useLoopPanelController({
     activeSessionId,
+    ensureLoopSourceSessionId,
     gatewayOpen: chatOpen && gatewayOpen,
     loopSourceSessionId,
     onAddContextRef: composer.addContextRefAttachment
@@ -821,6 +832,7 @@ export function DesktopController() {
     busyRef,
     createBackendSessionForSend,
     handleSkinCommand,
+    onOpenLoop: loopController.onOpen,
     openMemoryGraph: openStarmap,
     refreshSessions,
     requestGateway,
@@ -1180,11 +1192,7 @@ export function DesktopController() {
   const sidebarSide = panesFlipped ? 'right' : 'left'
   const railSide = panesFlipped ? 'left' : 'right'
 
-  const loopRailOpen = Boolean(
-    loopController.open &&
-    !loopController.hidden &&
-    (loopController.state || loopController.selectedTaskId || loopController.focusedTaskId)
-  )
+  const loopRailOpen = loopController.open && !loopController.hidden
 
   const activePreviewTarget = filePreviewTarget || previewTarget
   const previewRailOpen = Boolean(activePreviewTarget)
@@ -1216,6 +1224,7 @@ export function DesktopController() {
       {chatOpen ? (
         <ChatWorkRail
           loop={loopController}
+          onCreateLoopTask={loopController.onCreateTask}
           onRestartServer={restartPreviewServer}
           previewKey={activePreviewTarget?.url || ''}
           previewLabel={activePreviewTarget?.label || undefined}

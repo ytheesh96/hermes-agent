@@ -3,6 +3,7 @@ import type { MutableRefObject } from 'react'
 import { useEffect, useRef } from 'react'
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 
+import { createLoopDraftTask } from '@/hermes'
 import { textPart } from '@/lib/chat-messages'
 import { $composerAttachments, $composerDraft, type ComposerAttachment, setComposerDraft } from '@/store/composer'
 import { $queuedPromptsBySession, getQueuedPrompts } from '@/store/composer-queue'
@@ -12,7 +13,13 @@ import type { SessionInfo } from '@/types/hermes'
 import { uploadComposerAttachment, usePromptActions } from '.'
 
 vi.mock('@/hermes', () => ({
+  createLoopDraftTask: vi.fn(),
   getProfiles: vi.fn(async () => ({ profiles: [] })),
+  loopSourceFromDraftResult: (
+    sessionId: string,
+    result: { source?: unknown; task?: null | { id: string } }
+  ) => result.source || (result.task ? { root_task_id: result.task.id, session_id: sessionId, tasks: [result.task] } : null),
+  mergeLoopDraftSource: (_current: unknown, incoming: unknown) => incoming,
   PROMPT_SUBMIT_REQUEST_TIMEOUT_MS: 1_800_000,
   setApiRequestProfile: vi.fn(),
   transcribeAudio: vi.fn()
@@ -48,7 +55,10 @@ interface HarnessHandle {
   cancelRun: () => Promise<void>
   restoreToMessage: (messageId: string, target?: { text?: string; userOrdinal?: number | null }) => Promise<void>
   steerPrompt: (text: string) => Promise<boolean>
-  submitText: (text: string, options?: { attachments?: ComposerAttachment[]; fromQueue?: boolean }) => Promise<boolean>
+  submitText: (
+    text: string,
+    options?: { attachments?: ComposerAttachment[]; fromQueue?: boolean; loopAssignee?: string }
+  ) => Promise<boolean>
 }
 
 function Harness({
@@ -62,7 +72,9 @@ function Harness({
   seedMessages,
   storedSessionId,
   activeSessionId,
-  createBackendSessionForSend
+  createBackendSessionForSend,
+  newStoredSessionId,
+  onOpenLoop
 }: {
   busyRef?: MutableRefObject<boolean>
   onReady: (handle: HarnessHandle) => void
@@ -75,6 +87,8 @@ function Harness({
   storedSessionId?: null | string
   activeSessionId?: null | string
   createBackendSessionForSend?: () => Promise<null | string>
+  newStoredSessionId?: string
+  onOpenLoop?: (taskId?: string) => void
 }) {
   const activeSessionIdRef: MutableRefObject<string | null> = {
     current: activeSessionId === undefined ? RUNTIME_SESSION_ID : activeSessionId
@@ -85,6 +99,17 @@ function Harness({
   }
 
   const localBusyRef = busyRef ?? { current: false }
+
+  const createSessionForSend = async () => {
+    const sessionId = await (createBackendSessionForSend ?? (async () => RUNTIME_SESSION_ID))()
+
+    if (sessionId) {
+      activeSessionIdRef.current = sessionId
+      selectedStoredSessionIdRef.current = newStoredSessionId ?? sessionId
+    }
+
+    return sessionId
+  }
 
   const stateRef = useRef({
     messages: seedMessages ?? [],
@@ -98,8 +123,9 @@ function Harness({
     activeSessionIdRef,
     branchCurrentSession: async () => true,
     busyRef: localBusyRef,
-    createBackendSessionForSend: createBackendSessionForSend ?? (async () => RUNTIME_SESSION_ID),
+    createBackendSessionForSend: createSessionForSend,
     handleSkinCommand: () => '',
+    onOpenLoop: onOpenLoop ?? (() => undefined),
     openMemoryGraph: openMemoryGraph ?? (() => undefined),
     refreshSessions,
     requestGateway,
@@ -438,6 +464,137 @@ describe('usePromptActions desktop slash pickers', () => {
   })
 })
 
+describe('usePromptActions /loop', () => {
+  afterEach(() => {
+    cleanup()
+    $queuedPromptsBySession.set({})
+    vi.mocked(createLoopDraftTask).mockReset()
+    vi.restoreAllMocks()
+  })
+
+  it('only opens the Loop canvas for a bare command', async () => {
+    const createBackendSessionForSend = vi.fn(async () => 'unexpected-session')
+    const onOpenLoop = vi.fn()
+    const requestGateway = vi.fn(async () => ({}) as never)
+    let handle: HarnessHandle | null = null
+
+    render(
+      <Harness
+        activeSessionId={null}
+        createBackendSessionForSend={createBackendSessionForSend}
+        onOpenLoop={onOpenLoop}
+        onReady={h => (handle = h)}
+        refreshSessions={async () => undefined}
+        requestGateway={requestGateway}
+        storedSessionId={null}
+      />
+    )
+
+    await handle!.submitText('/loop')
+
+    expect(onOpenLoop).toHaveBeenCalledOnce()
+    expect(onOpenLoop).toHaveBeenCalledWith()
+    expect(createBackendSessionForSend).not.toHaveBeenCalled()
+    expect(createLoopDraftTask).not.toHaveBeenCalled()
+    expect(requestGateway).not.toHaveBeenCalled()
+    expect(getQueuedPrompts(RUNTIME_SESSION_ID)).toEqual([])
+  })
+
+  it('creates fresh title-only tasks and opens them without starting a specification turn', async () => {
+    vi.mocked(createLoopDraftTask)
+      .mockResolvedValueOnce({
+        task: {
+          assignee: 'orchestrator',
+          id: 't_loop_1',
+          loop_intake: { dispatchable: false, needed: true, state: 'drafted' },
+          session_id: RUNTIME_SESSION_ID,
+          status: 'scheduled',
+          title: 'Fix flaky auth test'
+        }
+      })
+      .mockResolvedValueOnce({
+        task: {
+          id: 't_loop_2',
+          session_id: RUNTIME_SESSION_ID,
+          status: 'scheduled',
+          title: 'Second idea'
+        }
+      })
+
+    const onOpenLoop = vi.fn()
+    const requestGateway = vi.fn(async () => ({}) as never)
+    let handle: HarnessHandle | null = null
+
+    render(
+      <Harness
+        onOpenLoop={onOpenLoop}
+        onReady={h => (handle = h)}
+        refreshSessions={async () => undefined}
+        requestGateway={requestGateway}
+      />
+    )
+
+    await handle!.submitText('/loop Fix flaky auth test', { loopAssignee: 'peacock' })
+    await handle!.submitText('/loop Second idea')
+
+    expect(createLoopDraftTask).toHaveBeenNthCalledWith(1, {
+      assignee: 'peacock',
+      idempotencyKey: expect.stringMatching(/^loop-draft:rt-abc123:/),
+      profile: expect.any(String),
+      sessionId: RUNTIME_SESSION_ID,
+      title: 'Fix flaky auth test'
+    })
+    expect(createLoopDraftTask).toHaveBeenNthCalledWith(
+      2,
+      expect.objectContaining({ sessionId: RUNTIME_SESSION_ID, title: 'Second idea' })
+    )
+    expect(vi.mocked(createLoopDraftTask).mock.calls[1]?.[0].idempotencyKey).not.toBe(
+      vi.mocked(createLoopDraftTask).mock.calls[0]?.[0].idempotencyKey
+    )
+    expect(onOpenLoop).toHaveBeenNthCalledWith(1, 't_loop_1')
+    expect(onOpenLoop).toHaveBeenNthCalledWith(2, 't_loop_2')
+    expect(requestGateway).not.toHaveBeenCalled()
+    expect(getQueuedPrompts(RUNTIME_SESSION_ID)).toEqual([])
+  })
+
+  it('keeps a first-message title-only Loop task in the newly created session', async () => {
+    vi.mocked(createLoopDraftTask).mockResolvedValue({
+      task: {
+        id: 't_loop_new_session',
+        loop_intake: { dispatchable: false, needed: true, state: 'drafted' },
+        session_id: 'stored-new-session',
+        status: 'scheduled',
+        title: 'First task'
+      }
+    })
+
+    const createBackendSessionForSend = vi.fn(async () => 'rt-new-session')
+    const requestGateway = vi.fn(async () => ({}) as never)
+    let handle: HarnessHandle | null = null
+
+    render(
+      <Harness
+        activeSessionId={null}
+        createBackendSessionForSend={createBackendSessionForSend}
+        newStoredSessionId="stored-new-session"
+        onReady={h => (handle = h)}
+        refreshSessions={async () => undefined}
+        requestGateway={requestGateway}
+        storedSessionId={null}
+      />
+    )
+
+    await handle!.submitText('/loop First task')
+
+    expect(createBackendSessionForSend).toHaveBeenCalledTimes(1)
+    expect(createLoopDraftTask).toHaveBeenCalledWith(
+      expect.objectContaining({ sessionId: 'stored-new-session', title: 'First task' })
+    )
+    expect(requestGateway).not.toHaveBeenCalled()
+    expect(getQueuedPrompts('rt-new-session')).toEqual([])
+  })
+})
+
 describe('usePromptActions submit / queue drain semantics', () => {
   afterEach(() => {
     cleanup()
@@ -590,6 +747,7 @@ describe('usePromptActions submit / queue drain semantics', () => {
   it('returns false for a normal submit when the gateway stays busy past the retry window', async () => {
     vi.useFakeTimers()
     const states: Record<string, unknown>[] = []
+
     const requestGateway = vi.fn(async (method: string) => {
       if (method === 'prompt.submit') {
         throw new Error('4009: session busy')
@@ -615,7 +773,9 @@ describe('usePromptActions submit / queue drain semantics', () => {
     expect(getQueuedPrompts(RUNTIME_SESSION_ID).map(entry => entry.text)).toEqual([])
     expect(
       states.some(state =>
-        ((state.messages as Array<{ error?: string }> | undefined) ?? []).some(message => message.error?.includes('busy'))
+        ((state.messages as Array<{ error?: string }> | undefined) ?? []).some(message =>
+          message.error?.includes('busy')
+        )
       )
     ).toBe(false)
   })

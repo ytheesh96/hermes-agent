@@ -119,7 +119,7 @@ const DESKTOP_COMMAND_SPECS: readonly DesktopCommandSpec[] = [
   },
   {
     name: '/loop',
-    description: 'Create a draft Loop task for this session',
+    description: 'Open Loop or create a draft from an idea',
     surface: action('loop'),
     args: 'freeform'
   },

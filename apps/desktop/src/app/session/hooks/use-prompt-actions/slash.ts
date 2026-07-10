@@ -1,8 +1,7 @@
 import { type MutableRefObject, useCallback } from 'react'
 
-import { buildLoopChatDraft } from '@/app/chat/loop-intake'
-import { deriveLoopPanelStateFromTenantSource } from '@/app/chat/loop-state'
-import { createLoopDraftTask, getProfiles } from '@/hermes'
+import type { TenantLoopSource } from '@/app/chat/loop-state'
+import { createLoopDraftTask, getProfiles, loopSourceFromDraftResult, mergeLoopDraftSource } from '@/hermes'
 import type { Translations } from '@/i18n'
 import { type ChatMessage } from '@/lib/chat-messages'
 import { parseCommandDispatch, parseSlashCommand, sessionTitle } from '@/lib/chat-runtime'
@@ -18,7 +17,6 @@ import { queryClient } from '@/lib/query-client'
 import { setSessionYolo } from '@/lib/yolo-session'
 import { openCommandPalettePage } from '@/store/command-palette'
 import { type ComposerAttachment, setComposerDraft } from '@/store/composer'
-import { enqueueQueuedPrompt } from '@/store/composer-queue'
 import { reconcileKanbanSessionSourceForComposer } from '@/store/composer-status'
 import { notify, notifyError } from '@/store/notifications'
 import { setPetScale } from '@/store/pet-gallery'
@@ -37,27 +35,6 @@ import {
 import type { BrowserManageResponse, SessionTitleResponse, SlashExecResponse } from '../../../types'
 
 import { type GatewayRequest, isSessionIdCandidate, renderCommandsCatalog, slashStatusText } from './utils'
-
-function sourceFromLoopDraftResult(sessionId: string, result: Awaited<ReturnType<typeof createLoopDraftTask>>) {
-  if (result.source) {
-    return result.source
-  }
-
-  const task = result.task
-
-  if (!task) {
-    return null
-  }
-
-  return {
-    board: result.board || 'default',
-    default_tenant: result.tenant || 'default',
-    generated_at: Date.now() / 1000,
-    roots: [task.id],
-    session_id: sessionId,
-    tasks: [task]
-  }
-}
 
 /** Everything a slash handler needs about the invocation it's serving. */
 interface SlashActionCtx {
@@ -80,10 +57,12 @@ interface SlashCommandDeps {
     platform: string,
     options?: { onProgress?: (state: string) => void; sessionId?: string }
   ) => Promise<{ ok: boolean; error?: string }>
+  onOpenLoop: (taskId?: string) => void
   openMemoryGraph: () => void
   refreshSessions: () => Promise<void>
   requestGateway: GatewayRequest
   resumeStoredSession: (storedSessionId: string) => Promise<void> | void
+  selectedStoredSessionIdRef: MutableRefObject<string | null>
   startFreshSessionDraft: () => void
   submitPromptText: (
     rawText: string,
@@ -102,16 +81,21 @@ export function useSlashCommand(deps: SlashCommandDeps) {
     createBackendSessionForSend,
     handleSkinCommand,
     handoffSession,
+    onOpenLoop,
     openMemoryGraph,
     refreshSessions,
     requestGateway,
     resumeStoredSession,
+    selectedStoredSessionIdRef,
     startFreshSessionDraft,
     submitPromptText
   } = deps
 
   return useCallback(
-    async (rawCommand: string, options?: { sessionId?: string; recordInput?: boolean }) => {
+    async (
+      rawCommand: string,
+      options?: { loopAssignee?: string; sessionId?: string; recordInput?: boolean }
+    ) => {
       const ensureSessionId = async (sessionHint?: string) =>
         sessionHint || activeSessionIdRef.current || (await createBackendSessionForSend())
 
@@ -424,6 +408,14 @@ export function useSlashCommand(deps: SlashCommandDeps) {
           openMemoryGraph()
         },
         loop: async ({ arg, sessionHint }) => {
+          const title = arg.trim()
+
+          if (!title) {
+            onOpenLoop()
+
+            return
+          }
+
           const sessionId = await ensureSessionId(sessionHint)
 
           if (!sessionId) {
@@ -434,47 +426,43 @@ export function useSlashCommand(deps: SlashCommandDeps) {
 
           try {
             const profile = $activeGatewayProfile.get()
-            const sourceSessionId = sessionHint || sessionId
+            const sourceSessionId = sessionHint || selectedStoredSessionIdRef.current || sessionId
+
             const result = await createLoopDraftTask({
+              ...(options?.loopAssignee ? { assignee: options.loopAssignee } : {}),
+              idempotencyKey: `loop-draft:${sourceSessionId}:${crypto.randomUUID()}`,
               profile,
               sessionId: sourceSessionId,
-              title: arg.trim() || undefined
+              title
             })
-            const source = sourceFromLoopDraftResult(sourceSessionId, result)
+
+            const source = loopSourceFromDraftResult(sourceSessionId, result)
 
             if (source) {
-              queryClient.setQueryData(['loop-session-source', profile, sourceSessionId], source)
+              const queryKey = ['loop-session-source', profile, sourceSessionId]
+
+              const reconciledSource = mergeLoopDraftSource(
+                queryClient.getQueryData<TenantLoopSource>(queryKey),
+                source
+              )
+
+              queryClient.setQueryData(queryKey, reconciledSource)
               void queryClient.invalidateQueries({ queryKey: ['loop-session-source', profile, sourceSessionId] })
-              reconcileKanbanSessionSourceForComposer({ activeSessionId: sessionId, source, sourceSessionId })
+              reconcileKanbanSessionSourceForComposer({
+                activeSessionId: sessionId,
+                source: reconciledSource,
+                sourceSessionId
+              })
             }
 
-            const intakeRow = source
-              ? deriveLoopPanelStateFromTenantSource(source)?.rows.find(row => {
-                  if (row.taskId !== result.task?.id) {
-                    return false
-                  }
+            const createdTaskId = result.task?.id
 
-                  const intake = row.loopIntake
-                  const state = (intake?.state || '').trim().toLowerCase()
-
-                  return (
-                    intake?.needed === true &&
-                    intake.dispatchable !== true &&
-                    !['spec-ready', 'spec_ready', 'approved'].includes(state)
-                  )
-                })
-              : null
-
-            if (intakeRow) {
-              const intakePrompt = buildLoopChatDraft(intakeRow)
-
-              if (busyRef.current || !(await submitPromptText(intakePrompt))) {
-                enqueueQueuedPrompt(sessionId, { attachments: [], text: intakePrompt })
-              }
+            if (createdTaskId) {
+              onOpenLoop(createdTaskId)
             }
 
-            const title = result.task?.title || source?.tasks?.[0]?.title || arg.trim() || 'Loop draft'
-            notify({ kind: 'success', message: `Loop draft ready: ${title}` })
+            const taskTitle = result.task?.title || source?.tasks?.[0]?.title || title || 'Loop draft'
+            notify({ kind: 'success', message: `Task added · ${taskTitle}` })
           } catch (err) {
             notifyError(err, 'Create Loop draft failed')
           }
@@ -703,10 +691,12 @@ export function useSlashCommand(deps: SlashCommandDeps) {
       createBackendSessionForSend,
       handleSkinCommand,
       handoffSession,
+      onOpenLoop,
       openMemoryGraph,
       refreshSessions,
       requestGateway,
       resumeStoredSession,
+      selectedStoredSessionIdRef,
       startFreshSessionDraft,
       submitPromptText
     ]

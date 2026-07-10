@@ -22,6 +22,7 @@ type WorkRailTabId = 'loop' | 'preview'
 interface ChatWorkRailProps {
   artifactSourceBaseDir?: null | string
   loop: LoopPanelController
+  onCreateLoopTask?: (idea: string, assignee: string) => Promise<null | string>
   onRestartServer?: (url: string, context?: string) => Promise<string>
   previewKey?: string
   previewLabel?: string
@@ -45,14 +46,14 @@ function loopRailLabel(loop: LoopPanelController): string {
 export function ChatWorkRail({
   artifactSourceBaseDir,
   loop,
+  onCreateLoopTask,
   onRestartServer,
   previewKey = '',
   previewLabel = 'Preview',
   previewOpen,
   setTitlebarToolGroup
 }: ChatWorkRailProps) {
-  const loopHasRequestedTask = Boolean(loop.selectedTaskId || loop.focusedTaskId)
-  const loopOpen = Boolean(loop.open && !loop.hidden && (loop.state || loopHasRequestedTask))
+  const loopOpen = loop.open && !loop.hidden
   const [activeTabId, setActiveTabId] = useState<WorkRailTabId>('loop')
   const lastLoopKeyRef = useRef('')
   const lastLoopFocusRequestKeyRef = useRef(loop.focusRequestKey)
@@ -61,9 +62,7 @@ export function ChatWorkRail({
 
   const tabs = useMemo<WorkRailTab[]>(
     () => [
-      ...(loopOpen
-        ? [{ id: 'loop' as const, label: 'Loop', onClose: loop.onHide, title: loopRailLabel(loop) }]
-        : []),
+      ...(loopOpen ? [{ id: 'loop' as const, label: 'Loop', onClose: loop.onHide, title: loopRailLabel(loop) }] : []),
       ...(previewOpen
         ? [{ id: 'preview' as const, label: 'Preview', onClose: closeRightRail, title: previewLabel || 'Preview' }]
         : [])
@@ -144,7 +143,9 @@ export function ChatWorkRail({
                   }
                 }}
               >
-                {active && <span aria-hidden="true" className="absolute inset-x-0 top-0 h-px bg-(--ui-stroke-primary)" />}
+                {active && (
+                  <span aria-hidden="true" className="absolute inset-x-0 top-0 h-px bg-(--ui-stroke-primary)" />
+                )}
                 <button
                   aria-selected={active}
                   className="flex h-full min-w-0 max-w-full items-center overflow-hidden pl-3 pr-2 text-left outline-none"
@@ -188,26 +189,29 @@ export function ChatWorkRail({
         {activeTab.id === 'loop' ? (
           <LoopPanel
             artifactSourceBaseDir={artifactSourceBaseDir}
+            canvasScopeKey={loop.canvasScopeKey}
             embedded
             focusRequestKey={loop.focusRequestKey}
             hidden={loop.hidden}
             onAddTaskComment={loop.onAddTaskComment}
+            onCreateTask={onCreateLoopTask}
             onFocusTaskId={loop.onFocusTaskId}
             onHide={loop.onHide}
+            onLinkTasks={loop.onLinkTasks}
+            onSavePositions={loop.onSavePositions}
             onSelectTaskId={loop.onSelectTaskId}
             onTaskAction={loop.onTaskAction}
+            onUnlinkTasks={loop.onUnlinkTasks}
             open={loop.open}
+            positions={loop.positions}
+            rootTaskId={loop.rootTaskId}
             selectedTaskDetail={loop.selectedTaskDetail}
             selectedTaskDetailError={loop.selectedTaskDetailError}
             selectedTaskId={loop.selectedTaskId}
             state={loop.state}
           />
         ) : (
-          <ChatPreviewRail
-            embedded
-            onRestartServer={onRestartServer}
-            setTitlebarToolGroup={setTitlebarToolGroup}
-          />
+          <ChatPreviewRail embedded onRestartServer={onRestartServer} setTitlebarToolGroup={setTitlebarToolGroup} />
         )}
       </div>
     </aside>
