@@ -10,6 +10,11 @@ from the original conversation.
 
 https://github.com/user-attachments/assets/48ea333a-3fe8-4a4a-b2e5-66af5b055fee
 
+## Installation
+
+Hermes Loop uses the upstream Hermes Agent installers: `scripts/install.sh` on
+macOS/Linux and `scripts/install.ps1` in Windows PowerShell.
+
 ## What this fork adds
 
 - **Durable Loop/Kanban task engine**: Loop mode routes work into persistent
