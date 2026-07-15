@@ -21,7 +21,15 @@ import { resetSessionBackground } from '@/store/composer-status'
 import { clearNotifications, notify, notifyError } from '@/store/notifications'
 import { clearPreviewArtifacts } from '@/store/preview-status'
 import { clearAllPrompts } from '@/store/prompts'
-import { $busy, $connection, $messages, setAwaitingResponse, setBusy, setMessages } from '@/store/session'
+import {
+  $busy,
+  $connection,
+  $messages,
+  setAwaitingResponse,
+  setBusy,
+  setMessages,
+  setTurnStartedAt
+} from '@/store/session'
 import { clearSessionSubagents } from '@/store/subagents'
 import { clearSessionTodos } from '@/store/todos'
 
@@ -158,6 +166,7 @@ interface PromptActionsOptions {
   busyRef: MutableRefObject<boolean>
   branchCurrentSession: () => Promise<boolean>
   createBackendSessionForSend: (preview?: string | null) => Promise<string | null>
+  getRouteToken: () => string
   handleSkinCommand: (arg: string) => string
   onOpenLoop: (taskId?: string) => void
   openMemoryGraph: () => void
@@ -187,6 +196,7 @@ export function usePromptActions({
   busyRef,
   branchCurrentSession,
   createBackendSessionForSend,
+  getRouteToken,
   handleSkinCommand,
   onOpenLoop,
   openMemoryGraph,
@@ -356,6 +366,7 @@ export function usePromptActions({
     busyRef,
     copy,
     createBackendSessionForSend,
+    getRouteToken,
     requestGateway,
     selectedStoredSessionIdRef,
     syncAttachmentsForSubmit,
@@ -502,6 +513,7 @@ export function usePromptActions({
     }
 
     setAwaitingResponse(false)
+    setTurnStartedAt(null)
 
     const finalizeMessages = (messages: ChatMessage[], streamId?: string | null) =>
       messages
@@ -527,7 +539,8 @@ export function usePromptActions({
         streamId: null,
         pendingBranchGroup: null,
         needsInput: false,
-        interrupted: true
+        interrupted: true,
+        turnStartedAt: null
       }
     })
 

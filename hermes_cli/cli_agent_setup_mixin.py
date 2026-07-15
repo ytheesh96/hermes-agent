@@ -455,6 +455,7 @@ class CLIAgentSetupMixin:
                 status_callback=status_cb,
                 notice_callback=self._on_notice,
                 notice_clear_callback=self._on_notice_clear,
+                reaction_callback=self._on_reaction,
             )
             # Store reference for atexit memory provider shutdown.
             # NOTE: this MUST write to the ``cli`` module's global, not a

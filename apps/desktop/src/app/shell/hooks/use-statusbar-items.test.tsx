@@ -11,7 +11,22 @@ import { useStatusbarItems } from './use-statusbar-items'
 vi.mock('@/i18n', () => ({
   useI18n: () => ({
     t: {
+      fileMenu: {
+        copyPath: 'Copy path',
+        revealFileManager: 'Reveal in file manager',
+        revealInSidebar: 'Reveal in sidebar'
+      },
       shell: {
+        approvalMode: {
+          ariaLabel: (value: string) => `Approval mode ${value}`,
+          manual: 'Manual',
+          manualDescription: 'Ask for every approval',
+          off: 'Off',
+          offDescription: 'Skip approvals',
+          smart: 'Smart',
+          smartDescription: 'Ask when needed',
+          title: 'Approval mode'
+        },
         statusbar: {
           agents: 'Agents',
           backendLabel: (value: string) => `Backend ${value}`,
