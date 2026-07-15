@@ -1257,6 +1257,10 @@ function dynamicTitle(
   const titledAction = (action: string, title: string): ToolTitleParts =>
     titlePartsFromAction(title, part.result === undefined ? action : undefined)
 
+  if (part.toolName === 'loop_graph' && part.result !== undefined) {
+    return { title: 'Updated Loop' }
+  }
+
   if (part.toolName === 'web_extract') {
     const url = findFirstUrl(args, result)
     const action = verb(translateNow('assistant.tool.actions.reading'), translateNow('assistant.tool.actions.read'))
@@ -1366,15 +1370,25 @@ export function buildToolView(part: ToolPart, inlineDiff: string): ToolView {
 
   const title = titleParts.title
   const titleEnriched = title !== baseTitle
-  const baseSubtitle = error || toolSubtitle(part, argsRecord, resultRecord)
+  const loopGraphSubtitle =
+    part.toolName === 'loop_graph' && Array.isArray(resultRecord.nodes)
+      ? [
+          `${resultRecord.nodes.length} row${resultRecord.nodes.length === 1 ? '' : 's'}`,
+          typeof resultRecord.graph_revision === 'number' ? `rev ${resultRecord.graph_revision}` : ''
+        ]
+          .filter(Boolean)
+          .join(' · ')
+      : ''
+  const baseSubtitle = error || loopGraphSubtitle || toolSubtitle(part, argsRecord, resultRecord)
 
   const keepSubtitleWithTitle =
     part.toolName === 'terminal' ||
     part.toolName === 'execute_code' ||
+    part.toolName === 'loop_graph' ||
     (isFileEditTool(part.toolName) && Boolean(baseSubtitle.trim()))
 
   const subtitle = titleEnriched && !error && !keepSubtitleWithTitle ? '' : baseSubtitle
-  const detailBody = stripDividerLines(toolDetailText(part, argsRecord, resultRecord))
+  const detailBody = loopGraphSubtitle ? '' : stripDividerLines(toolDetailText(part, argsRecord, resultRecord))
 
   const detail = error
     ? [error, detailBody]

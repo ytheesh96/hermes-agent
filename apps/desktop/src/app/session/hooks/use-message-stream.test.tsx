@@ -212,7 +212,7 @@ describe('useMessageStream loopagent events', () => {
     expect(hydrateFromStoredSession).not.toHaveBeenCalled()
   })
 
-  it('settles stale local todo rows when a turn completes', () => {
+  it('clears stale local todo rows when a turn completes', () => {
     const queryClient = new QueryClient()
     const activeSessionIdRef = { current: 'runtime-tip' }
     const initialState = createClientSessionState('stored-tip')
@@ -254,9 +254,6 @@ describe('useMessageStream loopagent events', () => {
       } as RpcEvent)
     })
 
-    expect($todosBySession.get()['runtime-tip']?.map(item => [item.id, item.status])).toEqual([
-      ['done', 'completed'],
-      ['running', 'completed']
-    ])
+    expect($todosBySession.get()['runtime-tip']).toBeUndefined()
   })
 })
