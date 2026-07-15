@@ -89,6 +89,7 @@ describe('ChatWorkRail', () => {
         .getAllByRole('tab')
         .map(tab => tab.textContent)
     ).toEqual(['Loop', 'Preview'])
+    expect(screen.getAllByRole('tab').map(tab => tab.textContent)).toEqual(['Loop', 'Preview'])
     expect((await screen.findByTestId('preview-pane')).textContent).toBe('Preview artifact')
 
     fireEvent.click(screen.getByRole('tab', { name: 'Loop' }))
