@@ -147,6 +147,18 @@ def test_create_task_appears_on_board(client):
     assert "researcher" in data["assignees"]
 
 
+def test_create_task_without_assignee_remains_unassigned(client):
+    response = client.post(
+        "/api/plugins/kanban/tasks",
+        json={"title": "Unassigned backlog item"},
+    )
+
+    assert response.status_code == 200, response.text
+    task = response.json()["task"]
+    assert task["assignee"] is None
+    assert task["status"] == "ready"
+
+
 def test_create_task_upserts_triage_draft_root_without_dispatch_run(client):
     """Draft roots are real triage rows, not dummy containers or dispatched workers."""
 
@@ -225,6 +237,564 @@ def test_create_loop_draft_anchors_session_source_and_real_root(client):
     assert persisted.status == "scheduled"
     assert persisted.tenant is None
     assert runs == []
+
+
+def test_create_loop_node_is_live_and_stores_its_initial_edges_atomically(client):
+    root = client.post(
+        "/api/plugins/kanban/loop-drafts",
+        json={"title": "Live graph root", "session_id": "session-live-graph"},
+    ).json()["task"]
+    downstream = client.post(
+        "/api/plugins/kanban/loop-drafts",
+        json={
+            "title": "Verify result",
+            "root_task_id": root["id"],
+            "session_id": "session-live-graph",
+        },
+    ).json()["task"]
+
+    assert downstream["status"] == "triage"
+    assert downstream["needs_specification"] is True
+    assert downstream["assignee"] is None
+    assert downstream["created_by"] == f"loop:{root['id']}"
+    assert "loop_intake" not in downstream
+
+    predecessor_response = client.post(
+        "/api/plugins/kanban/loop-drafts",
+        json={
+            "title": "Research constraints",
+            "root_task_id": root["id"],
+            "child_ids": [downstream["id"]],
+            "session_id": "session-live-graph",
+        },
+    )
+    assert predecessor_response.status_code == 200, predecessor_response.text
+    predecessor = predecessor_response.json()["task"]
+
+    conn = kb.connect()
+    try:
+        stored_downstream = kb.get_task(conn, downstream["id"])
+        assert stored_downstream is not None
+        assert stored_downstream.status == "todo"
+        assert stored_downstream.needs_specification is True
+        assert kb.parent_ids(conn, downstream["id"]) == [predecessor["id"]]
+        assert kb.parent_ids(conn, root["id"]) == [downstream["id"]]
+        assert kb.get_task(conn, predecessor["id"]).status == "triage"
+    finally:
+        conn.close()
+
+
+def test_first_desktop_node_activates_root_and_completion_promotes_it(client):
+    session_id = "session-first-live-node"
+    root = client.post(
+        "/api/plugins/kanban/loop-drafts",
+        json={"title": "Fresh root", "session_id": session_id},
+    ).json()["task"]
+    assert root["status"] == "scheduled"
+    assert root["assignee"] == "orchestrator"
+
+    created = client.post(
+        "/api/plugins/kanban/loop-drafts",
+        json={
+            "title": "First manual node",
+            "root_task_id": root["id"],
+            "session_id": session_id,
+        },
+    )
+    assert created.status_code == 200, created.text
+    child_id = created.json()["task"]["id"]
+
+    conn = kb.connect()
+    try:
+        activated_root = kb.get_task(conn, root["id"])
+        assert activated_root is not None
+        assert activated_root.status == "todo"
+        assert activated_root.assignee is None
+        assert kb.parent_ids(conn, root["id"]) == [child_id]
+
+        assert kb.specify_triage_task(
+            conn,
+            child_id,
+            body="Worker-ready first-node specification",
+            assignee="worker-a",
+        )
+        assert kb.claim_task(conn, child_id, claimer="worker-a:first-live-node")
+        assert kb.complete_task(conn, child_id, summary="First node complete")
+
+        completed_root = kb.get_task(conn, root["id"])
+        assert completed_root is not None
+        assert completed_root.status == "ready"
+        assert completed_root.assignee is None
+    finally:
+        conn.close()
+
+
+def test_desktop_live_node_completion_has_one_foreground_notification(client):
+    session_id = "session-live-node-reentry"
+    root = client.post(
+        "/api/plugins/kanban/loop-drafts",
+        json={"title": "Notification root", "session_id": session_id},
+    ).json()["task"]
+    created = client.post(
+        "/api/plugins/kanban/loop-drafts",
+        json={
+            "title": "Notify on completion",
+            "root_task_id": root["id"],
+            "session_id": session_id,
+        },
+    )
+
+    assert created.status_code == 200, created.text
+    assert created.json()["subscribed"] is True
+    task_id = created.json()["task"]["id"]
+    conn = kb.connect()
+    try:
+        [subscription] = kb.list_notify_subs(conn, task_id)
+        assert subscription["platform"] == "tui"
+        assert subscription["chat_id"] == session_id
+        assert kb.specify_triage_task(
+            conn,
+            task_id,
+            body="Worker-ready specification",
+            assignee="worker-a",
+        )
+        assert kb.claim_task(conn, task_id, claimer="worker-a:test") is not None
+        assert kb.complete_task(conn, task_id, summary="Completed live node")
+
+        _old_cursor, _new_cursor, events = kb.claim_unseen_events_for_sub(
+            conn,
+            task_id=task_id,
+            platform="tui",
+            chat_id=session_id,
+            kinds=["completed"],
+        )
+        assert [event.kind for event in events] == ["completed"]
+        assert kb.claim_unseen_events_for_sub(
+            conn,
+            task_id=task_id,
+            platform="tui",
+            chat_id=session_id,
+            kinds=["completed"],
+        )[2] == []
+    finally:
+        conn.close()
+
+
+def test_desktop_root_subscription_wakes_once_for_nested_fanout_blocker(client):
+    session_id = "session-nested-blocker-reentry"
+    created_root = client.post(
+        "/api/plugins/kanban/loop-drafts",
+        json={"title": "Nested blocker root", "assignee": None, "session_id": session_id},
+    )
+    assert created_root.status_code == 200, created_root.text
+    assert created_root.json()["subscribed"] is True
+    root_id = created_root.json()["task"]["id"]
+
+    conn = kb.connect()
+    try:
+        graph = kb.create_loop_skeleton_graph(
+            conn,
+            root_task_id=root_id,
+            nodes=[{"client_id": "shell", "title": "Expandable shell"}],
+        )
+        shell_id = graph["items"][0]["task_id"]
+        child_ids = kb.decompose_triage_task(
+            conn,
+            shell_id,
+            root_assignee="orchestrator",
+            children=[
+                {
+                    "title": "Nested worker",
+                    "body": "Perform nested work",
+                    "assignee": "worker-a",
+                    "parents": [],
+                }
+            ],
+            author="test-decomposer",
+        )
+        assert child_ids is not None
+        [child_id] = child_ids
+        assert kb.block_task(
+            conn,
+            child_id,
+            reason="review-required: foreground decision needed",
+        )
+        _old_cursor, _new_cursor, events = kb.claim_unseen_events_for_sub(
+            conn,
+            task_id=root_id,
+            platform="tui",
+            chat_id=session_id,
+            kinds=["loop_descendant_blocked"],
+        )
+        assert len(events) == 1
+        assert events[0].payload["source_task_id"] == child_id
+        assert kb.claim_unseen_events_for_sub(
+            conn,
+            task_id=root_id,
+            platform="tui",
+            chat_id=session_id,
+            kinds=["loop_descendant_blocked"],
+        )[2] == []
+    finally:
+        conn.close()
+
+
+def test_kanban_capabilities_advertise_atomic_live_graph_nodes(client):
+    response = client.get("/api/plugins/kanban/capabilities")
+
+    assert response.status_code == 200, response.text
+    assert response.json() == {"live_loop_graph": True}
+
+
+def test_session_source_exposes_current_specification_failure(client):
+    session_id = "session-visible-specification-failure"
+    root = client.post(
+        "/api/plugins/kanban/loop-drafts",
+        json={"title": "Failure root", "session_id": session_id},
+    ).json()["task"]
+    child = client.post(
+        "/api/plugins/kanban/loop-drafts",
+        json={
+            "title": "Needs specification",
+            "root_task_id": root["id"],
+            "session_id": session_id,
+        },
+    ).json()["task"]
+    conn = kb.connect()
+    try:
+        fingerprint = kb.task_specification_fingerprint(conn, child["id"])
+        assert fingerprint is not None
+        assert kb.record_specification_failure(
+            conn,
+            child["id"],
+            reason="LLM returned malformed JSON",
+            retry_after_seconds=30,
+            expected_fingerprint=fingerprint,
+        )
+    finally:
+        conn.close()
+
+    source = client.get(
+        "/api/plugins/kanban/session-source",
+        params={"session_id": session_id},
+    )
+    assert source.status_code == 200, source.text
+    task = next(item for item in source.json()["tasks"] if item["id"] == child["id"])
+    assert task["specification_failure"]["reason"] == "LLM returned malformed JSON"
+    assert task["specification_failure"]["backing_off"] is True
+
+    detail = client.get(f"/api/plugins/kanban/tasks/{child['id']}")
+    assert detail.status_code == 200, detail.text
+    assert detail.json()["task"]["specification_failure"] == task["specification_failure"]
+
+
+def test_session_source_exposes_active_decomposition_children(client):
+    session_id = "session-visible-active-fanout"
+    root = client.post(
+        "/api/plugins/kanban/loop-drafts",
+        json={"title": "Fanout root", "assignee": None, "session_id": session_id},
+    ).json()["task"]
+    conn = kb.connect()
+    try:
+        graph = kb.create_loop_skeleton_graph(
+            conn,
+            root_task_id=root["id"],
+            nodes=[{"client_id": "shell", "title": "Expandable shell"}],
+        )
+        shell_id = graph["items"][0]["task_id"]
+        child_ids = kb.decompose_triage_task(
+            conn,
+            shell_id,
+            root_assignee=None,
+            children=[{"title": "Generated worker", "body": "Do the work", "parents": []}],
+        )
+        assert child_ids is not None
+    finally:
+        conn.close()
+
+    source = client.get(
+        "/api/plugins/kanban/session-source",
+        params={"session_id": session_id},
+    )
+    assert source.status_code == 200, source.text
+    shell = next(item for item in source.json()["tasks"] if item["id"] == shell_id)
+    assert shell["active_decomposition_child_count"] == 1
+
+    detail = client.get(f"/api/plugins/kanban/tasks/{shell_id}")
+    assert detail.status_code == 200, detail.text
+    assert detail.json()["task"]["active_decomposition_child_count"] == 1
+
+
+def test_archive_loop_nodes_is_atomic_and_rejects_the_canonical_root(client):
+    session_id = "session-atomic-archive"
+    root = client.post(
+        "/api/plugins/kanban/loop-drafts",
+        json={"title": "Archive root", "assignee": None, "session_id": session_id},
+    ).json()["task"]
+    children = [
+        client.post(
+            "/api/plugins/kanban/loop-drafts",
+            json={
+                "title": title,
+                "root_task_id": root["id"],
+                "session_id": session_id,
+            },
+        ).json()["task"]
+        for title in ("Discard one", "Discard two")
+    ]
+
+    archived = client.post(
+        f"/api/plugins/kanban/loop-canvas/{root['id']}/archive-nodes",
+        json={"task_ids": [item["id"] for item in children], "session_id": session_id},
+    )
+    assert archived.status_code == 200, archived.text
+    assert set(archived.json()["archived"]) == {item["id"] for item in children}
+
+    conn = kb.connect()
+    try:
+        assert {kb.get_task(conn, item["id"]).status for item in children} == {"archived"}
+        assert kb.parent_ids(conn, root["id"]) == []
+    finally:
+        conn.close()
+
+    rejected = client.post(
+        f"/api/plugins/kanban/loop-canvas/{root['id']}/archive-nodes",
+        json={"task_ids": [root["id"]], "session_id": session_id},
+    )
+    assert rejected.status_code == 409
+    assert "root" in rejected.json()["detail"].lower()
+
+
+def test_archive_loop_nodes_rolls_back_if_a_node_is_claimed_during_the_request(
+    client, monkeypatch
+):
+    from hermes_cli import loop_graph
+
+    session_id = "session-archive-claim-race"
+    root = client.post(
+        "/api/plugins/kanban/loop-drafts",
+        json={"title": "Race root", "assignee": None, "session_id": session_id},
+    ).json()["task"]
+    children = [
+        client.post(
+            "/api/plugins/kanban/loop-drafts",
+            json={
+                "title": title,
+                "root_task_id": root["id"],
+                "session_id": session_id,
+            },
+        ).json()["task"]
+        for title in ("Still pending", "Claimed concurrently")
+    ]
+    first_id, claimed_id = (item["id"] for item in children)
+    original_apply_patch = loop_graph.apply_patch
+
+    def claim_before_archive(conn, root_task_id, **kwargs):
+        assert kb.specify_triage_task(
+            conn,
+            claimed_id,
+            body="Worker-ready concurrent task",
+            assignee="worker-a",
+        )
+        claimed = kb.claim_task(conn, claimed_id, claimer="worker-a:archive-race")
+        assert claimed is not None
+        kwargs["expected_revision"] = loop_graph.graph_revision(conn, root_task_id)
+        return original_apply_patch(conn, root_task_id, **kwargs)
+
+    monkeypatch.setattr(loop_graph, "apply_patch", claim_before_archive)
+    response = client.post(
+        f"/api/plugins/kanban/loop-canvas/{root['id']}/archive-nodes",
+        json={"task_ids": [first_id, claimed_id], "session_id": session_id},
+    )
+
+    assert response.status_code == 409
+    conn = kb.connect()
+    try:
+        assert kb.get_task(conn, first_id).status != "archived"
+        claimed = kb.get_task(conn, claimed_id)
+        assert claimed.status == "running"
+        assert claimed.current_run_id is not None
+        run = kb.get_run(conn, claimed.current_run_id)
+        assert run is not None
+        assert run.ended_at is None
+    finally:
+        conn.close()
+
+
+def test_create_loop_node_rolls_back_task_events_and_edges_on_bad_relation(client):
+    root = client.post(
+        "/api/plugins/kanban/loop-drafts",
+        json={"title": "Atomic canvas root", "session_id": "session-atomic-node"},
+    ).json()["task"]
+    valid_parent = client.post(
+        "/api/plugins/kanban/loop-drafts",
+        json={
+            "title": "Valid existing parent",
+            "root_task_id": root["id"],
+            "session_id": "session-atomic-node",
+        },
+    ).json()["task"]
+    conn = kb.connect()
+    try:
+        before = {
+            "tasks": conn.execute("SELECT COUNT(*) FROM tasks").fetchone()[0],
+            "events": conn.execute("SELECT COUNT(*) FROM task_events").fetchone()[0],
+            "links": conn.execute("SELECT COUNT(*) FROM task_links").fetchone()[0],
+        }
+    finally:
+        conn.close()
+
+    response = client.post(
+        "/api/plugins/kanban/loop-drafts",
+        json={
+            "title": "Must roll back",
+            "root_task_id": root["id"],
+            "parents": [valid_parent["id"]],
+            "child_ids": ["t_missing_relation"],
+            "session_id": "session-atomic-node",
+        },
+    )
+
+    assert response.status_code == 400
+    conn = kb.connect()
+    try:
+        after = {
+            "tasks": conn.execute("SELECT COUNT(*) FROM tasks").fetchone()[0],
+            "events": conn.execute("SELECT COUNT(*) FROM task_events").fetchone()[0],
+            "links": conn.execute("SELECT COUNT(*) FROM task_links").fetchone()[0],
+        }
+        assert conn.execute(
+            "SELECT 1 FROM tasks WHERE title = 'Must roll back'"
+        ).fetchone() is None
+    finally:
+        conn.close()
+    assert after == before
+
+
+def test_create_loop_node_rejects_canonical_root_as_parent(client):
+    root = client.post(
+        "/api/plugins/kanban/loop-drafts",
+        json={"title": "Aggregate root", "session_id": "session-root-sink"},
+    ).json()["task"]
+
+    response = client.post(
+        "/api/plugins/kanban/loop-drafts",
+        json={
+            "title": "Would deadlock",
+            "root_task_id": root["id"],
+            "parents": [root["id"]],
+            "session_id": "session-root-sink",
+        },
+    )
+
+    assert response.status_code == 400
+    assert "aggregate sink" in response.json()["detail"]
+
+
+def test_create_loop_node_extends_unassigned_ready_root_as_new_sink(client):
+    session_id = "session-ready-root-extension"
+    root = client.post(
+        "/api/plugins/kanban/loop-drafts",
+        json={
+            "title": "Dynamic aggregate root",
+            "assignee": None,
+            "session_id": session_id,
+        },
+    ).json()["task"]
+    conn = kb.connect()
+    try:
+        graph = kb.create_loop_skeleton_graph(
+            conn,
+            root_task_id=root["id"],
+            nodes=[{"client_id": "first", "title": "First pass"}],
+        )
+        first_id = graph["items"][0]["task_id"]
+        assert kb.specify_triage_task(
+            conn, first_id, body="First pass spec", assignee="worker-a"
+        )
+        assert kb.claim_task(conn, first_id, claimer="worker-a:first") is not None
+        assert kb.complete_task(conn, first_id, summary="First pass complete")
+        ready_root = kb.get_task(conn, root["id"])
+        assert ready_root is not None
+        assert ready_root.status == "ready"
+        assert ready_root.assignee is None
+    finally:
+        conn.close()
+
+    extension = client.post(
+        "/api/plugins/kanban/loop-drafts",
+        json={
+            "title": "Follow-up after results",
+            "root_task_id": root["id"],
+            "session_id": session_id,
+        },
+    )
+
+    assert extension.status_code == 200, extension.text
+    extension_id = extension.json()["task"]["id"]
+    conn = kb.connect()
+    try:
+        extended_root = kb.get_task(conn, root["id"])
+        assert extended_root is not None
+        assert extended_root.status == "todo"
+        assert set(kb.parent_ids(conn, root["id"])) == {first_id, extension_id}
+    finally:
+        conn.close()
+
+
+@pytest.mark.parametrize("immutable_status", ["running", "done"])
+def test_create_loop_predecessor_rejects_active_or_completed_child_atomically(
+    client, immutable_status
+):
+    session_id = f"session-create-predecessor-{immutable_status}"
+    root = client.post(
+        "/api/plugins/kanban/loop-drafts",
+        json={"title": "Immutable child root", "session_id": session_id},
+    ).json()["task"]
+    child = client.post(
+        "/api/plugins/kanban/loop-drafts",
+        json={
+            "title": "Existing work",
+            "root_task_id": root["id"],
+            "session_id": session_id,
+        },
+    ).json()["task"]
+    conn = kb.connect()
+    try:
+        conn.execute(
+            "UPDATE tasks SET status = ? WHERE id = ?",
+            (immutable_status, child["id"]),
+        )
+        conn.commit()
+        before = {
+            "tasks": conn.execute("SELECT COUNT(*) FROM tasks").fetchone()[0],
+            "events": conn.execute("SELECT COUNT(*) FROM task_events").fetchone()[0],
+            "links": conn.execute("SELECT COUNT(*) FROM task_links").fetchone()[0],
+        }
+    finally:
+        conn.close()
+
+    response = client.post(
+        "/api/plugins/kanban/loop-drafts",
+        json={
+            "title": "Forbidden late predecessor",
+            "root_task_id": root["id"],
+            "child_ids": [child["id"]],
+            "session_id": session_id,
+        },
+    )
+
+    assert response.status_code == 409
+    conn = kb.connect()
+    try:
+        after = {
+            "tasks": conn.execute("SELECT COUNT(*) FROM tasks").fetchone()[0],
+            "events": conn.execute("SELECT COUNT(*) FROM task_events").fetchone()[0],
+            "links": conn.execute("SELECT COUNT(*) FROM task_links").fetchone()[0],
+        }
+    finally:
+        conn.close()
+    assert after == before
 
 
 def test_loop_canvas_positions_round_trip_replace_and_clear_without_task_events(client):
@@ -363,7 +933,7 @@ def test_loop_canvas_positions_are_scoped_to_root_component_and_session(client):
     ).json()["task"]
     assert client.post(
         "/api/plugins/kanban/links",
-        json={"parent_id": root["id"], "child_id": connected["id"]},
+        json={"parent_id": connected["id"], "child_id": root["id"]},
     ).status_code == 200
 
     path = f"/api/plugins/kanban/loop-canvas/{root['id']}/positions"
@@ -478,7 +1048,7 @@ def test_loop_canvas_session_scope_matches_compression_lineage_source(client, ka
     )
     assert saved.status_code == 200, saved.text
 
-    linked = client.post(
+    cross_root_link = client.post(
         "/api/plugins/kanban/links",
         params={"board": "default"},
         json={
@@ -488,7 +1058,7 @@ def test_loop_canvas_session_scope_matches_compression_lineage_source(client, ka
             "session_id": "canvas-tip-session",
         },
     )
-    assert linked.status_code == 200, linked.text
+    assert cross_root_link.status_code == 400
 
     rejected_position = client.put(
         path,
@@ -509,7 +1079,7 @@ def test_loop_canvas_session_scope_matches_compression_lineage_source(client, ka
         },
     )
     assert rejected_link.status_code == 400
-    assert "outside Loop canvas" in rejected_link.json()["detail"]
+    assert "aggregate sink" in rejected_link.json()["detail"]
 
     rejected_root = client.get(
         f"/api/plugins/kanban/loop-canvas/{unrelated['id']}/positions",
@@ -596,12 +1166,12 @@ def test_loop_intake_needed_blocks_ready_and_decompose_until_approved(client):
 
     ready = client.patch(f"/api/plugins/kanban/tasks/{task_id}", json={"status": "ready"})
     assert ready.status_code == 409
-    assert "Loop intake is still required" in ready.json()["detail"]
+    assert "Loop planning is still in progress" in ready.json()["detail"]
 
     decompose = client.post(f"/api/plugins/kanban/tasks/{task_id}/decompose", json={})
     assert decompose.status_code == 200, decompose.text
     assert decompose.json()["ok"] is False
-    assert "Loop intake is still required" in decompose.json()["reason"]
+    assert "Loop planning is still in progress" in decompose.json()["reason"]
 
     activate = client.post(f"/api/plugins/kanban/tasks/{task_id}/activate", json={})
     assert activate.status_code == 200, activate.text
@@ -2182,57 +2752,400 @@ def test_add_link_and_delete_link(client):
 
 
 def test_add_link_can_be_scoped_to_loop_canvas_membership(client):
+    session_id = "session-links-owned"
     root = client.post(
         "/api/plugins/kanban/loop-drafts",
-        json={"title": "Canvas root", "session_id": "session-links-a"},
+        json={"title": "Canvas root", "session_id": session_id},
     ).json()["task"]
-    same_session = client.post(
+    first = client.post(
+        "/api/plugins/kanban/loop-drafts",
+        json={
+            "title": "First owned node",
+            "root_task_id": root["id"],
+            "session_id": session_id,
+        },
+    ).json()["task"]
+    second = client.post(
+        "/api/plugins/kanban/loop-drafts",
+        json={
+            "title": "Second owned node",
+            "root_task_id": root["id"],
+            "session_id": session_id,
+        },
+    ).json()["task"]
+    same_session_outsider = client.post(
         "/api/plugins/kanban/tasks",
-        json={"title": "Disconnected card", "session_id": "session-links-a", "triage": True},
+        json={"title": "Unowned card", "session_id": session_id, "triage": True},
     ).json()["task"]
-    connected = client.post(
-        "/api/plugins/kanban/tasks",
-        json={"title": "Cross-session card", "session_id": "session-links-b", "triage": True},
-    ).json()["task"]
-    unrelated = client.post(
-        "/api/plugins/kanban/tasks",
-        json={"title": "Other canvas", "session_id": "session-links-c", "triage": True},
-    ).json()["task"]
-    assert client.post(
-        "/api/plugins/kanban/links",
-        json={"parent_id": root["id"], "child_id": connected["id"]},
-    ).status_code == 200
 
-    same_session_link = client.post(
+    owned_link = client.post(
         "/api/plugins/kanban/links",
         json={
-            "parent_id": root["id"],
-            "child_id": same_session["id"],
+            "parent_id": first["id"],
+            "child_id": second["id"],
             "root_task_id": root["id"],
+            "session_id": session_id,
         },
     )
-    assert same_session_link.status_code == 200, same_session_link.text
-
-    connected_cross_session_link = client.post(
-        "/api/plugins/kanban/links",
-        json={
-            "parent_id": connected["id"],
-            "child_id": same_session["id"],
-            "root_task_id": root["id"],
-        },
-    )
-    assert connected_cross_session_link.status_code == 200, connected_cross_session_link.text
+    assert owned_link.status_code == 200, owned_link.text
 
     rejected = client.post(
         "/api/plugins/kanban/links",
         json={
-            "parent_id": root["id"],
-            "child_id": unrelated["id"],
+            "parent_id": first["id"],
+            "child_id": same_session_outsider["id"],
             "root_task_id": root["id"],
+            "session_id": session_id,
         },
     )
     assert rejected.status_code == 400
-    assert "outside Loop canvas" in rejected.json()["detail"]
+    assert "not owned by Loop root" in rejected.json()["detail"]
+
+
+def test_scoped_link_adds_existing_pending_node_to_unassigned_ready_root(client):
+    session_id = "session-link-ready-root"
+    root = client.post(
+        "/api/plugins/kanban/loop-drafts",
+        json={"title": "Ready root", "assignee": None, "session_id": session_id},
+    ).json()["task"]
+    first = client.post(
+        "/api/plugins/kanban/loop-drafts",
+        json={
+            "title": "Initial work",
+            "root_task_id": root["id"],
+            "session_id": session_id,
+        },
+    ).json()["task"]
+
+    conn = kb.connect()
+    try:
+        assert kb.specify_triage_task(
+            conn, first["id"], body="Initial work spec", assignee="worker-a"
+        )
+        assert kb.claim_task(conn, first["id"], claimer="worker-a:ready-root")
+        assert kb.complete_task(conn, first["id"], summary="Initial work complete")
+        assert kb.get_task(conn, root["id"]).status == "ready"
+        pending_id = kb.create_task(
+            conn,
+            title="Existing pending follow-up",
+            created_by=f"loop:{root['id']}",
+            triage=True,
+            needs_specification=True,
+            session_id=session_id,
+        )
+    finally:
+        conn.close()
+
+    response = client.post(
+        "/api/plugins/kanban/links",
+        json={
+            "parent_id": pending_id,
+            "child_id": root["id"],
+            "root_task_id": root["id"],
+            "session_id": session_id,
+        },
+    )
+    assert response.status_code == 200, response.text
+
+    conn = kb.connect()
+    try:
+        reopened_root = kb.get_task(conn, root["id"])
+        assert reopened_root is not None
+        assert reopened_root.status == "todo"
+        assert pending_id in kb.parent_ids(conn, root["id"])
+    finally:
+        conn.close()
+
+
+def test_scoped_links_reject_other_ready_targets_and_root_as_parent(client):
+    session_id = "session-link-ready-target"
+    root = client.post(
+        "/api/plugins/kanban/loop-drafts",
+        json={"title": "Aggregate root", "assignee": None, "session_id": session_id},
+    ).json()["task"]
+    conn = kb.connect()
+    try:
+        source_id = kb.create_task(
+            conn,
+            title="Pending source",
+            created_by=f"loop:{root['id']}",
+            triage=True,
+            needs_specification=True,
+            session_id=session_id,
+        )
+        ready_target_id = kb.create_task(
+            conn,
+            title="Ordinary ready target",
+            created_by=f"loop:{root['id']}",
+            session_id=session_id,
+        )
+    finally:
+        conn.close()
+
+    scope = {"root_task_id": root["id"], "session_id": session_id}
+    ready_target = client.post(
+        "/api/plugins/kanban/links",
+        json={"parent_id": source_id, "child_id": ready_target_id, **scope},
+    )
+    root_parent = client.post(
+        "/api/plugins/kanban/links",
+        json={"parent_id": root["id"], "child_id": source_id, **scope},
+    )
+
+    assert ready_target.status_code == 409
+    assert "immutable" in ready_target.json()["detail"]
+    assert root_parent.status_code == 400
+    assert "aggregate sink" in root_parent.json()["detail"]
+
+
+def test_scoped_links_reject_cross_root_mutations_with_shared_session(client):
+    session_id = "session-two-loop-roots"
+    root_a = client.post(
+        "/api/plugins/kanban/loop-drafts",
+        json={
+            "title": "Root A",
+            "session_id": session_id,
+            "idempotency_key": "loop-root-a",
+        },
+    ).json()["task"]
+    root_b = client.post(
+        "/api/plugins/kanban/loop-drafts",
+        json={
+            "title": "Root B",
+            "session_id": session_id,
+            "idempotency_key": "loop-root-b",
+        },
+    ).json()["task"]
+    child_a = client.post(
+        "/api/plugins/kanban/loop-drafts",
+        json={
+            "title": "Owned by A",
+            "root_task_id": root_a["id"],
+            "session_id": session_id,
+        },
+    ).json()["task"]
+    child_b = client.post(
+        "/api/plugins/kanban/loop-drafts",
+        json={
+            "title": "Owned by B",
+            "root_task_id": root_b["id"],
+            "session_id": session_id,
+        },
+    ).json()["task"]
+    scope_a = {"root_task_id": root_a["id"], "session_id": session_id}
+
+    foreign_source = client.post(
+        "/api/plugins/kanban/links",
+        json={"parent_id": child_b["id"], "child_id": child_a["id"], **scope_a},
+    )
+    foreign_target = client.post(
+        "/api/plugins/kanban/links",
+        json={"parent_id": child_a["id"], "child_id": child_b["id"], **scope_a},
+    )
+    foreign_delete = client.delete(
+        "/api/plugins/kanban/links",
+        params={
+            "parent_id": child_b["id"],
+            "child_id": root_b["id"],
+            **scope_a,
+        },
+    )
+
+    assert foreign_source.status_code == 400
+    assert foreign_target.status_code == 400
+    assert foreign_delete.status_code == 400
+    assert all(
+        "not owned by Loop root" in response.json()["detail"]
+        for response in (foreign_source, foreign_target, foreign_delete)
+    )
+    conn = kb.connect()
+    try:
+        assert kb.parent_ids(conn, child_a["id"]) == []
+        assert kb.parent_ids(conn, child_b["id"]) == []
+        assert kb.parent_ids(conn, root_b["id"]) == [child_b["id"]]
+    finally:
+        conn.close()
+
+
+@pytest.mark.parametrize("immutable_status", ["running", "done"])
+def test_scoped_loop_links_cannot_rewire_active_or_completed_children(
+    client, immutable_status
+):
+    session_id = "session-live-graph-immutable"
+    root = client.post(
+        "/api/plugins/kanban/loop-drafts",
+        json={"title": "Canvas root", "session_id": session_id},
+    ).json()["task"]
+    first_parent = client.post(
+        "/api/plugins/kanban/loop-drafts",
+        json={
+            "title": "First input",
+            "root_task_id": root["id"],
+            "session_id": session_id,
+        },
+    ).json()["task"]
+    second_parent = client.post(
+        "/api/plugins/kanban/loop-drafts",
+        json={
+            "title": "Late input",
+            "root_task_id": root["id"],
+            "session_id": session_id,
+        },
+    ).json()["task"]
+    child = client.post(
+        "/api/plugins/kanban/loop-drafts",
+        json={
+            "title": "Active work",
+            "root_task_id": root["id"],
+            "session_id": session_id,
+        },
+    ).json()["task"]
+    scope = {"root_task_id": root["id"], "session_id": session_id}
+
+    linked = client.post(
+        "/api/plugins/kanban/links",
+        json={"parent_id": first_parent["id"], "child_id": child["id"], **scope},
+    )
+    assert linked.status_code == 200, linked.text
+
+    conn = kb.connect()
+    try:
+        conn.execute(
+            "UPDATE tasks SET status = ? WHERE id = ?",
+            (immutable_status, child["id"]),
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+    add = client.post(
+        "/api/plugins/kanban/links",
+        json={"parent_id": second_parent["id"], "child_id": child["id"], **scope},
+    )
+    remove = client.delete(
+        "/api/plugins/kanban/links",
+        params={
+            "parent_id": first_parent["id"],
+            "child_id": child["id"],
+            **scope,
+        },
+    )
+
+    assert add.status_code == 409
+    assert remove.status_code == 409
+    assert "immutable" in add.json()["detail"]
+    assert "immutable" in remove.json()["detail"]
+
+    conn = kb.connect()
+    try:
+        assert kb.parent_ids(conn, child["id"]) == [first_parent["id"]]
+    finally:
+        conn.close()
+
+
+def test_scoped_link_route_rechecks_child_status_inside_edge_transaction(
+    client, monkeypatch
+):
+    session_id = "session-link-claim-race"
+    root = client.post(
+        "/api/plugins/kanban/loop-drafts",
+        json={"title": "Race root", "session_id": session_id},
+    ).json()["task"]
+    parent = client.post(
+        "/api/plugins/kanban/loop-drafts",
+        json={
+            "title": "Race parent",
+            "root_task_id": root["id"],
+            "session_id": session_id,
+        },
+    ).json()["task"]
+    child = client.post(
+        "/api/plugins/kanban/loop-drafts",
+        json={
+            "title": "Race child",
+            "root_task_id": root["id"],
+            "session_id": session_id,
+        },
+    ).json()["task"]
+    original_link = kb.link_tasks
+
+    def claim_before_link(conn, parent_id, child_id, **kwargs):
+        conn.execute("UPDATE tasks SET status = 'running' WHERE id = ?", (child_id,))
+        conn.commit()
+        return original_link(conn, parent_id, child_id, **kwargs)
+
+    monkeypatch.setattr(kb, "link_tasks", claim_before_link)
+    response = client.post(
+        "/api/plugins/kanban/links",
+        json={
+            "parent_id": parent["id"],
+            "child_id": child["id"],
+            "root_task_id": root["id"],
+            "session_id": session_id,
+        },
+    )
+
+    assert response.status_code == 409
+    conn = kb.connect()
+    try:
+        assert kb.parent_ids(conn, child["id"]) == []
+    finally:
+        conn.close()
+
+
+def test_scoped_unlink_route_rechecks_child_status_inside_edge_transaction(
+    client, monkeypatch
+):
+    session_id = "session-unlink-claim-race"
+    root = client.post(
+        "/api/plugins/kanban/loop-drafts",
+        json={"title": "Unlink race root", "session_id": session_id},
+    ).json()["task"]
+    parent = client.post(
+        "/api/plugins/kanban/loop-drafts",
+        json={
+            "title": "Unlink parent",
+            "root_task_id": root["id"],
+            "session_id": session_id,
+        },
+    ).json()["task"]
+    child = client.post(
+        "/api/plugins/kanban/loop-drafts",
+        json={
+            "title": "Unlink child",
+            "root_task_id": root["id"],
+            "session_id": session_id,
+        },
+    ).json()["task"]
+    conn = kb.connect()
+    try:
+        kb.link_tasks(conn, parent["id"], child["id"])
+    finally:
+        conn.close()
+    original_unlink = kb.unlink_tasks
+
+    def claim_before_unlink(conn, parent_id, child_id, **kwargs):
+        conn.execute("UPDATE tasks SET status = 'running' WHERE id = ?", (child_id,))
+        conn.commit()
+        return original_unlink(conn, parent_id, child_id, **kwargs)
+
+    monkeypatch.setattr(kb, "unlink_tasks", claim_before_unlink)
+    response = client.delete(
+        "/api/plugins/kanban/links",
+        params={
+            "parent_id": parent["id"],
+            "child_id": child["id"],
+            "root_task_id": root["id"],
+            "session_id": session_id,
+        },
+    )
+
+    assert response.status_code == 409
+    conn = kb.connect()
+    try:
+        assert kb.parent_ids(conn, child["id"]) == [parent["id"]]
+    finally:
+        conn.close()
 
 
 def test_add_link_cycle_rejected(client):

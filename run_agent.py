@@ -5810,6 +5810,7 @@ class AIAgent:
             board=function_args.get("board"),
             workspace_kind=function_args.get("workspace_kind"),
             workspace_path=function_args.get("workspace_path"),
+            root_task_id=function_args.get("root_task_id"),
             decompose=function_args.get("decompose", False),
             goal_mode=function_args.get("goal_mode", False),
             goal_max_turns=function_args.get("goal_max_turns"),

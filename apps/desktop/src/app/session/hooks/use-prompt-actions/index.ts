@@ -480,7 +480,7 @@ export function usePromptActions({
 
       if (!attachments.length && SLASH_COMMAND_RE.test(visibleText)) {
         triggerHaptic('selection')
-        await executeSlashCommand(visibleText, { loopAssignee: options?.loopAssignee })
+        await executeSlashCommand(visibleText)
 
         return true
       }

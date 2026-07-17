@@ -138,6 +138,33 @@ _IS_WINDOWS = sys.platform == "win32"
 KANBAN_ATTACHMENT_MAX_BYTES = 25 * 1024 * 1024
 
 
+class TaskStatusConflictError(RuntimeError):
+    """A guarded task mutation lost a race with a status transition."""
+
+    def __init__(
+        self,
+        task_id: str,
+        actual_status: Optional[str],
+        allowed_statuses: Iterable[str],
+        *,
+        reason: Optional[str] = None,
+    ) -> None:
+        self.task_id = task_id
+        self.actual_status = actual_status
+        self.allowed_statuses = frozenset(allowed_statuses)
+        self.reason = reason
+        expected = ", ".join(sorted(self.allowed_statuses))
+        actual = actual_status if actual_status is not None else "missing"
+        if reason:
+            message = f"task {task_id} cannot be mutated: {reason} (status={actual!r})"
+        else:
+            message = (
+                f"task {task_id} status changed to {actual!r}; "
+                f"expected one of [{expected}]"
+            )
+        super().__init__(message)
+
+
 def _fire_kanban_lifecycle_hook(event: str, task_id: str, **fields: Any) -> None:
     """Fire a kanban lifecycle plugin hook, fully best-effort.
 
@@ -947,6 +974,9 @@ class Task:
     # Unblock-loop counter. See the column comment in SCHEMA_SQL and
     # ``BLOCK_RECURRENCE_LIMIT``. Reset only on successful completion.
     block_recurrences: int = 0
+    # True while this row is only a foreground-authored task skeleton. A
+    # skeleton must pass through triage specification before it can dispatch.
+    needs_specification: bool = False
 
     @classmethod
     def from_row(cls, row: sqlite3.Row) -> "Task":
@@ -1045,6 +1075,11 @@ class Task:
                 int(row["block_recurrences"])
                 if "block_recurrences" in keys and row["block_recurrences"] is not None
                 else 0
+            ),
+            needs_specification=(
+                bool(row["needs_specification"])
+                if "needs_specification" in keys
+                else False
             ),
         )
 
@@ -1211,12 +1246,15 @@ CREATE TABLE IF NOT EXISTS tasks (
     -- set the env var. Indexed so per-session list queries stay cheap on
     -- larger boards.
     session_id           TEXT,
+    -- Foreground-authored skeletons are specified by the triage decomposer
+    -- before dispatch. Existing/ordinary tasks default to worker-ready.
+    needs_specification  INTEGER NOT NULL DEFAULT 0,
     -- Review-lane routing metadata. NULL preserves ordinary QA behavior.
     review_kind          TEXT,
     resume_mode          TEXT,
     review_subject_assignee TEXT,
     foreground_parent_session_id TEXT,
-    foreground_fork_session_id TEXT
+    foreground_fork_session_id TEXT,
     -- Typed block reason set by ``block_task`` (one of VALID_BLOCK_KINDS, or
     -- NULL for legacy/un-typed blocks). Drives routing: ``dependency`` never
     -- sits in ``blocked`` (goes to ``todo`` for parent-gating); the others go
@@ -2080,6 +2118,16 @@ def _migrate_add_optional_columns(conn: sqlite3.Connection) -> None:
             conn, "tasks", "session_id", "session_id TEXT"
         )
 
+    if "needs_specification" not in cols:
+        # Existing rows were already complete task specifications, so the
+        # backward-compatible migration default is false.
+        _add_column_if_missing(
+            conn,
+            "tasks",
+            "needs_specification",
+            "needs_specification INTEGER NOT NULL DEFAULT 0",
+        )
+
     for column in (
         "review_kind",
         "resume_mode",
@@ -2550,14 +2598,16 @@ def create_task(
     session_id: Optional[str] = None,
     board: Optional[str] = None,
     project_id: Optional[str] = None,
+    needs_specification: bool = False,
 ) -> str:
     """Create a new task and optionally link it under parent tasks.
 
-    Returns the new task id.  Status is ``ready`` when there are no
-    parents (or all parents already ``done``), otherwise ``todo``.
+    Returns the new task id. Status is ``ready`` when there are no
+    parents (or all parents are terminal), otherwise ``todo``.
     If ``triage=True``, status is forced to ``triage`` regardless of
-    parents — a specifier/triager is expected to promote the task to
-    ``todo`` once the spec is fleshed out.
+    parents. If ``needs_specification=True``, a dependency-satisfied task
+    starts in ``triage`` while one with unfinished parents waits in ``todo``;
+    neither can dispatch until specification succeeds.
 
     If ``idempotency_key`` is provided and a non-archived task with the
     same key already exists, returns the existing task's id instead of
@@ -2744,8 +2794,10 @@ def create_task(
                             "(" + ",".join("?" * len(parents)) + ")",
                             parents,
                         ).fetchall()
-                        if any(r["status"] != "done" for r in rows):
+                        if any(r["status"] not in ("done", "archived") for r in rows):
                             task_status = "todo"
+                    if needs_specification and task_status == "ready":
+                        task_status = "triage"
                 # Even in triage mode we still need to validate parent ids
                 # so the eventual link rows don't dangle.
                 if triage and parents:
@@ -2778,8 +2830,9 @@ def create_task(
                         created_by, created_at, workspace_kind, workspace_path,
                         branch_name, project_id, tenant, idempotency_key,
                         max_runtime_seconds,
-                        skills, max_retries, goal_mode, goal_max_turns, session_id
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                        skills, max_retries, goal_mode, goal_max_turns, session_id,
+                        needs_specification
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                     """,
                     (
                         task_id,
@@ -2802,6 +2855,7 @@ def create_task(
                         1 if goal_mode else 0,
                         int(goal_max_turns) if goal_max_turns is not None else None,
                         session_id,
+                        1 if needs_specification else 0,
                     ),
                 )
                 for pid in parents:
@@ -2821,6 +2875,7 @@ def create_task(
                         "branch_name": branch_name,
                         "skills": list(skills_list) if skills_list else None,
                         "goal_mode": bool(goal_mode) or None,
+                        "needs_specification": bool(needs_specification) or None,
                     },
                 )
             return task_id
@@ -2843,6 +2898,493 @@ def _find_missing_parents(conn: sqlite3.Connection, parents: Iterable[str]) -> l
     ).fetchall()
     present = {r["id"] for r in rows}
     return [p for p in parents if p not in present]
+
+
+def create_loop_skeleton_graph(
+    conn: sqlite3.Connection,
+    *,
+    nodes: list[dict[str, Any]],
+    root_task_id: Optional[str] = None,
+    shared_context: Optional[str] = None,
+    session_id: Optional[str] = None,
+    tenant: Optional[str] = None,
+    workspace_kind: str = "scratch",
+    workspace_path: Optional[str] = None,
+    board: Optional[str] = None,
+    created_by: Optional[str] = None,
+    idempotency_scope: Optional[str] = None,
+) -> dict[str, Any]:
+    """Atomically persist a live, title/dependency-only Loop graph.
+
+    Every submitted node is a ``needs_specification`` skeleton. Entry rows
+    move straight to ``triage``; rows with unfinished parents wait in ``todo``.
+    When no root is supplied, the same transaction synthesizes a stable,
+    unassigned Loop root and links the graph's sinks into it. Validation and
+    all task/link inserts share one write transaction, so a malformed final
+    node cannot leave a partial executable graph behind. When callers omit an
+    idempotency scope, one is derived from the normalized fragment: exact
+    retries reuse tasks, while aliases remain local to later graph fragments.
+    """
+    if not isinstance(nodes, list) or not nodes:
+        raise ValueError("nodes must be a non-empty list")
+    max_graph_nodes = 32
+    try:
+        from hermes_cli.config import load_config
+
+        config = load_config()
+        configured_limit = int((config.get("loop") or {}).get("max_graph_nodes", 32))
+        if configured_limit > 0:
+            max_graph_nodes = configured_limit
+    except (AttributeError, TypeError, ValueError):
+        pass
+    if len(nodes) > max_graph_nodes:
+        raise ValueError(
+            f"Loop graph has {len(nodes)} nodes; maximum is {max_graph_nodes} "
+            "(loop.max_graph_nodes)"
+        )
+    if workspace_kind not in VALID_WORKSPACE_KINDS:
+        raise ValueError(
+            f"workspace_kind must be one of {sorted(VALID_WORKSPACE_KINDS)}, "
+            f"got {workspace_kind!r}"
+        )
+
+    normalized: list[dict[str, Any]] = []
+    alias_to_index: dict[str, int] = {}
+    for index, raw in enumerate(nodes):
+        if not isinstance(raw, dict):
+            raise ValueError(f"node[{index}] is not a dict")
+        client_id = str(raw.get("client_id") or "").strip()
+        title = str(raw.get("title") or "").strip()
+        if not client_id:
+            raise ValueError(f"node[{index}].client_id is required")
+        if client_id in alias_to_index:
+            raise ValueError(f"duplicate client_id: {client_id}")
+        if not title:
+            raise ValueError(f"node[{index}].title is required")
+        raw_dependencies = raw.get("depends_on") or []
+        if isinstance(raw_dependencies, str):
+            raw_dependencies = [raw_dependencies]
+        if not isinstance(raw_dependencies, (list, tuple)):
+            raise ValueError(f"node[{index}].depends_on must be a list")
+        dependencies: list[str] = []
+        for value in raw_dependencies:
+            dependency = str(value or "").strip()
+            if dependency and dependency not in dependencies:
+                dependencies.append(dependency)
+        if client_id in dependencies:
+            raise ValueError(f"node {client_id} cannot depend on itself")
+        context = raw.get("context")
+        if context is not None and not isinstance(context, str):
+            raise ValueError(f"node[{index}].context must be a string")
+        normalized.append(
+            {
+                "client_id": client_id,
+                "title": title,
+                "depends_on": dependencies,
+                "context": context.strip() or None if isinstance(context, str) else None,
+                # Foreground graph construction owns only stable titles and
+                # topology. Routing is assigned later by the JIT decomposer.
+                "assignee": None,
+            }
+        )
+        alias_to_index[client_id] = index
+
+    # Validate the alias-only subgraph before opening the write transaction.
+    # External task ids are checked under the transaction below so they cannot
+    # disappear between validation and insertion.
+    indegree = [0] * len(normalized)
+    adjacency: list[list[int]] = [[] for _ in normalized]
+    external_parent_ids: set[str] = set()
+    for index, node in enumerate(normalized):
+        for dependency in node["depends_on"]:
+            parent_index = alias_to_index.get(dependency)
+            if parent_index is None:
+                external_parent_ids.add(dependency)
+            else:
+                adjacency[parent_index].append(index)
+                indegree[index] += 1
+    queue = [index for index, degree in enumerate(indegree) if degree == 0]
+    topological_order: list[int] = []
+    while queue:
+        index = queue.pop()
+        topological_order.append(index)
+        for child_index in adjacency[index]:
+            indegree[child_index] -= 1
+            if indegree[child_index] == 0:
+                queue.append(child_index)
+    if len(topological_order) != len(normalized):
+        raise ValueError("dependency cycle detected in Loop skeleton graph")
+
+    root_task_id = str(root_task_id or "").strip() or None
+    requested_root_task_id = root_task_id
+    session_id = str(session_id or "").strip() or None
+    tenant = str(tenant or "").strip() or None
+    created_by = str(created_by or "").strip() or None
+    shared_context = str(shared_context or "").strip() or None
+    idempotency_scope = str(idempotency_scope or "").strip() or None
+    if root_task_id and root_task_id in external_parent_ids:
+        raise ValueError("a Loop root cannot also be a skeleton dependency")
+
+    now = int(time.time())
+    item_ids: dict[str, str] = {}
+    reused: dict[str, bool] = {}
+    resolved_parents: dict[str, list[str]] = {}
+    edge_pairs: list[tuple[str, str]] = []
+
+    with write_txn(conn):
+        missing = _find_missing_parents(conn, external_parent_ids)
+        if missing:
+            raise ValueError(
+                "unknown dependency alias or task id: " + ", ".join(sorted(missing))
+            )
+
+        if idempotency_scope is None:
+            # Aliases are local to one submitted fragment, not global names
+            # under a long-lived root. Exact retries derive the same scope;
+            # later fragments with different content may safely reuse aliases.
+            digest_payload = {
+                "root_task_id": requested_root_task_id,
+                "shared_context": shared_context,
+                "nodes": normalized,
+            }
+            if requested_root_task_id is None:
+                digest_payload.update(
+                    {
+                        "session_id": session_id,
+                        "tenant": tenant,
+                        "workspace_kind": workspace_kind,
+                        "workspace_path": workspace_path,
+                    }
+                )
+            digest = hashlib.sha256(
+                json.dumps(
+                    digest_payload, sort_keys=True, ensure_ascii=False
+                ).encode()
+            ).hexdigest()[:20]
+            idempotency_scope = f"auto:{digest}"
+
+        root_row = None
+        if requested_root_task_id:
+            root_row = conn.execute(
+                "SELECT id, body, tenant, session_id, workspace_kind, workspace_path, "
+                "status, assignee "
+                "FROM tasks WHERE id = ?",
+                (requested_root_task_id,),
+            ).fetchone()
+            if root_row is None:
+                raise ValueError(f"unknown Loop root task: {requested_root_task_id}")
+            root_task_id = requested_root_task_id
+        else:
+            root_key = f"loop-root:{idempotency_scope}"
+            existing_root = conn.execute(
+                "SELECT id FROM tasks WHERE idempotency_key = ? "
+                "AND status != 'archived' ORDER BY created_at DESC LIMIT 1",
+                (root_key,),
+            ).fetchone()
+            if existing_root is not None:
+                root_task_id = existing_root["id"]
+            else:
+                root_task_id = _new_task_id()
+                while conn.execute(
+                    "SELECT 1 FROM tasks WHERE id = ?",
+                    (root_task_id,),
+                ).fetchone():  # pragma: no cover - cryptographic collision
+                    root_task_id = _new_task_id()
+                root_title = next(
+                    (
+                        line.strip()
+                        for line in (shared_context or "").splitlines()
+                        if line.strip()
+                    ),
+                    "Loop graph",
+                )[:200]
+                conn.execute(
+                    "INSERT INTO tasks "
+                    "(id, title, body, assignee, status, created_by, created_at, "
+                    " workspace_kind, workspace_path, tenant, idempotency_key, "
+                    " session_id, needs_specification) "
+                    "VALUES (?, ?, ?, NULL, 'scheduled', ?, ?, ?, ?, ?, ?, ?, 0)",
+                    (
+                        root_task_id,
+                        root_title,
+                        shared_context,
+                        f"loop:{root_task_id}",
+                        now,
+                        workspace_kind,
+                        workspace_path,
+                        tenant,
+                        root_key,
+                        session_id,
+                    ),
+                )
+                _append_event(
+                    conn,
+                    root_task_id,
+                    "created",
+                    {
+                        "status": "scheduled",
+                        "loop_root_task_id": root_task_id,
+                        "board": board,
+                    },
+                )
+            root_row = conn.execute(
+                "SELECT id, body, tenant, session_id, workspace_kind, workspace_path, "
+                "status, assignee "
+                "FROM tasks WHERE id = ?",
+                (root_task_id,),
+            ).fetchone()
+
+        if root_row is None or _loop_root_for_task(conn, root_task_id) != root_task_id:
+            raise ValueError(f"task {root_task_id} is not a Loop root")
+        root_status = root_row["status"]
+        root_is_mutable = root_status in {"scheduled", "todo"} or (
+            root_status == "ready" and not root_row["assignee"]
+        )
+        if not root_is_mutable:
+            raise ValueError(
+                f"Loop root {root_task_id} is not mutable in status {root_status!r}; "
+                "fragments require scheduled/todo or an unassigned ready root"
+            )
+        session_id = session_id or root_row["session_id"]
+        tenant = tenant or root_row["tenant"]
+        if workspace_kind == "scratch" and workspace_path is None:
+            workspace_kind = root_row["workspace_kind"] or "scratch"
+            workspace_path = root_row["workspace_path"]
+        created_by = f"loop:{root_task_id}"
+
+        reserved_ids: set[str] = set()
+        item_idempotency_keys: dict[str, str] = {}
+        for index in topological_order:
+            node = normalized[index]
+            client_id = node["client_id"]
+            idempotency_key = (
+                f"loop-skeleton:{root_task_id}:{idempotency_scope}:{client_id}"
+            )
+            legacy_idempotency_key = (
+                f"loop-skeleton:{idempotency_scope}:{client_id}"
+            )
+            item_idempotency_keys[client_id] = idempotency_key
+            existing = conn.execute(
+                "SELECT id FROM tasks WHERE idempotency_key IN (?, ?) "
+                "AND created_by = ? AND status != 'archived' "
+                "ORDER BY created_at DESC LIMIT 1",
+                (idempotency_key, legacy_idempotency_key, created_by),
+            ).fetchone()
+            if existing:
+                task_id = existing["id"]
+                reused[client_id] = True
+            else:
+                for _ in range(5):
+                    task_id = _new_task_id()
+                    if task_id not in reserved_ids and not conn.execute(
+                        "SELECT 1 FROM tasks WHERE id = ?", (task_id,)
+                    ).fetchone():
+                        break
+                else:  # pragma: no cover - cryptographic collision storm
+                    raise RuntimeError("could not allocate a unique Loop task id")
+                reserved_ids.add(task_id)
+                reused[client_id] = False
+            item_ids[client_id] = task_id
+
+        for index in topological_order:
+            node = normalized[index]
+            client_id = node["client_id"]
+            task_id = item_ids[client_id]
+            parent_task_ids = [
+                item_ids.get(dependency, dependency)
+                for dependency in node["depends_on"]
+            ]
+            resolved_parents[client_id] = parent_task_ids
+            if reused[client_id]:
+                durable_parents = parent_ids(conn, task_id)
+                if sorted(durable_parents) != sorted(parent_task_ids):
+                    raise ValueError(
+                        f"reused alias {client_id!r} has different durable parents; "
+                        "use the revision-guarded Loop graph patch API"
+                    )
+                continue
+            parent_statuses = []
+            if parent_task_ids:
+                placeholders = ",".join("?" for _ in parent_task_ids)
+                parent_statuses = conn.execute(
+                    f"SELECT status FROM tasks WHERE id IN ({placeholders})",
+                    tuple(parent_task_ids),
+                ).fetchall()
+            status = (
+                "triage"
+                if all(row["status"] in ("done", "archived") for row in parent_statuses)
+                else "todo"
+            )
+            body_parts = [
+                part
+                for part in (
+                    root_row["body"] if root_row else None,
+                    shared_context,
+                    node["context"],
+                )
+                if isinstance(part, str) and part.strip()
+            ]
+            body = "\n\n".join(dict.fromkeys(part.strip() for part in body_parts)) or None
+            conn.execute(
+                "INSERT INTO tasks "
+                "(id, title, body, assignee, status, created_by, created_at, "
+                " workspace_kind, workspace_path, tenant, idempotency_key, "
+                " session_id, needs_specification) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1)",
+                (
+                    task_id,
+                    node["title"],
+                    body,
+                    node["assignee"],
+                    status,
+                    created_by,
+                    now,
+                    workspace_kind,
+                    workspace_path,
+                    tenant,
+                    item_idempotency_keys[client_id],
+                    session_id,
+                ),
+            )
+            _append_event(
+                conn,
+                task_id,
+                "created",
+                {
+                    "status": status,
+                    "client_id": client_id,
+                    "needs_specification": True,
+                    "loop_root_task_id": root_task_id,
+                    "board": board,
+                },
+            )
+            if status == "triage":
+                _append_event(
+                    conn,
+                    task_id,
+                    "specification_requested",
+                    {"reason": "dependencies_satisfied"},
+                )
+
+        for node in normalized:
+            child_id = item_ids[node["client_id"]]
+            edge_pairs.extend(
+                (parent_id, child_id)
+                for parent_id in resolved_parents[node["client_id"]]
+            )
+        if root_task_id:
+            dependency_aliases = {
+                dependency
+                for node in normalized
+                for dependency in node["depends_on"]
+                if dependency in alias_to_index
+            }
+            edge_pairs.extend(
+                (item_ids[node["client_id"]], root_task_id)
+                for node in normalized
+                if node["client_id"] not in dependency_aliases
+            )
+
+            # A later fragment may extend a node that was previously a sink.
+            # Remove that node's direct completion edge to the root before
+            # attaching the new downstream sink, keeping the stable root while
+            # evolving its frontier atomically.
+            rewired_parent_ids = {
+                item_ids[alias] for alias in dependency_aliases
+            }
+            rewired_parent_ids.update(
+                parent_id
+                for parent_id in external_parent_ids
+                if _loop_root_for_task(conn, parent_id) == root_task_id
+            )
+            for previous_sink_id in rewired_parent_ids:
+                removed = conn.execute(
+                    "DELETE FROM task_links WHERE parent_id = ? AND child_id = ?",
+                    (previous_sink_id, root_task_id),
+                ).rowcount
+                if removed:
+                    _append_event(
+                        conn,
+                        root_task_id,
+                        "unlinked",
+                        {"parent": previous_sink_id, "child": root_task_id},
+                    )
+
+        for parent_id, child_id in edge_pairs:
+            if parent_id == child_id or _would_cycle(conn, parent_id, child_id):
+                raise ValueError(
+                    f"linking {parent_id} -> {child_id} would create a cycle"
+                )
+            inserted = conn.execute(
+                "INSERT OR IGNORE INTO task_links (parent_id, child_id) VALUES (?, ?)",
+                (parent_id, child_id),
+            ).rowcount
+            parent_status = conn.execute(
+                "SELECT status FROM tasks WHERE id = ?", (parent_id,)
+            ).fetchone()["status"]
+            if parent_status not in ("done", "archived"):
+                conn.execute(
+                    "UPDATE tasks SET status = 'todo' WHERE id = ? "
+                    "AND (status = 'ready' OR "
+                    "     (status = 'triage' AND needs_specification = 1))",
+                    (child_id,),
+                )
+            if inserted:
+                _append_event(
+                    conn,
+                    child_id,
+                    "linked",
+                    {"parent": parent_id, "child": child_id},
+                )
+
+        if root_task_id:
+            conn.execute(
+                "UPDATE tasks SET needs_specification = 0, assignee = NULL WHERE id = ?",
+                (root_task_id,),
+            )
+            activated = conn.execute(
+                "UPDATE tasks SET status = 'todo' "
+                "WHERE id = ? AND status = 'scheduled'",
+                (root_task_id,),
+            ).rowcount
+            if activated:
+                _append_event(
+                    conn,
+                    root_task_id,
+                    "activated",
+                    {"reason": "live_skeleton_graph_created"},
+                )
+
+    # The rows are already safely gated. Reuse the canonical promotion pass so
+    # an external parent that completed just before commit routes its child to
+    # triage without waiting for the next dispatcher tick.
+    recompute_ready(conn)
+    items = []
+    for node in normalized:
+        client_id = node["client_id"]
+        task_id = item_ids[client_id]
+        task = get_task(conn, task_id)
+        items.append(
+            {
+                "client_id": client_id,
+                "task_id": task_id,
+                "loop_item_id": task_id,
+                "status": task.status if task else None,
+                "needs_specification": bool(task and task.needs_specification),
+                "assignee": task.assignee if task else None,
+                "parents": parent_ids(conn, task_id),
+                "reused": reused[client_id],
+            }
+        )
+    return {
+        "items": items,
+        "edges": [
+            {"parent_id": parent_id, "child_id": child_id}
+            for parent_id, child_id in edge_pairs
+        ],
+        "root_task_id": root_task_id,
+        "idempotency_scope": idempotency_scope,
+    }
 
 
 def get_task(conn: sqlite3.Connection, task_id: str) -> Optional[Task]:
@@ -2993,13 +3535,217 @@ def _looks_like_reviewer_task(conn: sqlite3.Connection, task_id: str) -> bool:
     return any(marker in haystack for marker in ("reviewer", "review gate", " qa ", "qa "))
 
 
-def link_tasks(conn: sqlite3.Connection, parent_id: str, child_id: str) -> None:
+def _validate_allowed_child_statuses(
+    allowed_child_statuses: Optional[set[str]],
+) -> Optional[frozenset[str]]:
+    if allowed_child_statuses is None:
+        return None
+    allowed = frozenset(allowed_child_statuses)
+    invalid = sorted(allowed - VALID_STATUSES)
+    if invalid:
+        raise ValueError(f"invalid child status: {invalid[0]}")
+    return allowed
+
+
+def active_decomposition_child_ids(
+    conn: sqlite3.Connection,
+    task_id: str,
+) -> list[str]:
+    """Return nonterminal children currently owned by a decomposed shell.
+
+    A fanout shell is parked in ``todo`` with ``needs_specification=0`` while
+    its generated children execute. Status alone therefore does not make it a
+    safe graph-edit target. The durable ``decomposed`` event is authoritative;
+    the created-event fallback covers older rows whose decomposition payload
+    did not retain child ids.
+    """
+    row = conn.execute(
+        "SELECT payload FROM task_events "
+        "WHERE task_id = ? AND kind = 'decomposed' ORDER BY id DESC LIMIT 1",
+        (task_id,),
+    ).fetchone()
+    child_task_ids: list[str] = []
+    if row is not None:
+        try:
+            payload = json.loads(row["payload"] or "{}")
+        except (TypeError, ValueError):
+            payload = {}
+        raw_child_ids = payload.get("child_ids") if isinstance(payload, dict) else None
+        if isinstance(raw_child_ids, list):
+            child_task_ids = [
+                str(child_id).strip()
+                for child_id in raw_child_ids
+                if str(child_id).strip()
+            ]
+
+    if not child_task_ids:
+        created_rows = conn.execute(
+            "SELECT task_id FROM task_events WHERE kind = 'created' "
+            "AND json_valid(payload) "
+            "AND json_extract(payload, '$.from_decompose_of') = ? "
+            "ORDER BY id",
+            (task_id,),
+        ).fetchall()
+        child_task_ids.extend(created["task_id"] for created in created_rows)
+
+    if not child_task_ids:
+        return []
+    child_task_ids = list(dict.fromkeys(child_task_ids))
+    placeholders = ",".join("?" for _ in child_task_ids)
+    rows = conn.execute(
+        f"SELECT id FROM tasks WHERE id IN ({placeholders}) "
+        "AND status NOT IN ('done', 'archived') ORDER BY created_at, id",
+        tuple(child_task_ids),
+    ).fetchall()
+    return [row["id"] for row in rows]
+
+
+def active_decomposition_child_count(
+    conn: sqlite3.Connection,
+    task_id: str,
+) -> int:
+    """Return the number of unfinished children owned by a fanout shell."""
+    return len(active_decomposition_child_ids(conn, task_id))
+
+
+def active_decomposition_child_counts(
+    conn: sqlite3.Connection,
+    task_ids: Iterable[str],
+) -> dict[str, int]:
+    """Bulk active-child counts for session/canvas projections."""
+    shell_ids = list(dict.fromkeys(str(task_id).strip() for task_id in task_ids if str(task_id).strip()))
+    if not shell_ids:
+        return {}
+    placeholders = ",".join("?" for _ in shell_ids)
+    latest_rows = conn.execute(
+        f"""
+        SELECT e.task_id, e.payload
+        FROM task_events e
+        JOIN (
+            SELECT task_id, MAX(id) AS event_id
+            FROM task_events
+            WHERE kind = 'decomposed' AND task_id IN ({placeholders})
+            GROUP BY task_id
+        ) latest ON latest.event_id = e.id
+        """,
+        tuple(shell_ids),
+    ).fetchall()
+    children_by_shell: dict[str, list[str]] = {task_id: [] for task_id in shell_ids}
+    for row in latest_rows:
+        try:
+            payload = json.loads(row["payload"] or "{}")
+        except (TypeError, ValueError):
+            payload = {}
+        raw_child_ids = payload.get("child_ids") if isinstance(payload, dict) else None
+        if isinstance(raw_child_ids, list):
+            children_by_shell[row["task_id"]] = [
+                str(child_id).strip()
+                for child_id in raw_child_ids
+                if str(child_id).strip()
+            ]
+
+    fallback_shell_ids = [
+        task_id for task_id, child_ids in children_by_shell.items() if not child_ids
+    ]
+    if fallback_shell_ids:
+        fallback_placeholders = ",".join("?" for _ in fallback_shell_ids)
+        rows = conn.execute(
+            f"""
+            SELECT task_id AS child_id,
+                   json_extract(payload, '$.from_decompose_of') AS shell_id
+            FROM task_events
+            WHERE kind = 'created' AND json_valid(payload)
+              AND json_extract(payload, '$.from_decompose_of')
+                  IN ({fallback_placeholders})
+            ORDER BY id
+            """,
+            tuple(fallback_shell_ids),
+        ).fetchall()
+        for row in rows:
+            children_by_shell[str(row["shell_id"])].append(str(row["child_id"]))
+
+    all_child_ids = list(
+        dict.fromkeys(
+            child_id
+            for child_ids in children_by_shell.values()
+            for child_id in child_ids
+        )
+    )
+    if not all_child_ids:
+        return {}
+    child_placeholders = ",".join("?" for _ in all_child_ids)
+    active_child_ids = {
+        str(row["id"])
+        for row in conn.execute(
+            f"SELECT id FROM tasks WHERE id IN ({child_placeholders}) "
+            "AND status NOT IN ('done', 'archived')",
+            tuple(all_child_ids),
+        ).fetchall()
+    }
+    return {
+        shell_id: count
+        for shell_id, child_ids in children_by_shell.items()
+        if (count := len(set(child_ids) & active_child_ids))
+    }
+
+
+def task_has_active_decomposition_children(
+    conn: sqlite3.Connection,
+    task_id: str,
+) -> bool:
+    """Return whether a decomposed shell still owns unfinished child work."""
+    return bool(active_decomposition_child_ids(conn, task_id))
+
+
+def _require_mutable_child_status(
+    conn: sqlite3.Connection,
+    child_id: str,
+    allowed_child_statuses: Optional[frozenset[str]],
+) -> None:
+    if allowed_child_statuses is None:
+        return
+    row = conn.execute(
+        "SELECT status FROM tasks WHERE id = ?",
+        (child_id,),
+    ).fetchone()
+    actual_status = row["status"] if row is not None else None
+    if actual_status not in allowed_child_statuses:
+        raise TaskStatusConflictError(
+            child_id,
+            actual_status,
+            allowed_child_statuses,
+        )
+    if task_has_active_decomposition_children(conn, child_id):
+        raise TaskStatusConflictError(
+            child_id,
+            actual_status,
+            allowed_child_statuses,
+            reason="decomposition children are still active",
+        )
+
+
+def link_tasks(
+    conn: sqlite3.Connection,
+    parent_id: str,
+    child_id: str,
+    *,
+    allowed_child_statuses: Optional[set[str]] = None,
+) -> None:
+    """Add a dependency, optionally only while the child remains mutable.
+
+    ``allowed_child_statuses`` is checked under the same write transaction as
+    the edge insert. A caller that read a pending child before a concurrent
+    worker claimed it therefore receives :class:`TaskStatusConflictError`
+    instead of mutating an in-flight graph. Existing callers remain unguarded.
+    """
     if parent_id == child_id:
         raise ValueError("a task cannot depend on itself")
+    mutable_statuses = _validate_allowed_child_statuses(allowed_child_statuses)
     with write_txn(conn):
         missing = _find_missing_parents(conn, [parent_id, child_id])
         if missing:
             raise ValueError(f"unknown task(s): {', '.join(missing)}")
+        _require_mutable_child_status(conn, child_id, mutable_statuses)
         if _would_cycle(conn, parent_id, child_id):
             raise ValueError(
                 f"linking {parent_id} -> {child_id} would create a cycle"
@@ -3019,9 +3765,11 @@ def link_tasks(conn: sqlite3.Connection, parent_id: str, child_id: str) -> None:
         parent_status = conn.execute(
             "SELECT status FROM tasks WHERE id = ?", (parent_id,)
         ).fetchone()["status"]
-        if parent_status != "done":
+        if parent_status not in ("done", "archived"):
             conn.execute(
-                "UPDATE tasks SET status = 'todo' WHERE id = ? AND status = 'ready'",
+                "UPDATE tasks SET status = 'todo' WHERE id = ? "
+                "AND (status = 'ready' OR "
+                "     (status = 'triage' AND needs_specification = 1))",
                 (child_id,),
             )
         _append_event(
@@ -3053,8 +3801,17 @@ def _would_cycle(conn: sqlite3.Connection, parent_id: str, child_id: str) -> boo
     return False
 
 
-def unlink_tasks(conn: sqlite3.Connection, parent_id: str, child_id: str) -> bool:
+def unlink_tasks(
+    conn: sqlite3.Connection,
+    parent_id: str,
+    child_id: str,
+    *,
+    allowed_child_statuses: Optional[set[str]] = None,
+) -> bool:
+    """Remove a dependency, optionally only while the child remains mutable."""
+    mutable_statuses = _validate_allowed_child_statuses(allowed_child_statuses)
     with write_txn(conn):
+        _require_mutable_child_status(conn, child_id, mutable_statuses)
         cur = conn.execute(
             "DELETE FROM task_links WHERE parent_id = ? AND child_id = ?",
             (parent_id, child_id),
@@ -3516,6 +4273,22 @@ def _append_loop_root_notification_event(
         "title": source_row["title"],
         "assignee": source_row["assignee"],
     }
+    direct_subscription_rows = conn.execute(
+        "SELECT platform, chat_id, thread_id, notifier_profile "
+        "FROM kanban_notify_subs "
+        "WHERE task_id = ? ORDER BY platform, chat_id, thread_id",
+        (source_task_id,),
+    ).fetchall()
+    if direct_subscription_rows:
+        root_payload["source_subscription_routes"] = [
+            {
+                "platform": row["platform"],
+                "chat_id": row["chat_id"],
+                "thread_id": row["thread_id"] or "",
+                "notifier_profile": row["notifier_profile"] or "",
+            }
+            for row in direct_subscription_rows
+        ]
     if source_run_id is not None:
         root_payload["source_run_id"] = int(source_run_id)
     for key in (
@@ -5013,7 +5786,10 @@ def _has_sticky_block(conn: sqlite3.Connection, task_id: str) -> bool:
 def recompute_ready(
     conn: sqlite3.Connection, failure_limit: int = None,
 ) -> int:
-    """Promote ``todo`` tasks to ``ready`` when all parents are ``done`` or ``archived``.
+    """Promote dependency-satisfied ``todo`` tasks to their next runnable lane.
+
+    Ordinary tasks move to ``ready``. Foreground skeletons move to ``triage``
+    so the existing decomposer can specify them before any worker claim.
 
     Returns the number of tasks promoted.  Safe to call inside or outside
     an existing transaction; it opens its own IMMEDIATE txn.
@@ -5046,7 +5822,7 @@ def recompute_ready(
     promoted = 0
     with write_txn(conn):
         todo_rows = conn.execute(
-            "SELECT id, status, consecutive_failures, max_retries "
+            "SELECT id, status, consecutive_failures, max_retries, needs_specification "
             "FROM tasks WHERE status IN ('todo', 'blocked')"
         ).fetchall()
         for row in todo_rows:
@@ -5065,6 +5841,7 @@ def recompute_ready(
                 (task_id,),
             ).fetchall()
             if all(p["status"] in ("done", "archived") for p in parents):
+                next_status = "triage" if row["needs_specification"] else "ready"
                 if cur_status == "blocked":
                     # Don't auto-recover tasks that have hit the
                     # circuit-breaker failure limit.  Without this
@@ -5083,16 +5860,24 @@ def recompute_ready(
                     if failures >= effective_limit:
                         continue
                     conn.execute(
-                        "UPDATE tasks SET status = 'ready' "
+                        "UPDATE tasks SET status = ? "
                         "WHERE id = ? AND status = 'blocked'",
-                        (task_id,),
+                        (next_status, task_id),
                     )
                 else:
                     conn.execute(
-                        "UPDATE tasks SET status = 'ready' WHERE id = ? AND status = 'todo'",
-                        (task_id,),
+                        "UPDATE tasks SET status = ? WHERE id = ? AND status = 'todo'",
+                        (next_status, task_id),
                     )
-                _append_event(conn, task_id, "promoted", None)
+                if row["needs_specification"]:
+                    _append_event(
+                        conn,
+                        task_id,
+                        "specification_requested",
+                        {"reason": "dependencies_satisfied"},
+                    )
+                else:
+                    _append_event(conn, task_id, "promoted", None)
                 promoted += 1
     return promoted
 
@@ -5117,6 +5902,35 @@ def claim_task(
     lock = claimer or _claimer_id()
     expires = now + _resolve_claim_ttl_seconds(ttl_seconds)
     with write_txn(conn):
+        foreground_root = conn.execute(
+            "SELECT status, assignee, created_by FROM tasks WHERE id = ?",
+            (task_id,),
+        ).fetchone()
+        if (
+            foreground_root is not None
+            and foreground_root["status"] == "ready"
+            and not foreground_root["assignee"]
+            and foreground_root["created_by"] == f"loop:{task_id}"
+        ):
+            return None
+        skeleton = conn.execute(
+            "SELECT status FROM tasks WHERE id = ? AND needs_specification = 1",
+            (task_id,),
+        ).fetchone()
+        if skeleton is not None:
+            if skeleton["status"] == "ready":
+                conn.execute(
+                    "UPDATE tasks SET status = 'triage' "
+                    "WHERE id = ? AND status = 'ready' AND needs_specification = 1",
+                    (task_id,),
+                )
+                _append_event(
+                    conn,
+                    task_id,
+                    "claim_rejected",
+                    {"reason": "needs_specification"},
+                )
+            return None
         # Structural invariant: never transition ready -> running while any
         # parent is not yet 'done'. This is the single enforcement point
         # regardless of which writer (create_task, link_tasks, unblock_task,
@@ -5176,6 +5990,7 @@ def claim_task(
                    started_at    = COALESCE(started_at, ?)
              WHERE id = ?
                AND status = 'ready'
+               AND needs_specification = 0
                AND claim_lock IS NULL
             """,
             (lock, expires, now, task_id),
@@ -7216,6 +8031,172 @@ def unblock_task(conn: sqlite3.Connection, task_id: str) -> bool:
         return True
 
 
+def _task_specification_fingerprint(
+    conn: sqlite3.Connection,
+    task_id: str,
+) -> Optional[str]:
+    """Hash only fields that invalidate in-flight decomposer output."""
+    row = conn.execute(
+        "SELECT title, body, status, needs_specification FROM tasks WHERE id = ?",
+        (task_id,),
+    ).fetchone()
+    if row is None:
+        return None
+    parents = [
+        parent["parent_id"]
+        for parent in conn.execute(
+            "SELECT parent_id FROM task_links WHERE child_id = ? ORDER BY parent_id",
+            (task_id,),
+        ).fetchall()
+    ]
+    snapshot = {
+        "title": row["title"],
+        "body": row["body"],
+        "status": row["status"],
+        "needs_specification": bool(row["needs_specification"]),
+        "parents": parents,
+    }
+    encoded = json.dumps(
+        snapshot,
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+    ).encode("utf-8")
+    return hashlib.sha256(encoded).hexdigest()
+
+
+def task_specification_fingerprint(
+    conn: sqlite3.Connection,
+    task_id: str,
+) -> Optional[str]:
+    """Return the current decomposer input fingerprint for ``task_id``."""
+    return _task_specification_fingerprint(conn, task_id)
+
+
+def _specification_hold_until(
+    conn: sqlite3.Connection,
+    task_id: str,
+) -> int:
+    row = conn.execute(
+        "SELECT kind, payload FROM task_events "
+        "WHERE task_id = ? "
+        "AND kind IN ('specification_started', 'specification_failed') "
+        "ORDER BY id DESC LIMIT 1",
+        (task_id,),
+    ).fetchone()
+    if row is None:
+        return 0
+    try:
+        payload = json.loads(row["payload"] or "{}")
+    except (TypeError, ValueError):
+        return 0
+    if not isinstance(payload, dict):
+        return 0
+    event_fingerprint = payload.get("fingerprint")
+    if (
+        isinstance(event_fingerprint, str)
+        and event_fingerprint
+        and _task_specification_fingerprint(conn, task_id) != event_fingerprint
+    ):
+        # The foreground edited this task after the attempt began. Its new
+        # revision must not inherit the old revision's lease or backoff.
+        return 0
+    key = "lease_expires" if row["kind"] == "specification_started" else "retry_after"
+    try:
+        return max(0, int(payload.get(key) or 0))
+    except (TypeError, ValueError):
+        return 0
+
+
+def specification_retry_eligible(
+    conn: sqlite3.Connection,
+    task_id: str,
+    *,
+    now: Optional[int] = None,
+) -> bool:
+    """Return whether no active specification lease/backoff holds the task."""
+    current_time = int(time.time()) if now is None else int(now)
+    return _specification_hold_until(conn, task_id) <= current_time
+
+
+def begin_specification_attempt(
+    conn: sqlite3.Connection,
+    task_id: str,
+    *,
+    lease_seconds: int,
+    allowed_statuses: Optional[set[str]] = None,
+    expected_fingerprint: Optional[str] = None,
+    author: Optional[str] = None,
+) -> Optional[str]:
+    """Lease a task for JIT specification and return its input fingerprint.
+
+    The eligibility check, optional snapshot comparison, and durable lease
+    event share one write transaction. ``None`` means the task moved, changed,
+    or is already leased/backing off; no LLM call should be made.
+    """
+    allowed = allowed_statuses or {"triage"}
+    invalid = sorted(allowed - VALID_STATUSES)
+    if invalid:
+        raise ValueError(f"invalid specification status: {invalid[0]}")
+    lease_seconds = max(1, min(int(lease_seconds), 3600))
+    now = int(time.time())
+    with write_txn(conn):
+        row = conn.execute(
+            "SELECT status FROM tasks WHERE id = ?",
+            (task_id,),
+        ).fetchone()
+        if row is None or row["status"] not in allowed:
+            return None
+        if _specification_hold_until(conn, task_id) > now:
+            return None
+        fingerprint = _task_specification_fingerprint(conn, task_id)
+        if fingerprint is None:
+            return None
+        if expected_fingerprint is not None and fingerprint != expected_fingerprint:
+            return None
+        payload: dict[str, Any] = {
+            "fingerprint": fingerprint,
+            "lease_expires": now + lease_seconds,
+        }
+        if author and author.strip():
+            payload["author"] = author.strip()
+        _append_event(conn, task_id, "specification_started", payload)
+        return fingerprint
+
+
+def record_specification_failure(
+    conn: sqlite3.Connection,
+    task_id: str,
+    *,
+    reason: str,
+    retry_after_seconds: int,
+    author: Optional[str] = None,
+    expected_fingerprint: Optional[str] = None,
+) -> bool:
+    """Persist a visible decomposer failure without changing task state."""
+    retry_after_seconds = max(1, min(int(retry_after_seconds), 3600))
+    now = int(time.time())
+    with write_txn(conn):
+        fingerprint = _task_specification_fingerprint(conn, task_id)
+        if fingerprint is None:
+            return False
+        if (
+            expected_fingerprint is not None
+            and fingerprint != expected_fingerprint
+        ):
+            return False
+        payload: dict[str, Any] = {
+            "reason": str(reason or "specification failed")[:1000],
+            "retry_after": now + retry_after_seconds,
+            "retry_after_seconds": retry_after_seconds,
+            "fingerprint": fingerprint,
+        }
+        if author and author.strip():
+            payload["author"] = author.strip()
+        _append_event(conn, task_id, "specification_failed", payload)
+        return True
+
+
 def specify_triage_task(
     conn: sqlite3.Connection,
     task_id: str,
@@ -7228,6 +8209,7 @@ def specify_triage_task(
     next_status: str = "todo",
     recompute: bool = True,
     loop_intake_payload: Optional[dict[str, Any]] = None,
+    expected_specification_fingerprint: Optional[str] = None,
 ) -> bool:
     """Flesh out a triage task and promote it to ``todo``.
 
@@ -7253,6 +8235,12 @@ def specify_triage_task(
         raise ValueError(f"status must be one of {sorted(VALID_STATUSES)}: {bad_statuses[0]}")
     assignee = _canonical_assignee(assignee)
     with write_txn(conn):
+        if (
+            expected_specification_fingerprint is not None
+            and _task_specification_fingerprint(conn, task_id)
+            != expected_specification_fingerprint
+        ):
+            return False
         placeholders = ",".join("?" for _ in allowed_statuses)
         existing = conn.execute(
             f"SELECT title, body, assignee FROM tasks WHERE id = ? AND status IN ({placeholders})",
@@ -7260,7 +8248,7 @@ def specify_triage_task(
         ).fetchone()
         if existing is None:
             return False
-        sets: list[str] = ["status = ?"]
+        sets: list[str] = ["status = ?", "needs_specification = 0"]
         params: list[Any] = [next_status]
         changed_fields: list[str] = []
         if title is not None and title.strip() != (existing["title"] or ""):
@@ -7331,6 +8319,7 @@ def decompose_triage_task(
     allowed_root_statuses: Optional[set[str]] = None,
     root_next_status: str = "todo",
     loop_intake_payload: Optional[dict[str, Any]] = None,
+    expected_specification_fingerprint: Optional[str] = None,
 ) -> Optional[list[str]]:
     """Fan a planning task out into child tasks and park/promote the root.
 
@@ -7434,6 +8423,12 @@ def decompose_triage_task(
     now = int(time.time())
     child_ids: list[str] = []
     with write_txn(conn):
+        if (
+            expected_specification_fingerprint is not None
+            and _task_specification_fingerprint(conn, task_id)
+            != expected_specification_fingerprint
+        ):
+            return None
         root_row = conn.execute(
             "SELECT id, status, tenant, workspace_kind, workspace_path, session_id "
             "FROM tasks WHERE id = ?",
@@ -7461,6 +8456,19 @@ def decompose_triage_task(
         # override with its own 'workspace_kind' / 'workspace_path'.
         root_ws_kind = root_row["workspace_kind"] or "scratch"
         root_ws_path = root_row["workspace_path"]
+        external_parent_ids = parent_ids(conn, task_id)
+        entry_indices = [
+            idx for idx, child in enumerate(children)
+            if not (child.get("parents") or [])
+        ]
+        referenced_indices = {
+            parent_idx
+            for child in children
+            for parent_idx in (child.get("parents") or [])
+        }
+        exit_indices = [
+            idx for idx in range(len(children)) if idx not in referenced_indices
+        ]
 
         child_initial_status = "todo" if auto_promote else "scheduled"
         # Create children. In activation mode, status is 'todo' regardless
@@ -7544,11 +8552,29 @@ def decompose_triage_task(
                     {"parent": parent_id, "child": child_id},
                 )
 
-        # Link the ROOT task as a child of every leaf child — i.e. the
-        # root waits for the whole graph. Simpler than computing leaves:
-        # link root under every child. Cycle-free because the root is
-        # only ever a child here, never a parent of children.
-        for cid in child_ids:
+        # Preserve the shell's upstream boundary: generated entry tasks must
+        # satisfy the same external prerequisites before they can dispatch.
+        for entry_index in entry_indices:
+            entry_id = child_ids[entry_index]
+            for parent_id in external_parent_ids:
+                inserted = conn.execute(
+                    "INSERT OR IGNORE INTO task_links (parent_id, child_id) "
+                    "VALUES (?, ?)",
+                    (parent_id, entry_id),
+                ).rowcount
+                if inserted:
+                    _append_event(
+                        conn,
+                        entry_id,
+                        "linked",
+                        {"parent": parent_id, "child": entry_id},
+                    )
+
+        # Generated exits feed the stable shell. Existing shell->downstream
+        # edges are untouched, so foreground-authored graph identity survives
+        # fanout without making every internal child a redundant prerequisite.
+        for exit_index in exit_indices:
+            cid = child_ids[exit_index]
             conn.execute(
                 "INSERT OR IGNORE INTO task_links (parent_id, child_id) "
                 "VALUES (?, ?)",
@@ -7556,7 +8582,7 @@ def decompose_triage_task(
             )
 
         # Flip/park the root and optionally set the orchestrator assignee.
-        sets = ["status = ?"]
+        sets = ["status = ?", "needs_specification = 0"]
         params: list[Any] = [root_next_status]
         if root_assignee is not None:
             sets.append("assignee = ?")
@@ -7612,8 +8638,21 @@ def decompose_triage_task(
     return child_ids
 
 
-def archive_task(conn: sqlite3.Connection, task_id: str) -> bool:
+def archive_task(
+    conn: sqlite3.Connection,
+    task_id: str,
+    *,
+    allowed_statuses: Optional[set[str]] = None,
+) -> bool:
+    """Archive a task, optionally only while it remains safely mutable.
+
+    ``allowed_statuses`` is checked under the same write transaction as the
+    archive. Guarded callers also reject decomposed shells with unfinished
+    children. Passing no guard preserves the historical archive behavior.
+    """
+    mutable_statuses = _validate_allowed_child_statuses(allowed_statuses)
     with write_txn(conn):
+        _require_mutable_child_status(conn, task_id, mutable_statuses)
         cur = conn.execute(
             "UPDATE tasks SET status = 'archived', "
             "    claim_lock = NULL, claim_expires = NULL, worker_pid = NULL "

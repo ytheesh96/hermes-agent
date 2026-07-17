@@ -42,6 +42,7 @@ import math
 import os
 import sqlite3
 import time
+import uuid
 from dataclasses import asdict
 from pathlib import Path
 from typing import Any, Optional
@@ -308,6 +309,60 @@ def _loop_intake_state_for_task(conn: sqlite3.Connection, task_id: str) -> Optio
     return _loop_intake_states_for_tasks(conn, [task_id]).get(task_id)
 
 
+def _specification_failures_for_tasks(
+    conn: sqlite3.Connection,
+    task_ids: list[str],
+) -> dict[str, dict[str, Any]]:
+    """Return the current-revision decomposer failure for each task."""
+    if not task_ids:
+        return {}
+    placeholders = ",".join("?" for _ in task_ids)
+    rows = conn.execute(
+        f"""
+        SELECT * FROM (
+            SELECT e.*, ROW_NUMBER() OVER (
+                PARTITION BY e.task_id ORDER BY e.id DESC
+            ) AS rn
+            FROM task_events e
+            WHERE e.task_id IN ({placeholders})
+              AND e.kind IN ('specification_started', 'specification_failed')
+        ) ranked
+        WHERE rn = 1
+        """,
+        tuple(task_ids),
+    ).fetchall()
+    now = int(time.time())
+    failures: dict[str, dict[str, Any]] = {}
+    for row in rows:
+        if row["kind"] != "specification_failed":
+            continue
+        try:
+            payload = json.loads(row["payload"] or "{}")
+        except (TypeError, ValueError):
+            continue
+        if not isinstance(payload, dict):
+            continue
+        task_id = str(row["task_id"])
+        fingerprint = str(payload.get("fingerprint") or "")
+        if fingerprint and kanban_db.task_specification_fingerprint(conn, task_id) != fingerprint:
+            continue
+        retry_after = int(payload.get("retry_after") or 0)
+        failures[task_id] = {
+            "reason": str(payload.get("reason") or "Specification failed"),
+            "retry_after": retry_after,
+            "retry_after_seconds": int(payload.get("retry_after_seconds") or 0),
+            "backing_off": retry_after > now,
+        }
+    return failures
+
+
+def _specification_failure_for_task(
+    conn: sqlite3.Connection,
+    task_id: str,
+) -> Optional[dict[str, Any]]:
+    return _specification_failures_for_tasks(conn, [task_id]).get(task_id)
+
+
 def _loop_node_metadata_for_tasks(
     conn: sqlite3.Connection,
     task_ids: list[str],
@@ -355,6 +410,14 @@ def _task_dict_with_loop_intake(
     intake = _loop_intake_state_for_task(conn, task.id)
     if intake:
         item["loop_intake"] = intake
+    specification_failure = _specification_failure_for_task(conn, task.id)
+    if specification_failure:
+        item["specification_failure"] = specification_failure
+    active_decomposition_child_count = kanban_db.active_decomposition_child_count(
+        conn, task.id
+    )
+    if active_decomposition_child_count:
+        item["active_decomposition_child_count"] = active_decomposition_child_count
     metadata = _loop_node_metadata_for_task(conn, task.id)
     if metadata:
         item.update(metadata)
@@ -522,8 +585,8 @@ def _task_has_loop_intake_pending_submit(conn: sqlite3.Connection, task_id: str)
 
 def _loop_intake_required_reason(task_id: str) -> str:
     return (
-        f"Loop intake is still required for {task_id}; use Loop drawer Submit or an explicit "
-        "activation request to approve Loop planning."
+        f"Loop planning is still in progress for {task_id}; let the foreground agent "
+        "create the first live graph fragment."
     )
 
 
@@ -1386,6 +1449,10 @@ def get_session_source(
         diagnostics = _compute_task_diagnostics(conn, task_ids=task_ids) if task_ids else {}
 
         intake_states = _loop_intake_states_for_tasks(conn, task_ids)
+        specification_failures = _specification_failures_for_tasks(conn, task_ids)
+        active_decomposition_child_counts = (
+            kanban_db.active_decomposition_child_counts(conn, task_ids)
+        )
         loop_node_metadata = _loop_node_metadata_for_tasks(conn, task_ids)
         root_task_id = _session_source_root_task_id(conn, tasks, included_links)
         planning_nodes, planning_links, planning_revision = _loop_planning_projection(conn, root_task_id)
@@ -1402,6 +1469,11 @@ def get_session_source(
             item = _task_dict(task, latest_summary=summary_map.get(task.id))
             if task.id in intake_states:
                 item["loop_intake"] = intake_states[task.id]
+            if task.id in specification_failures:
+                item["specification_failure"] = specification_failures[task.id]
+            active_decomposition_child_count = active_decomposition_child_counts.get(task.id, 0)
+            if active_decomposition_child_count:
+                item["active_decomposition_child_count"] = active_decomposition_child_count
             if task.id in loop_node_metadata:
                 item.update(loop_node_metadata[task.id])
             if task.id in loop_handoffs:
@@ -1763,10 +1835,19 @@ class CreateLoopDraftBody(BaseModel):
     assignee: Optional[str] = "orchestrator"
     tenant: Optional[str] = None
     session_id: Optional[str] = None
+    root_task_id: Optional[str] = None
+    parents: list[str] = Field(default_factory=list)
+    child_ids: list[str] = Field(default_factory=list)
     priority: int = 0
     workspace_kind: str = "scratch"
     workspace_path: Optional[str] = None
     idempotency_key: Optional[str] = None
+
+
+@router.get("/capabilities")
+def kanban_capabilities():
+    """Advertise mutation contracts that older Desktop backends may not support."""
+    return {"live_loop_graph": True}
 
 
 def _draft_title(value: Optional[str]) -> str:
@@ -1780,12 +1861,22 @@ def _create_loop_draft_root(
     *,
     board: Optional[str],
 ) -> str:
-    """Create/upsert the real scheduled row that anchors a desktop Loop draft."""
+    """Create one live, title-only Loop node with its initial edges atomically."""
     title = _draft_title(payload.title)
     session_id = (payload.session_id or os.environ.get("HERMES_SESSION_ID") or "").strip() or None
     tenant = (payload.tenant or "").strip() or None
-    idempotency_key = (payload.idempotency_key or (f"loop-draft:{session_id}" if session_id else "")).strip() or None
     needs_intake = not (payload.body or "").strip()
+    root_task_id = (payload.root_task_id or "").strip() or None
+    default_idempotency = f"loop-draft:{session_id}" if session_id and root_task_id is None else ""
+    idempotency_key = (payload.idempotency_key or default_idempotency).strip() or None
+    parents = list(dict.fromkeys(str(task_id).strip() for task_id in payload.parents if str(task_id).strip()))
+    child_ids = list(dict.fromkeys(str(task_id).strip() for task_id in payload.child_ids if str(task_id).strip()))
+    if root_task_id and root_task_id in parents:
+        raise ValueError(
+            "the canonical Loop root is an aggregate sink and cannot be a prerequisite"
+        )
+    if root_task_id and not child_ids:
+        child_ids = [root_task_id]
 
     if payload.workspace_kind not in kanban_db.VALID_WORKSPACE_KINDS:
         raise ValueError(
@@ -1802,13 +1893,15 @@ def _create_loop_draft_root(
         ).fetchone()
         if row:
             task_id = str(row["id"])
-            marker = f"loop:{task_id}"
+            marker = f"loop:{root_task_id or task_id}"
             with kanban_db.write_txn(conn):
                 if row["created_by"] != marker:
                     conn.execute("UPDATE tasks SET created_by = ? WHERE id = ?", (marker, task_id))
                     kanban_db._append_event(conn, task_id, "edited", {"created_by": marker, "loop_root": True})
-                if needs_intake and not _loop_intake_state_for_task(conn, task_id):
-                    kanban_db._append_event(conn, task_id, _LOOP_INTAKE_EVENT_KIND, dict(_LOOP_INTAKE_DRAFT_PAYLOAD))
+                if root_task_id is None and needs_intake and not _loop_intake_state_for_task(conn, task_id):
+                    kanban_db._append_event(
+                        conn, task_id, _LOOP_INTAKE_EVENT_KIND, dict(_LOOP_INTAKE_DRAFT_PAYLOAD)
+                    )
             return task_id
 
     if payload.workspace_path is None and payload.workspace_kind in {"dir", "worktree"}:
@@ -1822,44 +1915,151 @@ def _create_loop_draft_root(
         task_id = kanban_db._new_task_id()
         try:
             with kanban_db.write_txn(conn):
+                relation_ids = [*parents, *child_ids]
+                missing = kanban_db._find_missing_parents(conn, relation_ids)
+                if missing:
+                    raise ValueError(f"unknown task(s): {', '.join(missing)}")
+                if root_task_id:
+                    root = kanban_db.get_task(conn, root_task_id)
+                    if root is None:
+                        raise ValueError(f"unknown Loop root: {root_task_id}")
+                    allowed = f"loop:{root_task_id}"
+                    if root.created_by != allowed:
+                        raise ValueError(
+                            f"task {root_task_id} is not a canonical Loop root"
+                        )
+                    for relation_id in relation_ids:
+                        relation = kanban_db.get_task(conn, relation_id)
+                        if relation and relation.id != root_task_id and relation.created_by != allowed:
+                            raise ValueError(
+                                f"task {relation_id} is not part of Loop root {root_task_id}"
+                            )
+
+                is_intake_root = root_task_id is None
+                effective_assignee = payload.assignee if is_intake_root else None
+                unfinished_parent = bool(parents) and conn.execute(
+                    "SELECT 1 FROM tasks WHERE id IN ("
+                    + ",".join("?" for _ in parents)
+                    + ") AND status NOT IN ('done', 'archived') LIMIT 1",
+                    tuple(parents),
+                ).fetchone() is not None
+                initial_status = "scheduled" if is_intake_root else ("todo" if unfinished_parent else "triage")
+                needs_specification = 0 if is_intake_root else 1
                 conn.execute(
                     """
                     INSERT INTO tasks (
                         id, title, body, assignee, status, priority,
                         created_by, created_at, workspace_kind, workspace_path,
                         branch_name, tenant, idempotency_key, max_runtime_seconds,
-                        skills, max_retries, goal_mode, goal_max_turns, session_id
-                    ) VALUES (?, ?, ?, ?, 'scheduled', ?, ?, ?, ?, ?, NULL, ?, ?, NULL, NULL, NULL, 0, NULL, ?)
+                        skills, max_retries, goal_mode, goal_max_turns, session_id,
+                        needs_specification
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, ?, ?, NULL, NULL, NULL, 0, NULL, ?, ?)
                     """,
                     (
                         task_id,
                         title,
                         payload.body,
-                        payload.assignee,
+                        effective_assignee,
+                        initial_status,
                         payload.priority,
-                        f"loop:{task_id}",
+                        f"loop:{root_task_id or task_id}",
                         now,
                         payload.workspace_kind,
                         payload.workspace_path,
                         tenant,
                         idempotency_key,
                         session_id,
+                        needs_specification,
                     ),
                 )
+                for parent_id in parents:
+                    conn.execute(
+                        "INSERT INTO task_links (parent_id, child_id) VALUES (?, ?)",
+                        (parent_id, task_id),
+                    )
+                    kanban_db._append_event(
+                        conn, task_id, "linked", {"parent": parent_id, "child": task_id}
+                    )
+                for child_id in child_ids:
+                    child = kanban_db.get_task(conn, child_id)
+                    if child is None:
+                        raise ValueError(f"unknown task: {child_id}")
+                    mutable_ready_root = (
+                        child_id == root_task_id
+                        and child.status == "ready"
+                        and child.assignee is None
+                    )
+                    active_compiled_shell = (
+                        kanban_db.task_has_active_decomposition_children(conn, child_id)
+                    )
+                    if (
+                        (
+                            child.status not in _LOOP_GRAPH_MUTABLE_STATUSES
+                            and not mutable_ready_root
+                        )
+                        or active_compiled_shell
+                    ):
+                        reason = (
+                            "decomposition children are still active"
+                            if active_compiled_shell
+                            else f"the task is {child.status}"
+                        )
+                        raise HTTPException(
+                            status_code=409,
+                            detail=(
+                                f"Loop dependencies for {child_id} are immutable because "
+                                f"{reason}; add a successor node instead"
+                            ),
+                        )
+                    if kanban_db._would_cycle(conn, task_id, child_id):
+                        raise ValueError(f"linking {task_id} -> {child_id} would create a cycle")
+                    conn.execute(
+                        "INSERT INTO task_links (parent_id, child_id) VALUES (?, ?)",
+                        (task_id, child_id),
+                    )
+                    if child_id == root_task_id:
+                        activated = conn.execute(
+                            "UPDATE tasks SET status = 'todo', assignee = NULL "
+                            "WHERE id = ? AND "
+                            "(status IN ('scheduled', 'ready', 'todo') OR "
+                            " (status = 'triage' AND needs_specification = 1))",
+                            (child_id,),
+                        ).rowcount
+                    else:
+                        activated = conn.execute(
+                            "UPDATE tasks SET status = 'todo' WHERE id = ? AND "
+                            "(status IN ('scheduled', 'ready') OR "
+                            " (status = 'triage' AND needs_specification = 1))",
+                            (child_id,),
+                        ).rowcount
+                    if activated and child_id == root_task_id and child.status == "scheduled":
+                        kanban_db._append_event(
+                            conn,
+                            child_id,
+                            "activated",
+                            {"reason": "live_loop_node_created"},
+                        )
+                    kanban_db._append_event(
+                        conn, child_id, "linked", {"parent": task_id, "child": child_id}
+                    )
                 kanban_db._append_event(
                     conn,
                     task_id,
                     "created",
                     {
-                        "assignee": payload.assignee,
-                        "status": "scheduled",
-                        "parents": [],
+                        "assignee": effective_assignee,
+                        "status": initial_status,
+                        "parents": parents,
                         "tenant": tenant,
-                        "loop_root": True,
+                        "loop_root": is_intake_root,
+                        "root_task_id": root_task_id or task_id,
+                        "needs_specification": bool(needs_specification),
                     },
                 )
-                if needs_intake:
-                    kanban_db._append_event(conn, task_id, _LOOP_INTAKE_EVENT_KIND, dict(_LOOP_INTAKE_DRAFT_PAYLOAD))
+                if is_intake_root and needs_intake:
+                    kanban_db._append_event(
+                        conn, task_id, _LOOP_INTAKE_EVENT_KIND, dict(_LOOP_INTAKE_DRAFT_PAYLOAD)
+                    )
             return task_id
         except sqlite3.IntegrityError:
             if attempt == 1:
@@ -1905,10 +2105,37 @@ def create_loop_draft(payload: CreateLoopDraftBody, board: Optional[str] = Query
     conn = _conn(board=board)
     try:
         task_id = _create_loop_draft_root(conn, payload, board=board)
+        subscribed = False
+        dispatch: Optional[dict[str, Any]] = None
+        warnings: list[str] = []
+        try:
+            from tools.kanban_notify import maybe_auto_subscribe
+
+            subscribed = maybe_auto_subscribe(conn, task_id)
+        except Exception as exc:
+            warnings.append(f"auto-subscribe failed: {type(exc).__name__}: {exc}")
+        if payload.root_task_id:
+            try:
+                dispatch_result = kanban_db.dispatch_once(
+                    conn,
+                    board=board,
+                    max_spawn=1,
+                )
+                dispatch = {
+                    "spawned": [task for task, _assignee, _workspace in dispatch_result.spawned],
+                }
+            except Exception as exc:
+                warnings.append(f"inline dispatch failed: {type(exc).__name__}: {exc}")
         task = kanban_db.get_task(conn, task_id)
         if task is None:
             raise HTTPException(status_code=500, detail=f"draft task {task_id} was not persisted")
-        return {"task": _task_dict_with_loop_intake(conn, task), "source": _loop_draft_source_payload(conn, task, board=board)}
+        return {
+            "task": _task_dict_with_loop_intake(conn, task),
+            "source": _loop_draft_source_payload(conn, task, board=board),
+            "subscribed": subscribed,
+            "dispatch": dispatch,
+            "warnings": warnings,
+        }
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e))
     finally:
@@ -1923,6 +2150,11 @@ class LoopCanvasPosition(BaseModel):
 
 class PutLoopCanvasPositionsBody(BaseModel):
     positions: list[LoopCanvasPosition] = Field(default_factory=list)
+
+
+class ArchiveLoopNodesBody(BaseModel):
+    task_ids: list[str] = Field(default_factory=list)
+    session_id: Optional[str] = None
 
 
 _LOOP_CANVAS_COORD_LIMIT = 1_000_000.0
@@ -2058,6 +2290,47 @@ def get_loop_canvas_positions(
         members = _require_loop_canvas_tasks(conn, root_task_id, [], session_id=session_id)
         _ensure_loop_canvas_positions_schema(conn)
         return _loop_canvas_positions_payload(conn, root_task_id, members)
+    finally:
+        conn.close()
+
+
+@router.post("/loop-canvas/{root_task_id}/archive-nodes")
+def archive_loop_nodes(
+    root_task_id: str,
+    payload: ArchiveLoopNodesBody,
+    board: Optional[str] = Query(None),
+):
+    """Atomically archive pending Loop nodes with in-transaction state guards."""
+    task_ids = list(
+        dict.fromkeys(str(task_id).strip() for task_id in payload.task_ids if str(task_id).strip())
+    )
+    if not task_ids:
+        raise HTTPException(status_code=400, detail="task_ids is required")
+    from hermes_cli import loop_graph
+
+    board = _resolve_board(board)
+    conn = _conn(board=board)
+    try:
+        _require_loop_canvas_tasks(
+            conn,
+            root_task_id,
+            task_ids,
+            session_id=payload.session_id,
+        )
+        revision = loop_graph.graph_revision(conn, root_task_id)
+        result = loop_graph.apply_patch(
+            conn,
+            root_task_id,
+            expected_revision=revision,
+            mutation_id=f"desktop-archive-{uuid.uuid4().hex}",
+            operations=[
+                {"op": "archive_node", "task_id": task_id}
+                for task_id in task_ids
+            ],
+        )
+        return result
+    except loop_graph.LoopError as exc:
+        raise HTTPException(status_code=409, detail=exc.message)
     finally:
         conn.close()
 
@@ -2775,6 +3048,80 @@ class LinkBody(BaseModel):
     session_id: Optional[str] = None
 
 
+_LOOP_GRAPH_MUTABLE_STATUSES = frozenset({"triage", "scheduled", "todo"})
+
+
+def _is_canonical_loop_root(task: kanban_db.Task) -> bool:
+    return task.created_by == f"loop:{task.id}"
+
+
+def _require_loop_graph_ownership(
+    conn: sqlite3.Connection,
+    root_task_id: str,
+    task_ids: list[str],
+) -> kanban_db.Task:
+    """Require every scoped mutation endpoint to stay inside one Loop root."""
+    root = _require_loop_canvas_root(conn, root_task_id)
+    if not _is_canonical_loop_root(root):
+        raise HTTPException(
+            status_code=400,
+            detail=f"task {root_task_id} is not a canonical Loop root",
+        )
+    marker = f"loop:{root_task_id}"
+    outside: list[str] = []
+    for task_id in dict.fromkeys(task_ids):
+        task = kanban_db.get_task(conn, task_id)
+        if task is None:
+            raise HTTPException(status_code=404, detail=f"task {task_id} not found")
+        if task.created_by != marker:
+            outside.append(task_id)
+    if outside:
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                f"task(s) not owned by Loop root {root_task_id}: "
+                + ", ".join(outside)
+            ),
+        )
+    return root
+
+
+def _loop_graph_allowed_child_statuses(
+    conn: sqlite3.Connection,
+    child_id: str,
+    *,
+    root_task_id: str,
+) -> set[str]:
+    child = kanban_db.get_task(conn, child_id)
+    if child is None:
+        raise HTTPException(status_code=404, detail=f"task {child_id} not found")
+    mutable_ready_root = (
+        child.id == root_task_id
+        and _is_canonical_loop_root(child)
+        and child.status == "ready"
+        and child.assignee is None
+    )
+    if mutable_ready_root:
+        return {*_LOOP_GRAPH_MUTABLE_STATUSES, "ready"}
+    if child.status not in _LOOP_GRAPH_MUTABLE_STATUSES:
+        raise HTTPException(
+            status_code=409,
+            detail=(
+                f"Loop dependencies are immutable once {child_id} is {child.status}; "
+                "add or rewire a pending task instead"
+            ),
+        )
+    if kanban_db.task_has_active_decomposition_children(conn, child_id):
+        raise HTTPException(
+            status_code=409,
+            detail=(
+                f"Loop dependencies are immutable while decomposition children "
+                f"for {child_id} are still active"
+            ),
+        )
+    return set(_LOOP_GRAPH_MUTABLE_STATUSES)
+
+
 @router.post("/links")
 def add_link(payload: LinkBody, board: Optional[str] = Query(None)):
     board = _resolve_board(board)
@@ -2782,15 +3129,39 @@ def add_link(payload: LinkBody, board: Optional[str] = Query(None)):
     try:
         if payload.session_id and not payload.root_task_id:
             raise HTTPException(status_code=400, detail="root_task_id is required with session_id")
+        allowed_child_statuses = None
         if payload.root_task_id:
-            _require_loop_canvas_tasks(
+            if payload.parent_id == payload.root_task_id:
+                raise HTTPException(
+                    status_code=400,
+                    detail="the canonical Loop root is an aggregate sink and cannot be a prerequisite",
+                )
+            _require_loop_graph_ownership(
                 conn,
                 payload.root_task_id,
                 [payload.parent_id, payload.child_id],
-                session_id=payload.session_id,
             )
-        kanban_db.link_tasks(conn, payload.parent_id, payload.child_id)
+            allowed_child_statuses = _loop_graph_allowed_child_statuses(
+                conn,
+                payload.child_id,
+                root_task_id=payload.root_task_id,
+            )
+        else:
+            parent = kanban_db.get_task(conn, payload.parent_id)
+            if parent is not None and _is_canonical_loop_root(parent):
+                raise HTTPException(
+                    status_code=400,
+                    detail="the canonical Loop root is an aggregate sink and cannot be a prerequisite",
+                )
+        kanban_db.link_tasks(
+            conn,
+            payload.parent_id,
+            payload.child_id,
+            allowed_child_statuses=allowed_child_statuses,
+        )
         return {"ok": True}
+    except kanban_db.TaskStatusConflictError as e:
+        raise HTTPException(status_code=409, detail=str(e))
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e))
     finally:
@@ -2801,13 +3172,36 @@ def add_link(payload: LinkBody, board: Optional[str] = Query(None)):
 def delete_link(
     parent_id: str = Query(...),
     child_id: str = Query(...),
+    root_task_id: Optional[str] = Query(None),
+    session_id: Optional[str] = Query(None),
     board: Optional[str] = Query(None),
 ):
     board = _resolve_board(board)
     conn = _conn(board=board)
     try:
-        ok = kanban_db.unlink_tasks(conn, parent_id, child_id)
+        if session_id and not root_task_id:
+            raise HTTPException(status_code=400, detail="root_task_id is required with session_id")
+        allowed_child_statuses = None
+        if root_task_id:
+            _require_loop_graph_ownership(
+                conn,
+                root_task_id,
+                [parent_id, child_id],
+            )
+            allowed_child_statuses = _loop_graph_allowed_child_statuses(
+                conn,
+                child_id,
+                root_task_id=root_task_id,
+            )
+        ok = kanban_db.unlink_tasks(
+            conn,
+            parent_id,
+            child_id,
+            allowed_child_statuses=allowed_child_statuses,
+        )
         return {"ok": bool(ok)}
+    except kanban_db.TaskStatusConflictError as e:
+        raise HTTPException(status_code=409, detail=str(e))
     finally:
         conn.close()
 

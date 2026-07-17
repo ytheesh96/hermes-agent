@@ -90,6 +90,9 @@ Rules:
     instructions in the relevant child body. The origin/orchestrator can
     delegate durable Loop subtasks when uncertainty actually blocks safe
     progress.
+  - When live Loop graph context is present, treat completed prerequisite
+    summaries as input and keep this task distinct from its named downstream
+    work. Do not recreate work already represented by adjacent graph nodes.
   - Pick assignees from the roster by matching the task to the profile's
     DESCRIPTION (not just the name). When nothing matches well, use null
     and the system will route to the default_assignee.
@@ -119,6 +122,7 @@ _USER_TEMPLATE = """Task id: {task_id}
 Title: {title}
 Body:
 {body}
+{graph_context}
 
 Available profiles (assignees you may pick from):
 {roster}
@@ -130,6 +134,8 @@ Default assignee (used when no profile fits a task): {default_assignee}
 _FENCE_RE = re.compile(r"^```(?:json)?\s*|\s*```$", re.MULTILINE)
 _DEFAULT_MAX_TOKENS = 4000
 _RETRY_MAX_TOKENS = 12000
+_DEFAULT_SPECIFICATION_RETRY_SECONDS = 60
+_DEFAULT_SPECIFICATION_LEASE_SECONDS = 300
 
 
 @dataclass
@@ -225,6 +231,39 @@ def _load_config() -> dict:
         return {}
 
 
+def _loop_seconds(cfg: dict, key: str, default: int, maximum: int) -> int:
+    loop_cfg = cfg.get("loop", {}) if isinstance(cfg, dict) else {}
+    try:
+        value = int(loop_cfg.get(key, default))
+    except (AttributeError, TypeError, ValueError):
+        value = default
+    return max(1, min(value, maximum))
+
+
+def _failure_outcome(
+    task_id: str,
+    reason: str,
+    *,
+    retry_after_seconds: int,
+    author: str,
+    expected_fingerprint: Optional[str] = None,
+) -> DecomposeOutcome:
+    """Persist a failed compiler attempt and leave the task untouched."""
+    try:
+        with kb.connect_closing() as conn:
+            kb.record_specification_failure(
+                conn,
+                task_id,
+                reason=reason,
+                retry_after_seconds=retry_after_seconds,
+                author=author,
+                expected_fingerprint=expected_fingerprint,
+            )
+    except Exception:
+        logger.exception("decompose: could not persist specification failure for %s", task_id)
+    return DecomposeOutcome(task_id, False, reason)
+
+
 def _resolve_orchestrator_profile(cfg: dict) -> str:
     """Resolve which profile owns the root/orchestration task after fan-out.
 
@@ -316,6 +355,46 @@ def _normalize_assignee_choice(
     return chosen
 
 
+def _live_graph_context(conn: Any, task: Any, root_task_id: str | None) -> str:
+    """Render only the nearby durable graph facts needed to compile a skeleton."""
+    lines: list[str] = []
+    if root_task_id and root_task_id != task.id:
+        root = kb.get_task(conn, root_task_id)
+        if root:
+            lines.extend(
+                [
+                    "Loop root request:",
+                    f"- {root.title}",
+                    *([_truncate(root.body.strip(), 2000)] if root.body and root.body.strip() else []),
+                ]
+            )
+
+    parent_rows = conn.execute(
+        "SELECT p.id, p.title, p.status, p.result FROM tasks p "
+        "JOIN task_links l ON l.parent_id = p.id WHERE l.child_id = ? "
+        "ORDER BY p.created_at, p.id",
+        (task.id,),
+    ).fetchall()
+    if parent_rows:
+        lines.append("Direct prerequisites:")
+        for parent in parent_rows:
+            summary = kb.latest_summary(conn, parent["id"]) or parent["result"]
+            detail = f" — result: {_truncate(str(summary).strip(), 1200)}" if summary else ""
+            lines.append(f"- [{parent['status']}] {parent['title']}{detail}")
+
+    child_rows = conn.execute(
+        "SELECT c.title, c.status FROM tasks c "
+        "JOIN task_links l ON l.child_id = c.id WHERE l.parent_id = ? "
+        "ORDER BY c.created_at, c.id",
+        (task.id,),
+    ).fetchall()
+    if child_rows:
+        lines.append("Immediate downstream work (avoid overlapping its scope):")
+        lines.extend(f"- [{child['status']}] {child['title']}" for child in child_rows)
+
+    return "\nLive Loop graph context:\n" + "\n".join(lines) if lines else ""
+
+
 _LOOP_SAFE_STATUSES = {"triage", "scheduled"}
 _LOOP_INTAKE_EVENT_KIND = "loop_intake_state"
 
@@ -397,11 +476,62 @@ def decompose_task(
         )
 
     cfg = _load_config()
+    retry_after_seconds = _loop_seconds(
+        cfg,
+        "specification_retry_seconds",
+        _DEFAULT_SPECIFICATION_RETRY_SECONDS,
+        3600,
+    )
+    lease_seconds = _loop_seconds(
+        cfg,
+        "specification_lease_seconds",
+        _DEFAULT_SPECIFICATION_LEASE_SECONDS,
+        3600,
+    )
+    audit_author = author or _profile_author()
     orchestrator = _resolve_orchestrator_profile(cfg)
     default_assignee = _resolve_default_assignee(cfg)
     kanban_cfg = cfg.get("kanban", {}) if isinstance(cfg, dict) else {}
     auto_promote = False if loop_safe else bool(kanban_cfg.get("auto_promote_children", True))
     roster, valid_names = _build_roster()
+
+    # Acquire a durable attempt lease immediately before any external work.
+    # The returned fingerprint is the CAS token used by both apply paths.
+    with kb.connect_closing() as conn:
+        specification_fingerprint = kb.begin_specification_attempt(
+            conn,
+            task_id,
+            lease_seconds=lease_seconds,
+            allowed_statuses=_LOOP_SAFE_STATUSES if loop_safe else None,
+            author=audit_author,
+        )
+        if specification_fingerprint is not None:
+            task = kb.get_task(conn, task_id)
+            loop_root_id = kb._loop_root_for_task(conn, task_id)
+            graph_context = (
+                _live_graph_context(conn, task, loop_root_id)
+                if task is not None and bool(getattr(task, "needs_specification", False))
+                else ""
+            )
+    if specification_fingerprint is None or task is None:
+        return DecomposeOutcome(
+            task_id,
+            False,
+            "specification attempt deferred (task changed, leased, or backing off)",
+        )
+    is_live_loop_skeleton = bool(
+        task.needs_specification
+        and str(task.created_by or "").startswith("loop:")
+    )
+
+    def failed(reason: str) -> DecomposeOutcome:
+        return _failure_outcome(
+            task_id,
+            reason,
+            retry_after_seconds=retry_after_seconds,
+            author=audit_author,
+            expected_fingerprint=specification_fingerprint,
+        )
 
     try:
         from agent.auxiliary_client import (  # type: ignore
@@ -410,21 +540,22 @@ def decompose_task(
         )
     except Exception as exc:
         logger.debug("decompose: auxiliary client import failed: %s", exc)
-        return DecomposeOutcome(task_id, False, "auxiliary client unavailable")
+        return failed("auxiliary client unavailable")
 
     try:
         client, model = get_text_auxiliary_client("kanban_decomposer")
     except Exception as exc:
         logger.debug("decompose: get_text_auxiliary_client failed: %s", exc)
-        return DecomposeOutcome(task_id, False, "auxiliary client unavailable")
+        return failed("auxiliary client unavailable")
 
     if client is None or not model:
-        return DecomposeOutcome(task_id, False, "no auxiliary client configured")
+        return failed("no auxiliary client configured")
 
     user_msg = _USER_TEMPLATE.format(
         task_id=task.id,
         title=_truncate(task.title or "", 400),
         body=_truncate(task.body or "(no body)", 4000),
+        graph_context=graph_context,
         roster=_format_roster(roster),
         default_assignee=default_assignee,
     )
@@ -448,7 +579,7 @@ def decompose_task(
             logger.info(
                 "decompose: API call failed for %s (%s)", task_id, exc,
             )
-            return DecomposeOutcome(task_id, False, f"LLM error: {type(exc).__name__}")
+            return failed(f"LLM error: {type(exc).__name__}")
 
         raw, finish_reason = _response_content_and_finish_reason(resp)
         parsed = _extract_json_blob(raw)
@@ -466,15 +597,10 @@ def decompose_task(
 
     if parsed is None:
         if finish_reason == "length" or not raw.strip():
-            return DecomposeOutcome(
-                task_id,
-                False,
-                "LLM returned empty/truncated output before JSON",
-            )
-        return DecomposeOutcome(task_id, False, "LLM returned malformed JSON")
+            return failed("LLM returned empty/truncated output before JSON")
+        return failed("LLM returned malformed JSON")
 
     fanout = bool(parsed.get("fanout"))
-    audit_author = author or _profile_author()
 
     if not fanout:
         # Fall back to single-task spec promotion (same effect as specify).
@@ -482,6 +608,11 @@ def decompose_task(
         new_body = parsed.get("body")
         title_val = new_title.strip() if isinstance(new_title, str) and new_title.strip() else None
         body_val = new_body if isinstance(new_body, str) and new_body.strip() else None
+        # A live Loop skeleton is the foreground-authored graph node. The
+        # decomposer may enrich its body and routing, but renaming the durable
+        # shell would break the foreground's stable graph identity. Legacy
+        # triage cards retain the historical title-tightening behavior.
+        applied_title = task.title if is_live_loop_skeleton else title_val
         assignee_val = None
         if not task.assignee:
             assignee_val = _normalize_assignee_choice(
@@ -489,15 +620,17 @@ def decompose_task(
                 default_assignee=default_assignee,
                 valid_names=valid_names,
             )
-        if title_val is None and body_val is None:
-            return DecomposeOutcome(
-                task_id, False, "decomposer returned fanout=false with no title/body",
+        if is_live_loop_skeleton and body_val is None:
+            return failed(
+                "live skeleton specification requires a nonempty worker-ready body"
             )
+        if title_val is None and body_val is None:
+            return failed("decomposer returned fanout=false with no title/body")
         with kb.connect_closing() as conn:
             ok = kb.specify_triage_task(
                 conn,
                 task_id,
-                title=title_val,
+                title=applied_title,
                 body=body_val,
                 assignee=assignee_val,
                 author=audit_author,
@@ -509,20 +642,25 @@ def decompose_task(
                     if loop_safe
                     else None
                 ),
+                expected_specification_fingerprint=specification_fingerprint,
             )
         if not ok:
             reason = "task moved out of Loop planning before promotion" if loop_safe else "task moved out of triage before promotion"
-            return DecomposeOutcome(task_id, False, reason)
+            return failed(f"stale decomposer output rejected: {reason}")
         outcome = DecomposeOutcome(
             task_id, True, "single task (no fanout)",
-            fanout=False, new_title=title_val,
+            fanout=False, new_title=applied_title,
         )
         return outcome
 
     raw_tasks = parsed.get("tasks") or []
     if not isinstance(raw_tasks, list) or not raw_tasks:
-        return DecomposeOutcome(
-            task_id, False, "decomposer returned fanout=true with empty tasks list",
+        return failed("decomposer returned fanout=true with empty tasks list")
+    max_graph_nodes = _loop_seconds(cfg, "max_graph_nodes", 32, 1000)
+    if len(raw_tasks) > max_graph_nodes:
+        return failed(
+            f"decomposer returned {len(raw_tasks)} tasks; maximum is "
+            f"{max_graph_nodes} (loop.max_graph_nodes)"
         )
 
     # Rewrite invalid assignees to the default fallback. Never leave a
@@ -530,15 +668,17 @@ def decompose_task(
     children: list[dict] = []
     for idx, entry in enumerate(raw_tasks):
         if not isinstance(entry, dict):
-            return DecomposeOutcome(
-                task_id, False, f"tasks[{idx}] is not an object",
-            )
+            return failed(f"tasks[{idx}] is not an object")
         title = entry.get("title")
         if not isinstance(title, str) or not title.strip():
-            return DecomposeOutcome(
-                task_id, False, f"tasks[{idx}].title is missing or empty",
-            )
+            return failed(f"tasks[{idx}].title is missing or empty")
         body = entry.get("body")
+        if is_live_loop_skeleton and (
+            not isinstance(body, str) or not body.strip()
+        ):
+            return failed(
+                f"tasks[{idx}].body must be a nonempty worker-ready specification"
+            )
         if not isinstance(body, str):
             body = ""
         assignee = entry.get("assignee")
@@ -557,11 +697,32 @@ def decompose_task(
                 "routing to default_assignee %r",
                 task_id, idx, assignee, default_assignee,
             )
-        parents = entry.get("parents") or []
-        if not isinstance(parents, list):
-            parents = []
-        # Clean parent indices: drop non-int and out-of-range.
-        clean_parents = [p for p in parents if isinstance(p, int) and 0 <= p < len(raw_tasks) and p != idx]
+        parents = entry.get("parents")
+        if is_live_loop_skeleton:
+            if not isinstance(parents, list):
+                return failed(f"tasks[{idx}].parents must be a list")
+            for parent_index, parent in enumerate(parents):
+                if not isinstance(parent, int) or isinstance(parent, bool):
+                    return failed(
+                        f"tasks[{idx}].parents[{parent_index}] must be an integer index"
+                    )
+                if parent < 0 or parent >= len(raw_tasks) or parent == idx:
+                    return failed(
+                        f"tasks[{idx}].parents[{parent_index}] is not a valid dependency index"
+                    )
+            clean_parents = list(dict.fromkeys(parents))
+        else:
+            if not isinstance(parents, list):
+                parents = []
+            # Preserve historical leniency for ordinary manually-triaged cards.
+            clean_parents = [
+                parent
+                for parent in parents
+                if isinstance(parent, int)
+                and not isinstance(parent, bool)
+                and 0 <= parent < len(raw_tasks)
+                and parent != idx
+            ]
         children.append({
             "title": title.strip()[:200],
             "body": body.strip(),
@@ -585,16 +746,17 @@ def decompose_task(
                     if loop_safe
                     else None
                 ),
+                expected_specification_fingerprint=specification_fingerprint,
             )
     except ValueError as exc:
-        return DecomposeOutcome(task_id, False, f"DB rejected graph: {exc}")
+        return failed(f"DB rejected graph: {exc}")
     except Exception as exc:
         logger.exception("decompose: DB error on task %s", task_id)
-        return DecomposeOutcome(task_id, False, f"DB error: {type(exc).__name__}")
+        return failed(f"DB error: {type(exc).__name__}")
 
     if child_ids is None:
         reason = "task moved out of Loop planning before decomposition" if loop_safe else "task moved out of triage before decomposition"
-        return DecomposeOutcome(task_id, False, reason)
+        return failed(f"stale decomposer output rejected: {reason}")
 
     outcome = DecomposeOutcome(
         task_id, True, f"decomposed into {len(child_ids)} children",
@@ -604,7 +766,7 @@ def decompose_task(
 
 
 def list_triage_ids(*, tenant: Optional[str] = None) -> list[str]:
-    """Return task ids currently in the triage column."""
+    """Return triage tasks that are not leased or in retry backoff."""
     with kb.connect_closing() as conn:
         rows = kb.list_tasks(
             conn,
@@ -612,4 +774,4 @@ def list_triage_ids(*, tenant: Optional[str] = None) -> list[str]:
             tenant=tenant,
             limit=1000,
         )
-    return [row.id for row in rows]
+        return [row.id for row in rows if kb.specification_retry_eligible(conn, row.id)]

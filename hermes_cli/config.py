@@ -2232,6 +2232,16 @@ DEFAULT_CONFIG = {
         "provider": "",
     },
 
+    # Live Loop graph construction.  This is a durable graph bound, separate
+    # from delegation.max_concurrent_children (which limits ephemeral agents).
+    "loop": {
+        "max_graph_nodes": 32,
+        # Durable JIT-specification retry/lease windows. The lease prevents two
+        # watchers compiling the same skeleton; failures back off before retry.
+        "specification_retry_seconds": 60,
+        "specification_lease_seconds": 300,
+    },
+
     # Subagent delegation — override the provider:model used by delegate_task
     # so child agents can run on a different (cheaper/faster) provider and model.
     # Uses the same runtime provider resolution as CLI/gateway startup, so all

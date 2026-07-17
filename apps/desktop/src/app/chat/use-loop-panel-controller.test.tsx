@@ -11,9 +11,10 @@ import { useLoopPanelController } from './use-loop-panel-controller'
 
 const hermesMocks = vi.hoisted(() => ({
   addLoopTaskComment: vi.fn(),
-  activateLoopTask: vi.fn(),
+  archiveLoopNodes: vi.fn(),
   createLoopDraftTask: vi.fn(),
   getLoopCanvasPositions: vi.fn(),
+  getKanbanCapabilities: vi.fn(),
   getLoopSessionSource: vi.fn(),
   getLoopTaskDetail: vi.fn(),
   linkLoopTasks: vi.fn(),
@@ -47,17 +48,36 @@ function demoLoopSource() {
     tasks: [
       {
         assignee: 'orchestrator',
-        children: ['Loop draft'],
         id: 'LIVE DISPOSABLE DEMO',
+        included_child_ids: ['Loop draft', 'Running child', 'Done child'],
         status: 'scheduled',
         title: 'LIVE DISPOSABLE DEMO DATA'
       },
       {
         assignee: 'orchestrator',
         id: 'Loop draft',
-        parents: ['LIVE DISPOSABLE DEMO'],
+        included_parent_ids: ['LIVE DISPOSABLE DEMO', 'Completed parent'],
         status: 'scheduled',
         title: 'Loop draft'
+      },
+      {
+        id: 'Completed parent',
+        included_child_ids: ['Loop draft'],
+        status: 'done',
+        title: 'Completed parent'
+      },
+      {
+        active_decomposition_child_count: 1,
+        id: 'Running child',
+        included_parent_ids: ['LIVE DISPOSABLE DEMO'],
+        status: 'running',
+        title: 'Running child'
+      },
+      {
+        id: 'Done child',
+        included_parent_ids: ['LIVE DISPOSABLE DEMO'],
+        status: 'done',
+        title: 'Done child'
       }
     ]
   }
@@ -76,6 +96,11 @@ function renderControllerHarness({ gatewayOpen = false }: { gatewayOpen?: boolea
       onAddContextRef: vi.fn()
     })
 
+    const runningRow = controller.state?.rows.find(row => row.taskId === 'Running child')
+    const doneRow = controller.state?.rows.find(row => row.taskId === 'Done child')
+    const pendingRow = controller.state?.rows.find(row => row.taskId === 'Loop draft')
+    const rootRow = controller.state?.rows.find(row => row.taskId === 'LIVE DISPOSABLE DEMO')
+
     return (
       <>
         <button onClick={() => controller.onSelectTaskId('t_root')} type="button">
@@ -84,8 +109,20 @@ function renderControllerHarness({ gatewayOpen = false }: { gatewayOpen?: boolea
         <button onClick={() => controller.onOpen()} type="button">
           Open Loop canvas
         </button>
-        <button onClick={() => void controller.onCreateTask('Fix flaky auth test', 'peacock')} type="button">
-          Create Loop task
+        <button onClick={() => void controller.onCreateTask('Initial Loop task')} type="button">
+          Create initial Loop task
+        </button>
+        <button
+          onClick={() =>
+            void controller.onCreateTask('Fix flaky auth test', {
+              childId: 't_after',
+              parentId: 't_before',
+              rootTaskId: 'LIVE DISPOSABLE DEMO'
+            })
+          }
+          type="button"
+        >
+          Create linked Loop task
         </button>
         <button onClick={() => void controller.onSavePositions([{ taskId: 't_root', x: 120, y: 80 }])} type="button">
           Save Loop positions
@@ -96,11 +133,38 @@ function renderControllerHarness({ gatewayOpen = false }: { gatewayOpen?: boolea
         >
           Save new Loop root position
         </button>
-        <button onClick={() => void controller.onLinkTasks('t_parent', 't_child')} type="button">
+        <button onClick={() => void controller.onLinkTasks('Completed parent', 'Loop draft')} type="button">
           Connect Loop tasks
         </button>
-        <button onClick={() => void controller.onUnlinkTasks('t_parent', 't_child')} type="button">
+        <button onClick={() => void controller.onUnlinkTasks('Completed parent', 'Loop draft')} type="button">
           Delete Loop dependency
+        </button>
+        <button onClick={() => void controller.onLinkTasks('Completed parent', 'Running child')} type="button">
+          Connect running child
+        </button>
+        <button onClick={() => void controller.onUnlinkTasks('Completed parent', 'Done child')} type="button">
+          Delete done child dependency
+        </button>
+        <button onClick={() => void controller.onLinkTasks('LIVE DISPOSABLE DEMO', 'Loop draft')} type="button">
+          Connect from Loop root
+        </button>
+        <button onClick={() => void controller.onUnlinkTasks('LIVE DISPOSABLE DEMO', 'Loop draft')} type="button">
+          Delete legacy root dependency
+        </button>
+        <button onClick={() => void controller.onLinkTasks('Running child', 'Loop draft')} type="button">
+          Connect from compiled shell
+        </button>
+        <button onClick={() => runningRow && controller.onTaskAction('archive', runningRow)} type="button">
+          Archive running child
+        </button>
+        <button onClick={() => doneRow && controller.onTaskAction('archive', doneRow)} type="button">
+          Archive done child
+        </button>
+        <button onClick={() => pendingRow && controller.onTaskAction('archive', pendingRow)} type="button">
+          Archive pending child
+        </button>
+        <button onClick={() => rootRow && controller.onTaskAction('block', rootRow)} type="button">
+          Block Loop root
         </button>
         <button
           onClick={() =>
@@ -141,57 +205,6 @@ function renderControllerHarness({ gatewayOpen = false }: { gatewayOpen?: boolea
           type="button"
         >
           Open new Loop root
-        </button>
-        <button
-          onClick={() =>
-            controller.onTaskAction('triage', {
-              active: true,
-              childCount: 0,
-              children: [],
-              commentCount: 0,
-              depth: 0,
-              loopIntake: {
-                dispatchable: false,
-                needed: true,
-                source: 'slash_loop_draft',
-                state: 'drafted'
-              },
-              parentCount: 0,
-              parents: [],
-              status: 'scheduled',
-              taskId: 't_intake',
-              title: 'Rough Loop task'
-            })
-          }
-          type="button"
-        >
-          Triage Loop task
-        </button>
-        <button
-          onClick={() =>
-            controller.onTaskAction('submit', {
-              active: false,
-              body: '**Objective**\n\nValidate the staged Loop workflow.',
-              childCount: 0,
-              children: [],
-              commentCount: 0,
-              depth: 0,
-              loopIntake: {
-                dispatchable: false,
-                needed: true,
-                source: 'slash_loop_draft',
-                state: 'planned'
-              },
-              parentCount: 0,
-              parents: [],
-              status: 'scheduled',
-              taskId: 't_intake',
-              title: 'Specified Loop task'
-            })
-          }
-          type="button"
-        >
-          Submit Loop task
         </button>
         <button
           onClick={() =>
@@ -239,6 +252,8 @@ describe('useLoopPanelController', () => {
       positions: [{ taskId: 'LIVE DISPOSABLE DEMO', updatedAt: 42, x: 100, y: 200 }],
       rootTaskId: 'LIVE DISPOSABLE DEMO'
     })
+    hermesMocks.getKanbanCapabilities.mockResolvedValue({ live_loop_graph: true })
+    hermesMocks.archiveLoopNodes.mockResolvedValue({ archived: ['Loop draft'], ok: true })
     hermesMocks.linkLoopTasks.mockResolvedValue({ ok: true })
     hermesMocks.unlinkLoopTasks.mockResolvedValue({ ok: true })
     hermesMocks.saveLoopCanvasPositions.mockImplementation(async (rootTaskId: string, positions: unknown[]) => ({
@@ -326,39 +341,41 @@ describe('useLoopPanelController', () => {
     expect($paneStates.get()[PREVIEW_PANE_ID]?.open).toBe(true)
   })
 
-  it('submits the foreground Triage skill with the source board', async () => {
+  it('starts foreground Triage automatically after creating the initial Loop root', async () => {
     const submissions: Array<{ target: string; text: string }> = []
     const unsubscribe = onComposerSubmitRequest(detail => submissions.push(detail))
+    hermesMocks.createLoopDraftTask.mockResolvedValue({
+      source: {
+        board: 'default',
+        root_task_id: 't_initial',
+        session_id: 'session-1',
+        tasks: [{ id: 't_initial', status: 'scheduled', title: 'Initial Loop task' }]
+      },
+      task: { id: 't_initial', status: 'scheduled', title: 'Initial Loop task' }
+    })
 
-    renderControllerHarness({ gatewayOpen: true })
-    await waitFor(() => expect(screen.getByTestId('loop-root').textContent).toBe('LIVE DISPOSABLE DEMO'))
-    fireEvent.click(screen.getByRole('button', { name: /triage loop task/i }))
+    renderControllerHarness()
+    fireEvent.click(screen.getByRole('button', { name: /create initial loop task/i }))
 
     await waitFor(() => expect(submissions).toHaveLength(1))
     expect(submissions[0]).toEqual({
       target: 'main',
-      text: '/loop-triage Triage Loop root t_intake on Kanban board default: Rough Loop task'
+      text: '/loop-triage Triage Loop root t_initial on Kanban board default: Initial Loop task'
     })
+    expect(hermesMocks.createLoopDraftTask).toHaveBeenCalledWith(expect.objectContaining({ assignee: null }))
+    expect(hermesMocks.createLoopDraftTask).toHaveBeenCalledWith(
+      expect.not.objectContaining({
+        childIds: expect.anything(),
+        parents: expect.anything(),
+        rootTaskId: expect.anything()
+      })
+    )
+    expect(hermesMocks.getKanbanCapabilities).not.toHaveBeenCalled()
 
     unsubscribe()
   })
 
-  it('submits by activating the existing plan without decomposing again', async () => {
-    hermesMocks.activateLoopTask.mockResolvedValue({
-      activated_ids: ['t_intake'],
-      ok: true,
-      task_id: 't_intake'
-    })
-
-    renderControllerHarness({ gatewayOpen: true })
-    await waitFor(() => expect(screen.getByTestId('loop-root').textContent).toBe('LIVE DISPOSABLE DEMO'))
-    fireEvent.click(screen.getByRole('button', { name: /submit loop task/i }))
-
-    await waitFor(() => expect(hermesMocks.activateLoopTask).toHaveBeenCalledTimes(1))
-    expect(hermesMocks.activateLoopTask).toHaveBeenCalledWith('t_intake', 'default', { board: 'default' })
-  })
-
-  it('creates a title-only task through the draft API and opens the persisted row', async () => {
+  it('creates a title-only task with its root and initial graph edges in one request', async () => {
     hermesMocks.createLoopDraftTask.mockResolvedValue({
       source: {
         board: 'default',
@@ -383,23 +400,51 @@ describe('useLoopPanelController', () => {
       }
     })
 
-    renderControllerHarness()
-    fireEvent.click(screen.getByRole('button', { name: /create loop task/i }))
+    renderControllerHarness({ gatewayOpen: true })
+    await waitFor(() => expect(screen.getByTestId('loop-root').textContent).toBe('LIVE DISPOSABLE DEMO'))
+    fireEvent.click(screen.getByRole('button', { name: /create linked loop task/i }))
 
     await waitFor(() =>
       expect(hermesMocks.createLoopDraftTask).toHaveBeenCalledWith(
         expect.objectContaining({
-          assignee: 'peacock',
+          childIds: ['t_after'],
           idempotencyKey: expect.stringMatching(/^loop-draft:session-1:/),
+          parents: ['t_before'],
+          rootTaskId: 'LIVE DISPOSABLE DEMO',
           sessionId: 'session-1',
           title: 'Fix flaky auth test'
         })
       )
     )
-    await waitFor(() => expect(screen.getByTestId('loop-selected').textContent).toBe('t_created'))
-    expect(screen.getByTestId('loop-root').textContent).toBe('t_created')
-    expect(screen.getByTestId('loop-open').textContent).toBe('true')
+    expect(hermesMocks.getKanbanCapabilities).toHaveBeenCalledTimes(1)
+    expect(screen.getByTestId('loop-root').textContent).toBe('LIVE DISPOSABLE DEMO')
+    expect(screen.getByTestId('loop-selected').textContent).toBe('')
   })
+
+  it.each(['missing capability route', 'unsupported capability'])(
+    '%s blocks live-node creation before POST',
+    async mode => {
+      if (mode === 'missing capability route') {
+        hermesMocks.getKanbanCapabilities.mockRejectedValueOnce(new Error('404 Not Found'))
+      } else {
+        hermesMocks.getKanbanCapabilities.mockResolvedValueOnce({ live_loop_graph: false })
+      }
+
+      renderControllerHarness({ gatewayOpen: true })
+      await waitFor(() => expect(screen.getByTestId('loop-root').textContent).toBe('LIVE DISPOSABLE DEMO'))
+      fireEvent.click(screen.getByRole('button', { name: /create linked loop task/i }))
+
+      await waitFor(() =>
+        expect(notificationMocks.notifyError).toHaveBeenCalledWith(
+          expect.objectContaining({
+            message: 'Backend update required: this Hermes backend does not support live Loop graph editing.'
+          }),
+          'Create Loop task failed'
+        )
+      )
+      expect(hermesMocks.createLoopDraftTask).not.toHaveBeenCalled()
+    }
+  )
 
   it('keeps the existing authoring canvas stable when another title-only task is added', async () => {
     hermesMocks.createLoopDraftTask.mockResolvedValue({
@@ -413,7 +458,7 @@ describe('useLoopPanelController', () => {
 
     renderControllerHarness({ gatewayOpen: true })
     await waitFor(() => expect(screen.getByTestId('loop-root').textContent).toBe('LIVE DISPOSABLE DEMO'))
-    fireEvent.click(screen.getByRole('button', { name: /create loop task/i }))
+    fireEvent.click(screen.getByRole('button', { name: /create linked loop task/i }))
 
     await waitFor(() => expect(hermesMocks.createLoopDraftTask).toHaveBeenCalled())
     expect(screen.getByTestId('loop-root').textContent).toBe('LIVE DISPOSABLE DEMO')
@@ -461,7 +506,7 @@ describe('useLoopPanelController', () => {
     )
   })
 
-  it('links and unlinks tasks through the Loop source', async () => {
+  it('lets a pending child add and remove a completed parent through the Loop source', async () => {
     renderControllerHarness({ gatewayOpen: true })
 
     await waitFor(() => expect(screen.getByTestId('loop-root').textContent).toBe('LIVE DISPOSABLE DEMO'))
@@ -470,8 +515,8 @@ describe('useLoopPanelController', () => {
 
     await waitFor(() =>
       expect(hermesMocks.linkLoopTasks).toHaveBeenCalledWith(
-        't_parent',
-        't_child',
+        'Completed parent',
+        'Loop draft',
         'default',
         'default',
         'LIVE DISPOSABLE DEMO',
@@ -484,9 +529,88 @@ describe('useLoopPanelController', () => {
     fireEvent.click(screen.getByRole('button', { name: /delete loop dependency/i }))
 
     await waitFor(() =>
-      expect(hermesMocks.unlinkLoopTasks).toHaveBeenCalledWith('t_parent', 't_child', 'default', 'default')
+      expect(hermesMocks.unlinkLoopTasks).toHaveBeenCalledWith(
+        'Completed parent',
+        'Loop draft',
+        'default',
+        'default',
+        'LIVE DISPOSABLE DEMO',
+        'session-1'
+      )
     )
     await waitFor(() => expect(hermesMocks.getLoopSessionSource).toHaveBeenCalled())
+  })
+
+  it('rejects dependency mutations once the child is running or complete', async () => {
+    renderControllerHarness({ gatewayOpen: true })
+
+    await waitFor(() => expect(screen.getByTestId('loop-root').textContent).toBe('LIVE DISPOSABLE DEMO'))
+    hermesMocks.linkLoopTasks.mockClear()
+    hermesMocks.unlinkLoopTasks.mockClear()
+
+    fireEvent.click(screen.getByRole('button', { name: /connect running child/i }))
+    fireEvent.click(screen.getByRole('button', { name: /delete done child dependency/i }))
+
+    expect(hermesMocks.linkLoopTasks).not.toHaveBeenCalled()
+    expect(hermesMocks.unlinkLoopTasks).not.toHaveBeenCalled()
+    expect(notificationMocks.notify).toHaveBeenCalledTimes(2)
+    expect(notificationMocks.notify).toHaveBeenLastCalledWith({
+      kind: 'warning',
+      message: 'Dependencies can only be changed while the child task is pending.'
+    })
+  })
+
+  it('keeps the aggregate root out of parent mutations and active history out of archive mutations', async () => {
+    renderControllerHarness({ gatewayOpen: true })
+
+    await waitFor(() => expect(screen.getByTestId('loop-root').textContent).toBe('LIVE DISPOSABLE DEMO'))
+    fireEvent.click(screen.getByRole('button', { name: /connect from loop root/i }))
+    fireEvent.click(screen.getByRole('button', { name: /delete legacy root dependency/i }))
+    fireEvent.click(screen.getByRole('button', { name: /connect from compiled shell/i }))
+    fireEvent.click(screen.getByRole('button', { name: /archive running child/i }))
+    fireEvent.click(screen.getByRole('button', { name: /archive done child/i }))
+    fireEvent.click(screen.getByRole('button', { name: /block loop root/i }))
+
+    expect(hermesMocks.linkLoopTasks).not.toHaveBeenCalled()
+    expect(hermesMocks.unlinkLoopTasks).not.toHaveBeenCalled()
+    expect(hermesMocks.updateLoopTaskStatus).not.toHaveBeenCalled()
+    expect(notificationMocks.notify).toHaveBeenCalledTimes(6)
+  })
+
+  it('archives pending graph nodes through one guarded root-scoped mutation', async () => {
+    renderControllerHarness({ gatewayOpen: true })
+
+    await waitFor(() => expect(screen.getByTestId('loop-root').textContent).toBe('LIVE DISPOSABLE DEMO'))
+    fireEvent.click(screen.getByRole('button', { name: /archive pending child/i }))
+
+    await waitFor(() =>
+      expect(hermesMocks.archiveLoopNodes).toHaveBeenCalledWith(
+        'LIVE DISPOSABLE DEMO',
+        ['Loop draft'],
+        'default',
+        'default',
+        'session-1'
+      )
+    )
+    expect(hermesMocks.updateLoopTaskStatus).not.toHaveBeenCalledWith(
+      'Loop draft',
+      'archived',
+      expect.anything(),
+      expect.anything()
+    )
+  })
+
+  it('surfaces an atomic archive conflict without falling back to per-task status writes', async () => {
+    hermesMocks.archiveLoopNodes.mockRejectedValueOnce(new Error('409 graph changed'))
+    renderControllerHarness({ gatewayOpen: true })
+
+    await waitFor(() => expect(screen.getByTestId('loop-root').textContent).toBe('LIVE DISPOSABLE DEMO'))
+    fireEvent.click(screen.getByRole('button', { name: /archive pending child/i }))
+
+    await waitFor(() =>
+      expect(notificationMocks.notifyError).toHaveBeenCalledWith(expect.any(Error), 'Archive Loop task failed')
+    )
+    expect(hermesMocks.updateLoopTaskStatus).not.toHaveBeenCalled()
   })
 
   it('surfaces layout-save and dependency-link failures without mutating source state', async () => {

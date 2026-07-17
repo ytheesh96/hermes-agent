@@ -37,6 +37,146 @@ class DummyParent:
     provider = "test-provider"
 
 
+def test_delegate_task_loop_skeleton_batch_uses_minimal_live_graph_contract(
+    loop_delegate_env, monkeypatch
+):
+    from tools import delegate_tool, loop_tools
+
+    captured = []
+
+    def fake_create_graph(args, **_kwargs):
+        captured.append(args)
+        return json.dumps(
+            {
+                "ok": True,
+                "root_task_id": "t_root",
+                "items": [
+                    {
+                        "client_id": "research",
+                        "task_id": "t_research",
+                        "status": "triage",
+                        "needs_specification": True,
+                        "parents": [],
+                    },
+                    {
+                        "client_id": "build",
+                        "task_id": "t_build",
+                        "status": "todo",
+                        "needs_specification": True,
+                        "parents": ["t_research"],
+                    },
+                    {
+                        "client_id": "verify",
+                        "task_id": "t_verify",
+                        "status": "todo",
+                        "needs_specification": True,
+                        "parents": ["t_build"],
+                    },
+                ],
+                "edges": [
+                    {"parent_id": "t_research", "child_id": "t_build"},
+                    {"parent_id": "t_build", "child_id": "t_verify"},
+                ],
+                "dispatch": {"spawned": []},
+                "subscribed": True,
+            }
+        )
+
+    monkeypatch.setattr(loop_tools, "_handle_loop_create_graph", fake_create_graph)
+    monkeypatch.setattr(delegate_tool, "_get_max_concurrent_children", lambda: 1)
+
+    out = json.loads(
+        delegate_tool.delegate_task(
+            mode="loop",
+            decompose=True,
+            root_task_id="t_root",
+            tasks=[
+                {"id": "research", "title": "Research current behavior"},
+                {
+                    "id": "build",
+                    "goal": "Implement the selected approach",
+                    "depends_on": ["research"],
+                    "assignee": "foreground-must-not-route",
+                },
+                {
+                    "id": "verify",
+                    "title": "Verify end to end",
+                    "depends_on": ["build"],
+                },
+            ],
+            parent_agent=DummyParent(),
+        )
+    )
+
+    assert out["status"] == "dispatched"
+    assert out["count"] == 3
+    assert out["root_task_id"] == "t_root"
+    assert out["edges"] == [["t_research", "t_build"], ["t_build", "t_verify"]]
+    assert all(item["needs_specification"] for item in out["items"])
+    assert "immediately" in out["note"]
+    assert len(captured) == 1
+    assert captured[0]["root_task_id"] == "t_root"
+    assert captured[0]["shared_context"] is None
+    assert captured[0]["nodes"] == [
+        {
+            "client_id": "research",
+            "title": "Research current behavior",
+            "depends_on": [],
+        },
+        {
+            "client_id": "build",
+            "title": "Implement the selected approach",
+            "depends_on": ["research"],
+        },
+        {
+            "client_id": "verify",
+            "title": "Verify end to end",
+            "depends_on": ["build"],
+        },
+    ]
+    assert all("assignee" not in node and "context" not in node for node in captured[0]["nodes"])
+
+
+def test_delegate_task_loop_schema_and_prompt_explain_live_graph_ownership():
+    from agent.prompt_builder import KANBAN_GUIDANCE
+    from tools.delegate_tool import DELEGATE_TASK_SCHEMA, _build_tasks_param_description
+
+    properties = DELEGATE_TASK_SCHEMA["parameters"]["properties"]
+    task_properties = properties["tasks"]["items"]["properties"]
+
+    assert "root_task_id" in properties
+    assert "immediately-submitted skeleton" in properties["decompose"]["description"]
+    assert "auto-decomposer" in properties["decompose"]["description"]
+    assert "title" in task_properties
+    assert "Ignored" in task_properties["assignee"]["description"]
+    assert "does not apply" in _build_tasks_param_description()
+    assert "Creating nodes submits them immediately" in KANBAN_GUIDANCE
+    assert "no separate Submit" in KANBAN_GUIDANCE
+
+
+def test_delegate_task_loop_direct_batch_keeps_existing_concurrency_limit(
+    loop_delegate_env, monkeypatch
+):
+    from tools import delegate_tool
+
+    monkeypatch.setattr(delegate_tool, "_get_max_concurrent_children", lambda: 1)
+
+    out = json.loads(
+        delegate_tool.delegate_task(
+            mode="loop",
+            decompose=False,
+            tasks=[
+                {"goal": "First direct task", "assignee": "worker-a"},
+                {"goal": "Second direct task", "assignee": "worker-b"},
+            ],
+            parent_agent=DummyParent(),
+        )
+    )
+
+    assert "Too many tasks" in out["error"]
+    assert "max_concurrent_children is 1" in out["error"]
+
+
 def test_delegate_task_loop_mode_creates_durable_loop_item(loop_delegate_env, monkeypatch):
     from hermes_cli import kanban_db as kb
     from tools import delegate_tool
@@ -221,7 +361,9 @@ def test_delegate_task_loop_mode_keeps_custom_tenant_metadata_separate_from_sour
     ]
 
 
-def test_delegate_task_loop_mode_forwards_goal_mode_and_decompose(loop_delegate_env):
+def test_delegate_task_loop_single_decompose_preserves_legacy_goal_metadata(
+    loop_delegate_env,
+):
     from hermes_cli import kanban_db as kb
     from tools import delegate_tool
 
@@ -249,8 +391,10 @@ def test_delegate_task_loop_mode_forwards_goal_mode_and_decompose(loop_delegate_
 
     assert task is not None
     assert task.status == "triage"
+    assert task.assignee == "peacock"
     assert task.goal_mode is True
     assert task.goal_max_turns == 7
+    assert task.needs_specification is False
 
 
 def test_delegate_task_loop_decompose_preserves_loop_lineage(loop_delegate_env):

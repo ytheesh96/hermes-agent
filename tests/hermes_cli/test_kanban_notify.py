@@ -26,13 +26,19 @@ def kanban_home(tmp_path, monkeypatch):
     return home
 
 
-def _create_loop_root_and_child(conn):
-    root = kb.create_task(conn, title="loop root", assignee="orchestrator")
+def _create_loop_root_and_child(conn, *, session_id=None):
+    root = kb.create_task(
+        conn,
+        title="loop root",
+        assignee="orchestrator",
+        session_id=session_id,
+    )
     child = kb.create_task(
         conn,
         title="loop child",
         assignee="worker1",
         created_by=f"loop:{root}",
+        session_id=session_id,
     )
     return root, child
 
@@ -40,7 +46,7 @@ def _create_loop_root_and_child(conn):
 def test_root_subscription_claims_semantic_descendant_block_once(kanban_home):
     conn = kb.connect()
     try:
-        root, child = _create_loop_root_and_child(conn)
+        root, child = _create_loop_root_and_child(conn, session_id="loop-session")
         kb.add_notify_sub(conn, task_id=root, platform="telegram", chat_id="chat1")
 
         assert kb.block_task(conn, child, reason="review-required: QA should inspect")
@@ -356,7 +362,7 @@ async def test_notifier_delivers_semantic_descendant_block_to_root_sub(kanban_ho
 
     conn = kb.connect()
     try:
-        root, child = _create_loop_root_and_child(conn)
+        root, child = _create_loop_root_and_child(conn, session_id="loop-session")
         kb.add_notify_sub(
             conn,
             task_id=root,
@@ -378,6 +384,7 @@ async def test_notifier_delivers_semantic_descendant_block_to_root_sub(kanban_ho
         runner._running = False
 
     fake_adapter.send = AsyncMock(side_effect=_send_and_stop)
+    fake_adapter.handle_message = AsyncMock()
     runner.adapters = {Platform.TELEGRAM: fake_adapter}
 
     _orig_sleep = asyncio.sleep
@@ -399,6 +406,12 @@ async def test_notifier_delivers_semantic_descendant_block_to_root_sub(kanban_ho
     assert root not in call_msg.split("blocked", 1)[0]
     assert "needs-user: choose one" in call_msg
     assert call_metadata["thread_id"] == "thread1"
+    fake_adapter.handle_message.assert_awaited_once()
+    wake_event = fake_adapter.handle_message.await_args.args[0]
+    assert child in wake_event.text
+    assert wake_event.internal is True
+    assert wake_event.source.chat_id == "chat1"
+    assert wake_event.source.thread_id == "thread1"
 
     conn = kb.connect()
     try:
@@ -408,6 +421,118 @@ async def test_notifier_delivers_semantic_descendant_block_to_root_sub(kanban_ho
         conn.close()
     assert len(root_subs) == 1
     assert child_subs == []
+
+
+@pytest.mark.asyncio
+async def test_notifier_deduplicates_root_mirror_when_child_has_the_same_route(
+    kanban_home,
+):
+    """A shared root/child route gets one notification and one foreground wake."""
+    from gateway.config import Platform
+    from gateway.run import GatewayRunner
+
+    conn = kb.connect()
+    try:
+        root, child = _create_loop_root_and_child(conn, session_id="loop-session")
+        for task_id in (root, child):
+            kb.add_notify_sub(
+                conn,
+                task_id=task_id,
+                platform="telegram",
+                chat_id="chat1",
+                thread_id="thread1",
+            )
+        assert kb.block_task(conn, child, reason="needs-user: choose once")
+    finally:
+        conn.close()
+
+    runner = object.__new__(GatewayRunner)
+    runner._running = True
+    runner._kanban_sub_fail_counts = {}
+    fake_adapter = MagicMock()
+
+    async def _send_and_stop(chat_id, msg, metadata=None):
+        runner._running = False
+
+    fake_adapter.send = AsyncMock(side_effect=_send_and_stop)
+    fake_adapter.handle_message = AsyncMock()
+    runner.adapters = {Platform.TELEGRAM: fake_adapter}
+
+    original_sleep = asyncio.sleep
+
+    async def _fast_sleep(_):
+        await original_sleep(0)
+
+    with patch("gateway.run.asyncio.sleep", side_effect=_fast_sleep):
+        await asyncio.wait_for(
+            runner._kanban_notifier_watcher(interval=1),
+            timeout=10.0,
+        )
+
+    fake_adapter.send.assert_awaited_once()
+    assert child in fake_adapter.send.await_args.args[1]
+    fake_adapter.handle_message.assert_awaited_once()
+    assert child in fake_adapter.handle_message.await_args.args[0].text
+
+
+@pytest.mark.asyncio
+async def test_notifier_keeps_root_mirror_for_same_route_owned_by_another_profile(
+    kanban_home,
+):
+    """A different bot/profile subscription is not a duplicate delivery route."""
+    from gateway.config import Platform
+    from gateway.run import GatewayRunner
+
+    conn = kb.connect()
+    try:
+        root, child = _create_loop_root_and_child(conn, session_id="loop-session")
+        kb.add_notify_sub(
+            conn,
+            task_id=root,
+            platform="telegram",
+            chat_id="chat1",
+            thread_id="thread1",
+            notifier_profile="default",
+        )
+        kb.add_notify_sub(
+            conn,
+            task_id=child,
+            platform="telegram",
+            chat_id="chat1",
+            thread_id="thread1",
+            notifier_profile="business-partner",
+        )
+        assert kb.block_task(conn, child, reason="needs-user: default must still wake")
+    finally:
+        conn.close()
+
+    runner = object.__new__(GatewayRunner)
+    runner._running = True
+    runner._kanban_sub_fail_counts = {}
+    runner._kanban_notifier_profile = "default"
+    fake_adapter = MagicMock()
+
+    async def _send_and_stop(chat_id, msg, metadata=None):
+        runner._running = False
+
+    fake_adapter.send = AsyncMock(side_effect=_send_and_stop)
+    fake_adapter.handle_message = AsyncMock()
+    runner.adapters = {Platform.TELEGRAM: fake_adapter}
+
+    original_sleep = asyncio.sleep
+
+    async def _fast_sleep(_):
+        await original_sleep(0)
+
+    with patch("gateway.run.asyncio.sleep", side_effect=_fast_sleep):
+        await asyncio.wait_for(
+            runner._kanban_notifier_watcher(interval=1),
+            timeout=10.0,
+        )
+
+    fake_adapter.send.assert_awaited_once()
+    assert child in fake_adapter.send.await_args.args[1]
+    fake_adapter.handle_message.assert_awaited_once()
 
 
 # ---------------------------------------------------------------------------

@@ -68,6 +68,110 @@ def test_decompose_creates_children_and_promotes_root(kanban_home):
     assert c1.assignee == "engineer"
 
 
+def test_decompose_clears_skeleton_flag_only_on_success(kanban_home):
+    with kb.connect() as conn:
+        waiting_parent = kb.create_task(conn, title="unfinished")
+        waiting = kb.create_task(
+            conn,
+            title="waiting skeleton",
+            parents=[waiting_parent],
+            needs_specification=True,
+        )
+        assert kb.decompose_triage_task(
+            conn,
+            waiting,
+            root_assignee="orchestrator",
+            children=[{"title": "must not be created"}],
+        ) is None
+        assert kb.get_task(conn, waiting).needs_specification is True
+
+        skeleton = kb.create_task(
+            conn, title="live skeleton", needs_specification=True
+        )
+        child_ids = kb.decompose_triage_task(
+            conn,
+            skeleton,
+            root_assignee="orchestrator",
+            children=[{"title": "worker-complete child"}],
+        )
+        compiled = kb.get_task(conn, skeleton)
+        child = kb.get_task(conn, child_ids[0])
+
+    assert compiled is not None and compiled.needs_specification is False
+    assert child is not None and child.needs_specification is False
+
+
+def test_decompose_preserves_external_parents_and_shell_outgoing_edges(
+    kanban_home,
+):
+    with kb.connect() as conn:
+        upstream = kb.create_task(conn, title="upstream research")
+        shell = kb.create_task(
+            conn,
+            title="implementation skeleton",
+            parents=[upstream],
+            triage=True,
+            needs_specification=True,
+        )
+        downstream = kb.create_task(conn, title="verify", parents=[shell])
+
+        child_ids = kb.decompose_triage_task(
+            conn,
+            shell,
+            root_assignee="orchestrator",
+            children=[
+                {"title": "entry", "assignee": "engineer"},
+                {"title": "exit", "assignee": "engineer", "parents": [0]},
+            ],
+            author="decomposer",
+        )
+        assert child_ids is not None
+        entry, exit_task = child_ids
+
+        assert upstream in kb.parent_ids(conn, entry)
+        assert kb.get_task(conn, entry).status == "todo"
+        assert kb.parent_ids(conn, exit_task) == [entry]
+        assert exit_task in kb.parent_ids(conn, shell)
+        assert downstream in kb.child_ids(conn, shell)
+        assert kb.get_task(conn, shell).needs_specification is False
+
+        assert kb.claim_task(conn, upstream) is not None
+        assert kb.complete_task(conn, upstream, summary="research complete")
+        assert kb.get_task(conn, entry).status == "ready"
+
+
+def test_decompose_parallel_entries_inherit_every_external_parent(kanban_home):
+    with kb.connect() as conn:
+        left = kb.create_task(conn, title="left prerequisite")
+        right = kb.create_task(conn, title="right prerequisite")
+        shell = kb.create_task(
+            conn,
+            title="fan-in skeleton",
+            parents=[left, right],
+            triage=True,
+            needs_specification=True,
+        )
+        children = kb.decompose_triage_task(
+            conn,
+            shell,
+            root_assignee="orchestrator",
+            children=[
+                {"title": "entry one"},
+                {"title": "entry two"},
+                {"title": "internal fan-in", "parents": [0, 1]},
+            ],
+        )
+        assert children is not None
+        entry_one, entry_two, internal_exit = children
+
+        assert set(kb.parent_ids(conn, entry_one)) == {left, right}
+        assert set(kb.parent_ids(conn, entry_two)) == {left, right}
+        assert set(kb.parent_ids(conn, internal_exit)) == {entry_one, entry_two}
+        assert internal_exit in kb.parent_ids(conn, shell)
+        assert entry_one not in kb.parent_ids(conn, shell)
+        assert entry_two not in kb.parent_ids(conn, shell)
+
+
 def test_decompose_returns_none_when_task_missing(kanban_home):
     with kb.connect() as conn:
         result = kb.decompose_triage_task(

@@ -5,7 +5,7 @@ import { Codicon } from '@/components/ui/codicon'
 import { cn } from '@/lib/utils'
 import { closeRightRail } from '@/store/preview'
 
-import { LoopPanel } from '../loop-panel'
+import { LoopPanel, type LoopTaskCreateOptions } from '../loop-panel'
 import type { LoopPanelController } from '../use-loop-panel-controller'
 
 import { ChatPreviewRail } from './preview'
@@ -22,7 +22,7 @@ type WorkRailTabId = 'loop' | 'preview'
 interface ChatWorkRailProps {
   artifactSourceBaseDir?: null | string
   loop: LoopPanelController
-  onCreateLoopTask?: (idea: string, assignee: string) => Promise<null | string>
+  onCreateLoopTask?: (idea: string, options?: LoopTaskCreateOptions) => Promise<null | string>
   onRestartServer?: (url: string, context?: string) => Promise<string>
   previewKey?: string
   previewLabel?: string

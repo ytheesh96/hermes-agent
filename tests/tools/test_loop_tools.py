@@ -41,6 +41,7 @@ def _call_loop(tool_name: str, args: dict):
 
     handlers = {
         "loop_create": wt._handle_loop_create,
+        "loop_create_graph": wt._handle_loop_create_graph,
         "loop_status": wt._handle_loop_status,
         "loop_list_queue": wt._handle_loop_list_queue,
         "loop_update": wt._handle_loop_update,
@@ -481,6 +482,44 @@ def test_loop_create_sync_timeout_and_completion_wait(loop_env):
     assert completed["summary"] == "completed during sync wait"
 
 
+def test_loop_create_graph_submits_atomic_title_only_skeletons(loop_env, monkeypatch):
+    monkeypatch.setattr(
+        "tools.loop_tools._poke_dispatcher_once",
+        lambda _kb, _conn, _board, _warnings: {"spawned": []},
+    )
+
+    result = _call_loop(
+        "loop_create_graph",
+        {
+            "activation": "explicit_user_request",
+            "proof_packet": {"source": "test"},
+            "tenant": loop_env,
+            "nodes": [
+                {"client_id": "research", "title": "Research constraints", "depends_on": []},
+                {"client_id": "build", "title": "Build the change", "depends_on": ["research"]},
+            ],
+        },
+    )
+
+    assert result["ok"] is True
+    assert [item["status"] for item in result["items"]] == ["triage", "todo"]
+    assert all(item["needs_specification"] for item in result["items"])
+    assert result["root_task_id"]
+    assert len(result["edges"]) == 2
+
+    from hermes_cli import kanban_db as kb
+
+    ids = {item["client_id"]: item["task_id"] for item in result["items"]}
+    conn = kb.connect()
+    try:
+        assert kb.parent_ids(conn, ids["build"]) == [ids["research"]]
+        assert kb.parent_ids(conn, result["root_task_id"]) == [ids["build"]]
+        assert kb.list_runs(conn, ids["research"]) == []
+        assert kb.list_runs(conn, ids["build"]) == []
+    finally:
+        conn.close()
+
+
 def test_legacy_patch_round_trips_planning_nodes_without_tasks_or_task_links(loop_env):
     root = loop_env
     out = _call(
@@ -611,6 +650,87 @@ def test_patch_rejects_stale_revision_and_replays_duplicate_mutation(loop_env):
             (root, "Only once"),
         ).fetchall()
         assert len(rows) == 1
+    finally:
+        conn.close()
+
+
+def test_running_sibling_heartbeat_does_not_stale_pending_graph_patch(loop_env):
+    from hermes_cli import kanban_db as kb
+    from hermes_cli import loop_graph as graph
+
+    conn = kb.connect()
+    try:
+        root = kb.create_task(conn, title="Live root", initial_status="scheduled")
+        with kb.write_txn(conn):
+            conn.execute(
+                "UPDATE tasks SET created_by = ? WHERE id = ?",
+                (f"loop:{root}", root),
+            )
+        running = kb.create_task(
+            conn,
+            title="Long-running sibling",
+            created_by=f"loop:{root}",
+        )
+        pending = kb.create_task(
+            conn,
+            title="Pending sibling",
+            created_by=f"loop:{root}",
+            triage=True,
+        )
+        claimed = kb.claim_task(conn, running, claimer="worker:heartbeat")
+        assert claimed is not None and claimed.current_run_id is not None
+
+        revision = graph.graph_revision(conn, root)
+        assert kb.heartbeat_worker(
+            conn,
+            running,
+            note="still working",
+            expected_run_id=claimed.current_run_id,
+            current_tool="terminal",
+        )
+        assert graph.graph_revision(conn, root) == revision
+
+        result = graph.apply_patch(
+            conn,
+            root,
+            expected_revision=revision,
+            mutation_id="edit-pending-after-heartbeat",
+            operations=[
+                {
+                    "op": "update_node",
+                    "task_id": pending,
+                    "title": "Pending sibling, revised",
+                }
+            ],
+        )
+        assert result["ok"] is True
+        assert kb.get_task(conn, pending).title == "Pending sibling, revised"
+
+        # Revision filtering does not replace the in-transaction state guard.
+        # Simulate an external writer that omitted its event and verify the
+        # active target is still rejected under the patch write lock.
+        locked_revision = result["graph_revision"]
+        with kb.write_txn(conn):
+            conn.execute(
+                "UPDATE tasks SET status = 'running' WHERE id = ?",
+                (pending,),
+            )
+        assert graph.graph_revision(conn, root) == locked_revision
+        with pytest.raises(graph.LoopError) as exc_info:
+            graph.apply_patch(
+                conn,
+                root,
+                expected_revision=locked_revision,
+                mutation_id="reject-active-target",
+                operations=[
+                    {
+                        "op": "update_node",
+                        "task_id": pending,
+                        "title": "Must not apply",
+                    }
+                ],
+            )
+        assert exc_info.value.code == "unsafe_status"
     finally:
         conn.close()
 
@@ -904,6 +1024,219 @@ def test_patch_validates_cycles_and_keeps_ready_running_rows_safe(loop_env):
     )
     assert unsafe["ok"] is False
     assert unsafe["error"] == "unsafe_status"
+
+
+def test_patch_can_rewire_a_pending_live_skeleton_to_completed_results(loop_env):
+    from hermes_cli import kanban_db as kb
+    from hermes_cli import loop_graph as graph
+
+    conn = kb.connect()
+    try:
+        root = kb.create_task(conn, title="Live root", initial_status="scheduled")
+        with kb.write_txn(conn):
+            conn.execute("UPDATE tasks SET created_by = ? WHERE id = ?", (f"loop:{root}", root))
+        completed = kb.create_task(conn, title="Known result", created_by=f"loop:{root}")
+        kb.complete_task(conn, completed, summary="Reusable result")
+        waiting = kb.create_task(conn, title="Unfinished gate", created_by=f"loop:{root}")
+        skeleton = kb.create_task(
+            conn,
+            title="Pending skeleton",
+            created_by=f"loop:{root}",
+            parents=[waiting],
+            needs_specification=True,
+        )
+        revision = graph.graph_revision(conn, root)
+        result = graph.apply_patch(
+            conn,
+            root,
+            expected_revision=revision,
+            mutation_id="rewire-pending-skeleton",
+            operations=[{"op": "set_parents", "task_id": skeleton, "parents": [completed]}],
+        )
+        task = kb.get_task(conn, skeleton)
+        assert result["ok"] is True
+        assert kb.parent_ids(conn, skeleton) == [completed]
+        assert task.status == "triage"
+        assert task.needs_specification is True
+    finally:
+        conn.close()
+
+
+def test_archiving_live_nodes_recomputes_children_and_root_in_same_patch(loop_env):
+    from hermes_cli import kanban_db as kb
+    from hermes_cli import loop_graph as graph
+
+    conn = kb.connect()
+    try:
+        root = kb.create_task(
+            conn,
+            title="Foreground root",
+            initial_status="scheduled",
+            assignee="must-be-cleared",
+        )
+        with kb.write_txn(conn):
+            conn.execute(
+                "UPDATE tasks SET created_by = ? WHERE id = ?",
+                (f"loop:{root}", root),
+            )
+        created = kb.create_loop_skeleton_graph(
+            conn,
+            root_task_id=root,
+            nodes=[
+                {"client_id": "parent", "title": "Pending parent"},
+                {
+                    "client_id": "child",
+                    "title": "Blocked child",
+                    "depends_on": ["parent"],
+                },
+            ],
+        )
+        items = {item["client_id"]: item["task_id"] for item in created["items"]}
+
+        first = graph.apply_patch(
+            conn,
+            root,
+            expected_revision=graph.graph_revision(conn, root),
+            mutation_id="archive-parent-and-promote-child",
+            operations=[{"op": "archive_node", "task_id": items["parent"]}],
+        )
+        child_after_parent_archive = kb.get_task(conn, items["child"])
+
+        graph.apply_patch(
+            conn,
+            root,
+            expected_revision=first["graph_revision"],
+            mutation_id="archive-last-sink-and-promote-root",
+            operations=[{"op": "archive_node", "task_id": items["child"]}],
+        )
+        root_after_sink_archive = kb.get_task(conn, root)
+
+        assert child_after_parent_archive is not None
+        assert child_after_parent_archive.status == "triage"
+        assert child_after_parent_archive.needs_specification is True
+        assert kb.parent_ids(conn, items["child"]) == []
+        assert root_after_sink_archive is not None
+        assert root_after_sink_archive.status == "ready"
+        assert root_after_sink_archive.assignee is None
+        assert kb.parent_ids(conn, root) == []
+    finally:
+        conn.close()
+
+
+@pytest.mark.parametrize("op_name", ["update_node", "set_parents", "archive_node", "mark_node"])
+def test_patch_rejects_canonical_root_mutation(loop_env, op_name):
+    from hermes_cli import kanban_db as kb
+    from hermes_cli import loop_graph as graph
+
+    conn = kb.connect()
+    try:
+        root = kb.create_task(conn, title="Original root request", initial_status="scheduled")
+        with kb.write_txn(conn):
+            conn.execute(
+                "UPDATE tasks SET created_by = ? WHERE id = ?",
+                (f"loop:{root}", root),
+            )
+        revision = graph.graph_revision(conn, root)
+    finally:
+        conn.close()
+
+    operation = {"op": op_name, "task_id": root}
+    if op_name == "update_node":
+        operation["title"] = "Overwritten root"
+    elif op_name == "set_parents":
+        operation["parents"] = []
+    elif op_name == "mark_node":
+        operation["active"] = True
+    outcome = _call(
+        {
+            "action": "patch",
+            "root_task_id": root,
+            "expected_revision": revision,
+            "mutation_id": f"reject-root-{op_name}",
+            "operations": [operation],
+        }
+    )
+
+    assert outcome["ok"] is False
+    assert outcome["error"] == "root_immutable"
+    conn = kb.connect()
+    try:
+        task = kb.get_task(conn, root)
+        assert task is not None
+        assert task.title == "Original root request"
+        assert task.status == "scheduled"
+    finally:
+        conn.close()
+
+
+@pytest.mark.parametrize("op_name", ["update_node", "set_parents", "archive_node", "mark_node"])
+def test_patch_rejects_compiled_shell_while_decomposition_child_is_active(
+    loop_env, op_name
+):
+    from hermes_cli import kanban_db as kb
+    from hermes_cli import loop_graph as graph
+
+    conn = kb.connect()
+    try:
+        root = kb.create_task(conn, title="Live root", initial_status="scheduled")
+        with kb.write_txn(conn):
+            conn.execute(
+                "UPDATE tasks SET created_by = ? WHERE id = ?",
+                (f"loop:{root}", root),
+            )
+        created = kb.create_loop_skeleton_graph(
+            conn,
+            root_task_id=root,
+            nodes=[{"client_id": "shell", "title": "Compiled shell"}],
+        )
+        shell_id = created["items"][0]["task_id"]
+        [child_id] = kb.decompose_triage_task(
+            conn,
+            shell_id,
+            root_assignee="orchestrator",
+            children=[
+                {
+                    "title": "Generated child",
+                    "body": "Do generated work",
+                    "assignee": "worker-a",
+                    "parents": [],
+                }
+            ],
+            author="test-decomposer",
+        )
+        assert kb.claim_task(conn, child_id, claimer="worker-a:active") is not None
+        revision = graph.graph_revision(conn, root)
+    finally:
+        conn.close()
+
+    operation = {"op": op_name, "task_id": shell_id}
+    if op_name == "update_node":
+        operation["title"] = "Unsafe rewrite"
+    elif op_name == "set_parents":
+        operation["parents"] = []
+    elif op_name == "mark_node":
+        operation["active"] = True
+    outcome = _call(
+        {
+            "action": "patch",
+            "root_task_id": root,
+            "expected_revision": revision,
+            "mutation_id": f"reject-active-shell-{op_name}",
+            "operations": [operation],
+        }
+    )
+
+    assert outcome["ok"] is False
+    assert outcome["error"] == "unsafe_status"
+    assert "decomposition children are still active" in outcome["message"]
+    conn = kb.connect()
+    try:
+        shell = kb.get_task(conn, shell_id)
+        assert shell is not None
+        assert shell.status == "todo"
+        assert kb.active_decomposition_child_ids(conn, shell_id) == [child_id]
+    finally:
+        conn.close()
 
 
 def test_read_returns_revision_and_optional_dependency_derived_nodes(loop_env):

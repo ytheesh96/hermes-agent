@@ -18,7 +18,7 @@ from hermes_cli import kanban_db as kb
 LOOP_EVENT_KIND = "loop_mutation"
 LOOP_NODE_EVENT_KIND = "loop_node_state"
 LOOP_HANDOFF_RESOLUTION_EVENT_KIND = "loop_foreground_handoff_resolution"
-_SAFE_MUTATION_STATUSES = {"triage", "scheduled"}
+_SAFE_MUTATION_STATUSES = {"triage", "scheduled", "todo"}
 _DONE_LIKE = {"done", "archived"}
 _ALLOWED_HANDOFF_VERIFICATION_STATES = {"approved", "rejected", "needs-user", "done"}
 _ALLOWED_HANDOFF_ATTENTION = {None, "needs-orchestrator", "needs-user"}
@@ -26,6 +26,45 @@ _NODE_BRANCH_KINDS = {"alternative", "required"}
 _NODE_SELECTION_STATES = {"candidate", "chosen", "rejected"}
 _NODE_METADATA_KEYS = ("branch_kind", "decision_group_id", "selection_state")
 _PLAN_NODE_STATUS_VALUES = {"triage", "scheduled", "archived"}
+
+# Optimistic graph revisions track durable graph shape and task-state
+# boundaries, not high-frequency worker telemetry. ``edited`` is filtered
+# separately because completed-result backfills share that event kind with
+# title/body edits.
+_GRAPH_REVISION_EVENT_KINDS = frozenset({
+    "activated",
+    "archived",
+    "assigned",
+    "block_loop_detected",
+    "blocked",
+    "blocker_triage_resolved",
+    "claim_rejected",
+    "claimed",
+    "completed",
+    "crashed",
+    "created",
+    "decomposed",
+    "dependency_wait",
+    "error",
+    "failed",
+    "gave_up",
+    "linked",
+    "promoted",
+    "promoted_manual",
+    "protocol_violation",
+    "rate_limited",
+    "reclaimed",
+    "released",
+    "scheduled",
+    "spawn_failed",
+    "specification_requested",
+    "specified",
+    "stale",
+    "status",
+    "timed_out",
+    "unblocked",
+    "unlinked",
+})
 
 
 class LoopError(Exception):
@@ -101,14 +140,49 @@ def ensure_schema(conn: sqlite3.Connection) -> None:
 
 def graph_revision(conn: sqlite3.Connection, root_task_id: str) -> int:
     ensure_schema(conn)
+    relevant_kinds = sorted(_GRAPH_REVISION_EVENT_KINDS)
+    kind_placeholders = ",".join("?" for _ in relevant_kinds)
     event_row = conn.execute(
-        """
+        f"""
         SELECT COUNT(DISTINCT e.id) AS rev
           FROM task_events e
           LEFT JOIN tasks t ON t.id = e.task_id
-         WHERE e.task_id = ? OR t.created_by = ?
+         WHERE (e.task_id = ? OR t.created_by = ?)
+           AND (
+                e.kind IN ({kind_placeholders})
+                OR (substr(e.kind, 1, 5) = 'loop_' AND e.kind != ?)
+                OR substr(e.kind, 1, 8) = 'handoff_'
+                OR substr(e.kind, 1, 7) = 'review_'
+                OR (
+                    e.kind = 'edited'
+                    AND (
+                        e.payload IS NULL
+                        OR NOT json_valid(e.payload)
+                        OR json_type(
+                            CASE WHEN json_valid(e.payload) THEN e.payload ELSE '{{}}' END,
+                            '$.fields'
+                        ) IS NULL
+                        OR EXISTS (
+                            SELECT 1
+                              FROM json_each(
+                                  CASE WHEN json_valid(e.payload) THEN e.payload ELSE '{{}}' END,
+                                  '$.fields'
+                              )
+                             WHERE value IN (
+                                 'title', 'body', 'status', 'assignee',
+                                 'needs_specification'
+                             )
+                        )
+                    )
+                )
+           )
         """,
-        (root_task_id, f"loop:{root_task_id}"),
+        (
+            root_task_id,
+            f"loop:{root_task_id}",
+            *relevant_kinds,
+            LOOP_EVENT_KIND,
+        ),
     ).fetchone()
     plan_row = conn.execute(
         "SELECT COUNT(*) AS rev FROM loop_plan_events WHERE root_task_id = ?",
@@ -226,13 +300,27 @@ def _assert_safe_node(task) -> None:
 
 def _assert_loop_node(conn: sqlite3.Connection, task_id: str, root_task_id: str):
     task = _task_or_error(conn, task_id)
+    if task_id == root_task_id:
+        raise LoopError(
+            "root_immutable",
+            "the canonical Loop root is immutable; extend it with a new sink or complete it",
+        )
     _assert_safe_node(task)
+    _assert_loop_membership(task, task_id, root_task_id)
+    if kb.task_has_active_decomposition_children(conn, task_id):
+        raise LoopError(
+            "unsafe_status",
+            f"refusing to mutate {task_id}: decomposition children are still active",
+        )
+    return task
+
+
+def _assert_loop_membership(task: Any, task_id: str, root_task_id: str) -> None:
     if task.created_by != f"loop:{root_task_id}":
         raise LoopError(
             "wrong_root",
             f"refusing to mutate {task_id}: not a Loop node for root {root_task_id}",
         )
-    return task
 
 
 def _canonical_parent_ids(client_to_task: dict[str, str], parents: Any) -> list[str]:
@@ -711,7 +799,8 @@ def _set_parents_in_txn(
 ) -> None:
     _assert_loop_node(conn, task_id, root_task_id)
     for pid in parent_ids:
-        _assert_loop_node(conn, pid, root_task_id)
+        parent = _task_or_error(conn, pid)
+        _assert_loop_membership(parent, pid, root_task_id)
     if task_id in parent_ids:
         raise LoopError("validation_failed", "a task cannot depend on itself")
     if _would_cycle_with_replacement(conn, task_id, parent_ids):
@@ -722,7 +811,54 @@ def _set_parents_in_txn(
             "INSERT OR IGNORE INTO task_links (parent_id, child_id) VALUES (?, ?)",
             (pid, task_id),
         )
+    _refresh_readiness_in_txn(conn, [task_id], root_task_id=root_task_id)
     kb._append_event(conn, task_id, "loop_parents_set", {"parents": parent_ids})
+
+
+def _refresh_readiness_in_txn(
+    conn: sqlite3.Connection,
+    task_ids: list[str],
+    *,
+    root_task_id: str,
+) -> None:
+    """Refresh dependency-gated lanes without opening a nested transaction."""
+    for task_id in dict.fromkeys(task_ids):
+        row = conn.execute(
+            "SELECT status, needs_specification, assignee, created_by "
+            "FROM tasks WHERE id = ?",
+            (task_id,),
+        ).fetchone()
+        if row is None:
+            continue
+        is_unassigned_root = (
+            task_id == root_task_id
+            and not row["assignee"]
+            and row["created_by"] == f"loop:{root_task_id}"
+        )
+        if row["status"] not in {"todo", "triage"} and not (
+            is_unassigned_root and row["status"] == "scheduled"
+        ):
+            continue
+        unfinished = conn.execute(
+            "SELECT 1 FROM task_links l JOIN tasks p ON p.id = l.parent_id "
+            "WHERE l.child_id = ? AND p.status NOT IN ('done', 'archived') LIMIT 1",
+            (task_id,),
+        ).fetchone()
+        next_status = "todo" if unfinished else ("triage" if row["needs_specification"] else "ready")
+        if next_status != row["status"]:
+            conn.execute("UPDATE tasks SET status = ? WHERE id = ?", (next_status, task_id))
+            if next_status == "triage":
+                event_kind, payload = "specification_requested", {"reason": "dependencies_satisfied"}
+            elif next_status == "ready":
+                event_kind, payload = "promoted", None
+            else:
+                event_kind, payload = "dependency_wait", {"reason": "parents_not_done"}
+            kb._append_event(
+                conn,
+                task_id,
+                event_kind,
+                payload,
+            )
 
 
 def read_graph(
@@ -1086,6 +1222,13 @@ def apply_patch(
                     archived.append(task_id)
                     continue
                 _assert_loop_node(conn, task_id, root_task_id)
+                affected_children = [
+                    str(row["child_id"])
+                    for row in conn.execute(
+                        "SELECT child_id FROM task_links WHERE parent_id = ?",
+                        (task_id,),
+                    ).fetchall()
+                ]
                 conn.execute(
                     "UPDATE tasks SET status = 'archived', claim_lock = NULL, claim_expires = NULL, worker_pid = NULL "
                     "WHERE id = ?",
@@ -1096,6 +1239,11 @@ def apply_patch(
                     (task_id, task_id),
                 )
                 kb._append_event(conn, task_id, "archived", {"source": "loop"})
+                _refresh_readiness_in_txn(
+                    conn,
+                    affected_children,
+                    root_task_id=root_task_id,
+                )
                 archived.append(task_id)
             elif kind == "set_parents":
                 task_id = str(op.get("task_id") or "").strip()

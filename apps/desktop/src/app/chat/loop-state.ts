@@ -138,7 +138,15 @@ export interface LoopIntakeState {
   state?: null | string
 }
 
+export interface LoopSpecificationFailure {
+  backing_off?: boolean
+  reason?: null | string
+  retry_after?: null | number
+  retry_after_seconds?: null | number
+}
+
 export interface TenantLoopTask {
+  active_decomposition_child_count?: number
   age?: Record<string, null | number>
   assignee?: null | string
   body?: null | string
@@ -167,8 +175,10 @@ export interface TenantLoopTask {
   parent_count?: number
   parents_count?: number
   priority?: number
+  needs_specification?: boolean
   result?: null | string
   session_id?: null | string
+  specification_failure?: null | LoopSpecificationFailure
   review_kind?: null | string
   resume_mode?: null | string
   review_subject_assignee?: null | string
@@ -251,6 +261,7 @@ export interface LoopTaskDetail {
 
 export interface LoopRow {
   active: boolean
+  activeDecompositionChildCount?: number
   assignee?: null | string
   body?: null | string
   childCount: number
@@ -263,6 +274,7 @@ export interface LoopRow {
   latestSummary?: null | string
   loopIntake?: null | LoopIntakeState
   loopHandoffs?: LoopTaskHandoff[]
+  needsSpecification?: boolean
   parentCount: number
   parents: string[]
   priority?: number
@@ -276,12 +288,97 @@ export interface LoopRow {
   foregroundForkSessionId?: null | string
   status: string
   suggestedOwner?: null | string
+  specificationFailure?: null | LoopSpecificationFailure
   taskId: string
   tenant?: null | string
   title: string
+  unfinishedParentCount?: number
   workerActivity?: null | LoopWorkerActivity
   workspaceKind?: null | string
   workspacePath?: null | string
+}
+
+export type LoopTaskPhase =
+  | 'planning'
+  | 'running'
+  | 'specification_failed'
+  | 'specification_retrying'
+  | 'specifying'
+  | 'waiting'
+
+const EDITABLE_DEPENDENCY_STATUSES = new Set(['scheduled', 'todo', 'triage'])
+
+export function loopTaskAllowsDependencyEdits(row: Pick<LoopRow, 'activeDecompositionChildCount' | 'status'>): boolean {
+  return (
+    (row.activeDecompositionChildCount || 0) === 0 &&
+    EDITABLE_DEPENDENCY_STATUSES.has((row.status || '').trim().toLowerCase().replaceAll('-', '_'))
+  )
+}
+
+export function loopTaskAllowsDependencySource(row: Pick<LoopRow, 'activeDecompositionChildCount'>): boolean {
+  return (row.activeDecompositionChildCount || 0) === 0
+}
+
+export function loopRootAllowsNewSink(
+  row: Pick<LoopRow, 'activeDecompositionChildCount' | 'assignee' | 'status'>
+): boolean {
+  return (
+    (row.activeDecompositionChildCount || 0) === 0 &&
+    (row.status || '').trim().toLowerCase().replaceAll('-', '_') === 'ready' &&
+    !row.assignee?.trim()
+  )
+}
+
+export function loopTaskPhase(row: LoopRow): LoopTaskPhase | null {
+  const status = (row.status || '').trim().toLowerCase().replaceAll('-', '_')
+
+  const runStatus = (row.latestRun?.status || row.workerActivity?.status || '')
+    .trim()
+    .toLowerCase()
+    .replaceAll('-', '_')
+
+  if (
+    (row.activeDecompositionChildCount || 0) > 0 ||
+    ['claimed', 'in_progress', 'running'].includes(status) ||
+    ['claimed', 'in_progress', 'running'].includes(runStatus)
+  ) {
+    return 'running'
+  }
+
+  const needsSpecification = row.needsSpecification === true
+
+  if (row.specificationFailure) {
+    return row.specificationFailure.backing_off ? 'specification_retrying' : 'specification_failed'
+  }
+
+  if (needsSpecification && status === 'triage') {
+    return 'specifying'
+  }
+
+  if (status === 'todo' && (row.unfinishedParentCount || 0) > 0) {
+    return 'waiting'
+  }
+
+  if (status === 'scheduled' && (needsSpecification || row.loopIntake?.needed === true)) {
+    return 'planning'
+  }
+
+  return null
+}
+
+export function loopTaskPhaseLabel(row: LoopRow): string | null {
+  const phase = loopTaskPhase(row)
+
+  return phase
+    ? {
+        planning: 'Planning',
+        running: 'Running',
+        specification_failed: 'Specification failed',
+        specification_retrying: 'Retrying specification',
+        specifying: 'Specifying',
+        waiting: 'Waiting for dependencies'
+      }[phase]
+    : null
 }
 
 export interface LoopPanelState {
@@ -689,7 +786,11 @@ export function inferLoopRootTaskIdFromTenantSource(
     return source.tenant
   }
 
-  return source.tenant || source.session_id || source.lineage_session_ids?.[0] || ''
+  if (!tasks.length) {
+    return ''
+  }
+
+  return source.tenant || source.session_id || source.lineage_session_ids?.[0] || tasks[0]?.id || ''
 }
 
 export function inferLoopRootTasksFromTenantSource(
@@ -770,10 +871,12 @@ function latestWorkerForTask(task: TenantLoopTask, workers: readonly LoopWorkerA
 function tenantRowFromTask(
   task: TenantLoopTask,
   depths: Map<string, number>,
-  workers: readonly LoopWorkerActivity[] = []
+  workers: readonly LoopWorkerActivity[] = [],
+  taskById: ReadonlyMap<string, TenantLoopTask> = new Map()
 ): LoopRow {
   const parents = taskParents(task)
   const children = taskChildren(task)
+  const externalParentById = new Map((task.external_parent_tasks || []).map(parent => [parent.id, parent]))
   const status = normalizedStatus(task.status)
   const latestRun = task.latest_run || null
   const workerActivity = task.worker_activity || latestWorkerForTask(task, workers)
@@ -782,6 +885,7 @@ function tenantRowFromTask(
 
   return {
     active: ACTIVE_STATUSES.has(status) || latestRunActive || latestWorkerActive || Boolean(task.current_run_id),
+    activeDecompositionChildCount: task.active_decomposition_child_count || 0,
     assignee: task.assignee,
     body: task.body,
     childCount: children.length || task.child_count || task.children_count || 0,
@@ -795,6 +899,7 @@ function tenantRowFromTask(
       task.latest_summary || workerActivity?.summary || workerActivity?.summary_preview || latestRun?.summary || null,
     loopIntake: task.loop_intake || null,
     loopHandoffs: task.loop_handoffs || [],
+    needsSpecification: task.needs_specification,
     parentCount: parents.length || task.parent_count || task.parents_count || 0,
     parents,
     priority: task.priority,
@@ -808,9 +913,15 @@ function tenantRowFromTask(
     foregroundForkSessionId: task.foreground_fork_session_id,
     status,
     suggestedOwner: task.suggested_owner,
+    specificationFailure: task.specification_failure || null,
     taskId: task.id,
     tenant: task.tenant,
     title: task.title || task.id,
+    unfinishedParentCount: parents.filter(parentId => {
+      const parent = taskById.get(parentId) || externalParentById.get(parentId)
+
+      return !parent || !COMPLETE_STATUSES.has(normalizedStatus(parent.status))
+    }).length,
     workerActivity,
     workspaceKind: task.workspace_kind,
     workspacePath: task.workspace_path
@@ -829,7 +940,8 @@ export function deriveLoopPanelStateFromTenantSource(
   )
 
   const depths = depthByTaskId(tasks)
-  const rows = tasks.map(task => tenantRowFromTask(task, depths, source.workers || []))
+  const taskById = new Map((source.tasks || []).map(task => [task.id, task]))
+  const rows = tasks.map(task => tenantRowFromTask(task, depths, source.workers || [], taskById))
   const rootTaskId = inferLoopRootTaskIdFromTenantSource(source, tasks)
 
   return {

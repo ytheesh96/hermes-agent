@@ -351,7 +351,24 @@ class GatewayKanbanWatchersMixin:
                         if board_slug and board_slug != _kb.DEFAULT_BOARD
                         else ""
                     )
-                    for ev in d["events"]:
+                    events_to_deliver = []
+                    for event in d["events"]:
+                        payload = event.payload or {}
+                        direct_routes = payload.get("source_subscription_routes") or []
+                        duplicate_route = event.kind.startswith("loop_descendant_") and any(
+                            str(route.get("platform") or "").lower() == platform_str
+                            and str(route.get("chat_id") or "") == str(sub["chat_id"])
+                            and str(route.get("thread_id") or "")
+                            == str(sub.get("thread_id") or "")
+                            and str(route.get("notifier_profile") or "")
+                            == str(sub.get("notifier_profile") or "")
+                            for route in direct_routes
+                            if isinstance(route, dict)
+                        )
+                        if not duplicate_route:
+                            events_to_deliver.append(event)
+
+                    for ev in events_to_deliver:
                         kind = ev.kind
                         # Identity prefix: attribute terminal pings to the
                         # worker that did the work. Makes fleets (where one
@@ -526,24 +543,63 @@ class GatewayKanbanWatchersMixin:
                         # same state. See the longer comment on TERMINAL_KINDS
                         # above for the failure mode this prevents.
                         task_terminal = task and task.status in {"done", "archived"}
-                        _WAKE_KINDS = ("completed", "gave_up", "crashed", "timed_out", "blocked")
-                        _wake_kinds = {ev.kind for ev in d["events"] if ev.kind in _WAKE_KINDS}
+                        _WAKE_KINDS = (
+                            "completed",
+                            "gave_up",
+                            "crashed",
+                            "timed_out",
+                            "blocked",
+                            "loop_descendant_blocked",
+                            "loop_descendant_gave_up",
+                        )
+                        _wake_kinds = {
+                            ev.kind for ev in events_to_deliver if ev.kind in _WAKE_KINDS
+                        }
                         if _wake_kinds:
                             try:
                                 _session_key = getattr(task, "session_id", None) or ""
                                 if _session_key:
-                                    _title = (task.title if task else sub["task_id"])[:120]
-                                    _assignee = task.assignee if task else ""
+                                    descendant_event = next(
+                                        (
+                                            ev
+                                            for ev in events_to_deliver
+                                            if ev.kind
+                                            in {
+                                                "loop_descendant_blocked",
+                                                "loop_descendant_gave_up",
+                                            }
+                                        ),
+                                        None,
+                                    )
+                                    descendant_payload = (
+                                        descendant_event.payload or {}
+                                        if descendant_event is not None
+                                        else {}
+                                    )
+                                    _wake_task_id = str(
+                                        descendant_payload.get("source_task_id")
+                                        or sub["task_id"]
+                                    )
+                                    _title = str(
+                                        descendant_payload.get("title")
+                                        or (task.title if task else sub["task_id"])
+                                    )[:120]
+                                    _assignee = str(
+                                        descendant_payload.get("assignee")
+                                        or (task.assignee if task else "")
+                                    )
                                     _parts = []
                                     if "completed" in _wake_kinds: _parts.append(t("gateway.kanban.wake.completed"))
                                     if "gave_up" in _wake_kinds: _parts.append(t("gateway.kanban.wake.gave_up"))
+                                    if "loop_descendant_gave_up" in _wake_kinds: _parts.append(t("gateway.kanban.wake.gave_up"))
                                     if "crashed" in _wake_kinds: _parts.append(t("gateway.kanban.wake.crashed"))
                                     if "timed_out" in _wake_kinds: _parts.append(t("gateway.kanban.wake.timed_out"))
                                     if "blocked" in _wake_kinds: _parts.append(t("gateway.kanban.wake.blocked"))
+                                    if "loop_descendant_blocked" in _wake_kinds: _parts.append(t("gateway.kanban.wake.blocked"))
                                     _status = t("gateway.kanban.wake.status_joiner").join(_parts) or t("gateway.kanban.wake.status_default")
                                     _synth = t(
                                         "gateway.kanban.wake.message",
-                                        task_id=sub["task_id"],
+                                        task_id=_wake_task_id,
                                         status=_status,
                                         title=_title,
                                         assignee=_assignee,

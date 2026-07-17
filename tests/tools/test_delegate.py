@@ -2324,6 +2324,31 @@ class TestDispatchDelegateTask(unittest.TestCase):
         self.assertNotIn("acp_command", captured["tasks"][0])
         self.assertNotIn("acp_args", captured["tasks"][0])
 
+    def test_live_loop_graph_root_is_forwarded(self):
+        import run_agent
+
+        captured = {}
+
+        def fake_delegate_task(**kwargs):
+            captured.update(kwargs)
+            return "{}"
+
+        parent = _make_mock_parent(depth=0)
+        with patch("tools.delegate_tool.delegate_task", fake_delegate_task):
+            run_agent.AIAgent._dispatch_delegate_task(
+                parent,
+                {
+                    "mode": "loop",
+                    "decompose": True,
+                    "root_task_id": "t_root",
+                    "tasks": [{"id": "build", "title": "Build it"}],
+                },
+            )
+
+        self.assertEqual(captured["root_task_id"], "t_root")
+        self.assertTrue(captured["decompose"])
+        self.assertEqual(captured["tasks"], [{"id": "build", "title": "Build it"}])
+
 class TestDelegateEventEnum(unittest.TestCase):
     """Tests for DelegateEvent enum and back-compat aliases."""
 

@@ -15,10 +15,9 @@ import { uploadComposerAttachment, usePromptActions } from '.'
 vi.mock('@/hermes', () => ({
   createLoopDraftTask: vi.fn(),
   getProfiles: vi.fn(async () => ({ profiles: [] })),
-  loopSourceFromDraftResult: (
-    sessionId: string,
-    result: { source?: unknown; task?: null | { id: string } }
-  ) => result.source || (result.task ? { root_task_id: result.task.id, session_id: sessionId, tasks: [result.task] } : null),
+  loopSourceFromDraftResult: (sessionId: string, result: { source?: unknown; task?: null | { id: string } }) =>
+    result.source ||
+    (result.task ? { root_task_id: result.task.id, session_id: sessionId, tasks: [result.task] } : null),
   mergeLoopDraftSource: (_current: unknown, incoming: unknown) => incoming,
   PROMPT_SUBMIT_REQUEST_TIMEOUT_MS: 1_800_000,
   setApiRequestProfile: vi.fn(),
@@ -67,10 +66,7 @@ interface HarnessHandle {
   cancelRun: () => Promise<void>
   restoreToMessage: (messageId: string, target?: { text?: string; userOrdinal?: number | null }) => Promise<void>
   steerPrompt: (text: string) => Promise<boolean>
-  submitText: (
-    text: string,
-    options?: { attachments?: ComposerAttachment[]; fromQueue?: boolean; loopAssignee?: string }
-  ) => Promise<boolean>
+  submitText: (text: string, options?: { attachments?: ComposerAttachment[]; fromQueue?: boolean }) => Promise<boolean>
 }
 
 function Harness({
@@ -535,11 +531,12 @@ describe('usePromptActions /loop', () => {
     expect(getQueuedPrompts(RUNTIME_SESSION_ID)).toEqual([])
   })
 
-  it('creates fresh title-only tasks and opens them without starting a specification turn', async () => {
+  it('creates fresh foreground-owned roots, opens them, and starts foreground triage', async () => {
     vi.mocked(createLoopDraftTask)
       .mockResolvedValueOnce({
+        board: 'default',
         task: {
-          assignee: 'orchestrator',
+          assignee: null,
           id: 't_loop_1',
           loop_intake: { dispatchable: false, needed: true, state: 'drafted' },
           session_id: RUNTIME_SESSION_ID,
@@ -548,6 +545,7 @@ describe('usePromptActions /loop', () => {
         }
       })
       .mockResolvedValueOnce({
+        board: 'developer',
         task: {
           id: 't_loop_2',
           session_id: RUNTIME_SESSION_ID,
@@ -557,7 +555,12 @@ describe('usePromptActions /loop', () => {
       })
 
     const onOpenLoop = vi.fn()
-    const requestGateway = vi.fn(async () => ({}) as never)
+
+    const requestGateway = vi.fn(
+      async (method: string) =>
+        (method === 'slash.exec' ? { type: 'send', message: 'Triage the new Loop root' } : {}) as never
+    )
+
     let handle: HarnessHandle | null = null
 
     render(
@@ -569,11 +572,11 @@ describe('usePromptActions /loop', () => {
       />
     )
 
-    await handle!.submitText('/loop Fix flaky auth test', { loopAssignee: 'peacock' })
+    await handle!.submitText('/loop Fix flaky auth test')
     await handle!.submitText('/loop Second idea')
 
     expect(createLoopDraftTask).toHaveBeenNthCalledWith(1, {
-      assignee: 'peacock',
+      assignee: null,
       idempotencyKey: expect.stringMatching(/^loop-draft:rt-abc123:/),
       profile: expect.any(String),
       sessionId: RUNTIME_SESSION_ID,
@@ -588,7 +591,22 @@ describe('usePromptActions /loop', () => {
     )
     expect(onOpenLoop).toHaveBeenNthCalledWith(1, 't_loop_1')
     expect(onOpenLoop).toHaveBeenNthCalledWith(2, 't_loop_2')
-    expect(requestGateway).not.toHaveBeenCalled()
+    expect(requestGateway).toHaveBeenCalledWith('slash.exec', {
+      command: 'loop-triage Triage Loop root t_loop_1 on Kanban board default: Fix flaky auth test',
+      session_id: RUNTIME_SESSION_ID
+    })
+    expect(requestGateway).toHaveBeenCalledWith('slash.exec', {
+      command: 'loop-triage Triage Loop root t_loop_2 on Kanban board developer: Second idea',
+      session_id: RUNTIME_SESSION_ID
+    })
+    expect(requestGateway).toHaveBeenCalledWith(
+      'prompt.submit',
+      {
+        session_id: RUNTIME_SESSION_ID,
+        text: 'Triage the new Loop root'
+      },
+      1_800_000
+    )
     expect(getQueuedPrompts(RUNTIME_SESSION_ID)).toEqual([])
   })
 
@@ -604,7 +622,12 @@ describe('usePromptActions /loop', () => {
     })
 
     const createBackendSessionForSend = vi.fn(async () => 'rt-new-session')
-    const requestGateway = vi.fn(async () => ({}) as never)
+
+    const requestGateway = vi.fn(
+      async (method: string) =>
+        (method === 'slash.exec' ? { type: 'send', message: 'Triage the first Loop root' } : {}) as never
+    )
+
     let handle: HarnessHandle | null = null
 
     render(
@@ -625,7 +648,18 @@ describe('usePromptActions /loop', () => {
     expect(createLoopDraftTask).toHaveBeenCalledWith(
       expect.objectContaining({ sessionId: 'stored-new-session', title: 'First task' })
     )
-    expect(requestGateway).not.toHaveBeenCalled()
+    expect(requestGateway).toHaveBeenCalledWith('slash.exec', {
+      command: 'loop-triage Triage Loop root t_loop_new_session: First task',
+      session_id: 'rt-new-session'
+    })
+    expect(requestGateway).toHaveBeenCalledWith(
+      'prompt.submit',
+      {
+        session_id: 'rt-new-session',
+        text: 'Triage the first Loop root'
+      },
+      1_800_000
+    )
     expect(getQueuedPrompts('rt-new-session')).toEqual([])
   })
 })
@@ -1653,6 +1687,7 @@ describe('usePromptActions submit session-context isolation (#54527)', () => {
   it('aborts recovery submit when the user switches sessions during timeout resume', async () => {
     const calls: { method: string; params?: Record<string, unknown> }[] = []
     let submitAttempts = 0
+
     let releaseResume: () => void = () => {}
 
     const selectedStoredSessionIdRef: MutableRefObject<string | null> = { current: STORED_SESSION_A }

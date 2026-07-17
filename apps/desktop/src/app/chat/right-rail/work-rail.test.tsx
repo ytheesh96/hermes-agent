@@ -137,7 +137,7 @@ describe('ChatWorkRail', () => {
     const idea = screen.getByRole('textbox', { name: 'Rough idea' })
     fireEvent.change(idea, { target: { value: 'Fix flaky auth test' } })
     fireEvent.keyDown(idea, { key: 'Enter' })
-    expect(onCreateLoopTask).toHaveBeenCalledWith('Fix flaky auth test', 'orchestrator')
+    expect(onCreateLoopTask).toHaveBeenCalledWith('Fix flaky auth test', { rootTaskId: 't_root' })
   })
 
   it('reactivates the Loop tab when the same root row is explicitly opened again', async () => {

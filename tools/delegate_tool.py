@@ -2640,6 +2640,108 @@ def _loop_delegation_result(
     return json.dumps(payload, ensure_ascii=False)
 
 
+def _loop_skeleton_delegation_result(
+    task_list,
+    *,
+    context,
+    tenant,
+    board,
+    workspace_kind,
+    workspace_path,
+    root_task_id=None,
+) -> str:
+    """Submit a brief Loop graph for atomic, just-in-time specification."""
+    from tools import loop_tools
+
+    nodes: list[dict[str, Any]] = []
+    for index, task in enumerate(task_list):
+        alias, alias_error = _loop_task_alias(task, index)
+        if alias_error:
+            return tool_error(alias_error)
+        if not alias:
+            return tool_error(
+                f"Task {index} requires an id or client_id in Loop graph mode."
+            )
+        dependencies, dependency_error = _loop_depends_on(task, index)
+        if dependency_error:
+            return tool_error(dependency_error)
+        title = str(task.get("goal") or task.get("title") or "").strip()
+        if not title:
+            return tool_error(f"Task {index} is missing a 'goal' or 'title'.")
+        node = {
+            "client_id": alias,
+            "title": title,
+            "depends_on": dependencies,
+        }
+        if task.get("context") is not None:
+            node["context"] = task["context"]
+        nodes.append(node)
+
+    origin_session_id = get_source_session_id()
+    proof_packet = {
+        "source": "delegate_task_mode_loop_graph",
+        "origin_profile": os.environ.get("HERMES_PROFILE") or "",
+        "origin_session_id": origin_session_id,
+        "session_key_present": bool(get_session_env("HERMES_SESSION_KEY")),
+        "decompose": True,
+        "task_count": len(nodes),
+    }
+    raw = loop_tools._handle_loop_create_graph(
+        {
+            "nodes": nodes,
+            "root_task_id": root_task_id,
+            "shared_context": context,
+            "session_id": origin_session_id,
+            "tenant": tenant,
+            "board": board,
+            "workspace_kind": workspace_kind or "scratch",
+            "workspace_path": workspace_path,
+            "activation": "explicit_user_request",
+            "proof_packet": proof_packet,
+        }
+    )
+    created = json.loads(raw)
+    if not created.get("ok"):
+        return raw
+
+    items: list[dict[str, Any]] = []
+    for item in created.get("items") or []:
+        normalized = dict(item)
+        normalized["loop_item_id"] = normalized.pop(
+            "task_id", normalized.get("loop_item_id")
+        )
+        items.append(normalized)
+
+    edges = []
+    for edge in created.get("edges") or []:
+        if isinstance(edge, dict):
+            edges.append([edge.get("parent_id"), edge.get("child_id")])
+        else:
+            edges.append(list(edge))
+
+    subscribed = bool(created.get("subscribed"))
+    payload = {
+        "status": "dispatched",
+        "mode": "loop",
+        "count": len(items),
+        "items": items,
+        "edges": edges,
+        "root_task_id": created.get("root_task_id"),
+        "dispatch": created.get("dispatch"),
+        "subscribed": subscribed,
+        "auto_reentry": subscribed,
+        "note": (
+            "Creating a Loop graph submits it immediately. Dependency-ready "
+            "nodes are sent to the auto-decomposer for specification and routing."
+        ),
+    }
+    if len(items) == 1:
+        item = dict(items[0])
+        item["loop_status"] = item.pop("status", None)
+        payload.update(item)
+    return json.dumps(payload, ensure_ascii=False)
+
+
 def delegate_task(
     goal: Optional[str] = None,
     context: Optional[str] = None,
@@ -2653,6 +2755,7 @@ def delegate_task(
     board: Optional[str] = None,
     workspace_kind: Optional[str] = None,
     workspace_path: Optional[str] = None,
+    root_task_id: Optional[str] = None,
     decompose: bool = False,
     goal_mode: bool = False,
     goal_max_turns: Optional[int] = None,
@@ -2727,16 +2830,28 @@ def delegate_task(
         )
     effective_max_iter = default_max_iter
 
-    # Normalize to task list
-    max_children = _get_max_concurrent_children()
+    # Normalize to task list. Durable Loop graph size is governed by the Loop
+    # graph service, not the ephemeral child-agent concurrency limit.
+    loop_mode = str(mode or "").strip().lower() in _LOOP_DELEGATION_MODES
     recovered_tasks, tasks_error = _recover_tasks_from_json_string(tasks)
     if tasks_error:
         return tool_error(tasks_error)
     if recovered_tasks is not None:
         tasks = recovered_tasks
 
+    # ``decompose=True`` predates live graph construction for single-goal Loop
+    # calls, where it also carries assignee/goal-mode metadata.  Keep that path
+    # compatible.  A tasks array (or an existing root) is the unambiguous live
+    # graph contract: brief aliases + dependencies, specified just in time.
+    skeleton_mode = (
+        loop_mode
+        and is_truthy_value(decompose, default=False)
+        and (isinstance(tasks, list) or bool(str(root_task_id or "").strip()))
+    )
+    max_children = _get_max_concurrent_children()
+
     if tasks and isinstance(tasks, list):
-        if len(tasks) > max_children:
+        if not skeleton_mode and len(tasks) > max_children:
             return tool_error(
                 f"Too many tasks: {len(tasks)} provided, but "
                 f"max_concurrent_children is {max_children}. "
@@ -2747,6 +2862,8 @@ def delegate_task(
         task_list = tasks
     elif goal and isinstance(goal, str) and goal.strip():
         task_list = [{"goal": goal, "context": context, "role": top_role}]
+        if skeleton_mode:
+            task_list[0]["id"] = "task"
     else:
         return tool_error("Provide either 'goal' (single task) or 'tasks' (batch).")
 
@@ -2759,10 +2876,23 @@ def delegate_task(
             return tool_error(
                 f"Task {i} must be an object, got {type(task).__name__}."
             )
-        if not task.get("goal", "").strip():
-            return tool_error(f"Task {i} is missing a 'goal'.")
+        title = task.get("goal") or (task.get("title") if skeleton_mode else None)
+        if not isinstance(title, str) or not title.strip():
+            expected = "'goal' or 'title'" if skeleton_mode else "'goal'"
+            return tool_error(f"Task {i} is missing a {expected}.")
 
-    if str(mode or "").strip().lower() in _LOOP_DELEGATION_MODES:
+    if skeleton_mode:
+        return _loop_skeleton_delegation_result(
+            task_list,
+            context=context,
+            tenant=tenant,
+            board=board,
+            workspace_kind=workspace_kind,
+            workspace_path=workspace_path,
+            root_task_id=root_task_id,
+        )
+
+    if loop_mode:
         return _loop_delegation_result(
             task_list,
             context=context,
@@ -3544,12 +3674,16 @@ def _build_top_level_description() -> str:
         "Each subagent gets its own conversation, terminal session, and toolset. "
         "Only the final summary is returned -- intermediate tool results "
         "never enter your context window.\n\n"
-        "TWO MODES (one of 'goal' or 'tasks' is required):\n"
+        "INPUT FORMS (one of 'goal' or 'tasks' is required):\n"
         "1. Single task: provide 'goal' (+ optional context, toolsets).\n"
         f"2. Batch (parallel): provide 'tasks' array with up to {max_children} "
         f"items concurrently for this user (configured via "
-        f"delegation.max_concurrent_children in config.yaml). {nesting_clause}\n\n"
-        "BOTH MODES RUN IN THE BACKGROUND. delegate_task returns immediately — "
+        f"delegation.max_concurrent_children in config.yaml). {nesting_clause}\n"
+        "3. Live Loop graph: use mode='loop', decompose=true, and brief "
+        "id/title/depends_on rows. Creation submits the graph immediately; its "
+        "size is independent of ephemeral concurrency, and the auto-decomposer "
+        "owns detailed specifications and routing.\n\n"
+        "EPHEMERAL MODES RUN IN THE BACKGROUND. delegate_task returns immediately — "
         "you and the user keep working, and each subagent's full result "
         "re-enters the conversation as its own new message when it finishes. A "
         "batch is just N independent background subagents (N handles, each "
@@ -3612,7 +3746,10 @@ def _build_tasks_param_description() -> str:
         "When provided, top-level goal/context/toolsets are ignored. "
         "For mode='loop'/'durable', each item may include id/client_id as a "
         "batch-local alias and depends_on as a list of aliases or existing "
-        "Kanban task ids; dependencies become parent->child task_links."
+        "Kanban task ids; dependencies become parent->child task_links. With "
+        "mode='loop' and decompose=true, this ephemeral concurrency cap does "
+        "not apply: creation immediately submits the durable graph, and the "
+        "auto-decomposer owns detailed specifications and routing."
     )
 
 
@@ -3699,7 +3836,8 @@ DELEGATE_TASK_SCHEMA = {
                 "description": (
                     "What the subagent should accomplish. Be specific and "
                     "self-contained -- the subagent knows nothing about your "
-                    "conversation history."
+                    "conversation history. In Loop graph mode this is only a "
+                    "brief task title; the auto-decomposer writes the specification."
                 ),
             },
             "context": {
@@ -3720,7 +3858,10 @@ DELEGATE_TASK_SCHEMA = {
             },
             "assignee": {
                 "type": "string",
-                "description": "Loop/durable mode only: profile that should execute the durable work.",
+                "description": (
+                    "Loop/durable direct mode: profile that executes the work. "
+                    "Optional with decompose=true because the auto-decomposer routes it."
+                ),
             },
             "tenant": {"type": "string", "description": "Loop/durable mode tenant namespace."},
             "board": {"type": "string", "description": "Loop/durable mode Kanban board slug."},
@@ -3730,12 +3871,18 @@ DELEGATE_TASK_SCHEMA = {
                 "description": "Loop/durable mode workspace kind.",
             },
             "workspace_path": {"type": "string", "description": "Loop/durable mode workspace path."},
+            "root_task_id": {
+                "type": "string",
+                "description": "Loop graph mode: optional existing Loop root that owns the submitted nodes.",
+            },
             "decompose": {
                 "type": "boolean",
                 "description": (
-                    "Loop/durable mode only: create the Loop item in triage "
-                    "so the existing Kanban decomposer can fan it out. "
-                    "Applies to the root item only."
+                    "Loop/durable mode only. With a tasks array, every row is an "
+                    "immediately-submitted skeleton: provide brief titles and "
+                    "dependency aliases while the auto-decomposer owns detailed "
+                    "specifications, routing, and optional child decomposition. "
+                    "Legacy single-goal calls retain their direct decomposition behavior."
                 ),
             },
             "goal_mode": {
@@ -3754,7 +3901,14 @@ DELEGATE_TASK_SCHEMA = {
                 "items": {
                     "type": "object",
                     "properties": {
-                        "goal": {"type": "string", "description": "Task goal"},
+                        "goal": {
+                            "type": "string",
+                            "description": "Task goal; a brief title when Loop decompose=true.",
+                        },
+                        "title": {
+                            "type": "string",
+                            "description": "Alias for goal in Loop graph mode.",
+                        },
                         "id": {
                             "type": "string",
                             "description": "Loop/durable batch-local alias for depends_on references. Same as client_id.",
@@ -3774,7 +3928,11 @@ DELEGATE_TASK_SCHEMA = {
                         },
                         "assignee": {
                             "type": "string",
-                            "description": "Per-task assignee for loop/durable mode.",
+                            "description": (
+                                "Direct Loop mode routing override. Ignored when "
+                                "mode='loop' and decompose=true because the "
+                                "auto-decomposer owns routing."
+                            ),
                         },
                         "decompose": {
                             "type": "boolean",
@@ -3794,11 +3952,10 @@ DELEGATE_TASK_SCHEMA = {
                             "description": "Per-task role override. See top-level 'role' for semantics.",
                         },
                     },
-                    "required": ["goal"],
+                    "required": [],
                 },
-                # No maxItems — the runtime limit is configurable via
-                # delegation.max_concurrent_children (default 3) and
-                # enforced with a clear error in delegate_task().
+                # No maxItems: ephemeral batches use max_concurrent_children;
+                # durable Loop graphs have their own backend graph-size limit.
                 "description": "(rebuilt at get_definitions() time)",
             },
             "role": {
@@ -3882,6 +4039,7 @@ registry.register(
         board=args.get("board"),
         workspace_kind=args.get("workspace_kind"),
         workspace_path=args.get("workspace_path"),
+        root_task_id=args.get("root_task_id"),
         decompose=args.get("decompose", False),
         goal_mode=args.get("goal_mode", False),
         goal_max_turns=args.get("goal_max_turns"),

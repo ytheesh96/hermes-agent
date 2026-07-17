@@ -24,7 +24,7 @@ import { cn } from '@/lib/utils'
 import type { ComposerStatusItem, StatusItemState } from '@/store/composer-status'
 import type { PreviewTarget } from '@/store/preview'
 
-import { loopConnectedTaskIds } from './loop-state'
+import { loopConnectedTaskIds, loopTaskAllowsDependencyEdits, loopTaskPhaseLabel } from './loop-state'
 import type {
   LoopPanelState,
   LoopRow,
@@ -50,11 +50,15 @@ export type LoopTaskAction =
   | 'park'
   | 'reject-review'
   | 'start'
-  | 'submit'
-  | 'triage'
   | 'unblock'
   | 'worker-run'
   | 'worker-session'
+
+export interface LoopTaskCreateOptions {
+  childId?: string
+  parentId?: string
+  rootTaskId?: string
+}
 
 type LoopTaskCommentSubmit = (taskId: string, body: string) => Promise<void> | void
 
@@ -94,6 +98,10 @@ function loopRowStatusIndicator(row: LoopRow): StatusIndicatorKind {
   const runOutcome = normalizedLoopValue(row.latestRun?.outcome)
   const active = isActiveLoopRow(row) || row.active
 
+  if (row.specificationFailure) {
+    return row.specificationFailure.backing_off ? 'attention' : 'failed'
+  }
+
   const failed =
     FAILED_LOOP_STATUSES.has(status) || FAILED_LOOP_STATUSES.has(runStatus) || FAILED_LOOP_STATUSES.has(runOutcome)
 
@@ -127,7 +135,12 @@ function loopRowStatusIndicator(row: LoopRow): StatusIndicatorKind {
 }
 
 function LoopStatusIndicator({ row }: { row: LoopRow }) {
-  return <StatusIndicator ariaLabel={`Status: ${row.status}`} kind={loopRowStatusIndicator(row)} />
+  return (
+    <StatusIndicator
+      ariaLabel={`Status: ${loopTaskPhaseLabel(row) || row.status}`}
+      kind={loopRowStatusIndicator(row)}
+    />
+  )
 }
 
 function completedLoopRows(rows: LoopRow[]): number {
@@ -322,7 +335,7 @@ function isDoneLoopRow(row: LoopRow): boolean {
 function isActiveLoopRow(row: LoopRow): boolean {
   const status = normalizedLoopValue(row.status)
 
-  return ACTIVE_OVERVIEW_STATUSES.has(status)
+  return (row.activeDecompositionChildCount || 0) > 0 || ACTIVE_OVERVIEW_STATUSES.has(status)
 }
 
 function isQueuedLoopRow(row: LoopRow): boolean {
@@ -477,6 +490,7 @@ function detailRowFromTaskDetail(detail?: LoopTaskDetail | null, selectedTaskId?
 
   return {
     active: Boolean(task.current_run_id),
+    activeDecompositionChildCount: task.active_decomposition_child_count || 0,
     assignee: task.assignee,
     body: task.body,
     childCount: children.length || task.child_count || task.children_count || 0,
@@ -489,6 +503,7 @@ function detailRowFromTaskDetail(detail?: LoopTaskDetail | null, selectedTaskId?
     latestSummary: task.latest_summary || latestRun?.summary || null,
     loopIntake: task.loop_intake || null,
     loopHandoffs: task.loop_handoffs || [],
+    needsSpecification: task.needs_specification,
     parentCount: parents.length || task.parent_count || task.parents_count || 0,
     parents,
     priority: task.priority,
@@ -501,6 +516,7 @@ function detailRowFromTaskDetail(detail?: LoopTaskDetail | null, selectedTaskId?
     foregroundParentSessionId: task.foreground_parent_session_id,
     foregroundForkSessionId: task.foreground_fork_session_id,
     status,
+    specificationFailure: task.specification_failure || null,
     taskId: task.id,
     tenant: task.tenant,
     title: task.title || task.id,
@@ -521,15 +537,21 @@ function selectedRowFrom(
 
   const detailRow = detailRowFromTaskDetail(selectedTaskDetail, selectedTaskId)
 
+  const sourceRow = selectedTaskId
+    ? state.rows.find(row => row.taskId === selectedTaskId) || null
+    : state.rows[0] || null
+
   if (detailRow) {
-    return detailRow
+    return sourceRow
+      ? { ...sourceRow, ...detailRow, unfinishedParentCount: sourceRow.unfinishedParentCount }
+      : detailRow
   }
 
   if (selectedTaskId) {
-    return state.rows.find(row => row.taskId === selectedTaskId) || null
+    return sourceRow
   }
 
-  return state.rows[0] || null
+  return sourceRow
 }
 
 interface LoopStackRowProps {
@@ -732,7 +754,7 @@ interface LoopPanelProps {
   focusRequestKey?: number
   onFocusTaskId?: (taskId: string) => void
   onHide?: () => void
-  onCreateTask?: (idea: string, assignee: string) => Promise<null | string>
+  onCreateTask?: (idea: string, options?: LoopTaskCreateOptions) => Promise<null | string>
   onLinkTasks?: (parentId: string, childId: string) => Promise<boolean>
   onUnlinkTasks?: (parentId: string, childId: string) => Promise<boolean>
   onSavePositions?: (positions: LoopTaskGraphPosition[], rootTaskId?: string) => Promise<boolean>
@@ -973,62 +995,25 @@ function cleanTaskMarkdown(text: string): string {
   return cleaned.join('\n').replace(/^\n+|\n+$/g, '')
 }
 
-function loopTaskIsPlanned(row: LoopRow): boolean {
-  const intakeState = (row.loopIntake?.state || '').trim().toLowerCase()
-
-  return row.loopIntake?.needed === true && intakeState === 'planned'
-}
-
 function LoopTaskActions({
+  allowMutations = true,
   onTaskAction,
   row
 }: {
+  allowMutations?: boolean
   onTaskAction?: (action: LoopTaskAction, row: LoopRow) => void
   row: LoopRow
 }) {
   const status = normalizedLoopValue(row.status)
   const blocked = status === 'blocked'
-  const archived = status === 'archived'
   const terminal = TERMINAL_LOOP_STATUSES.has(status)
-
-  const planned = loopTaskIsPlanned(row)
-  const canSubmit = status === 'scheduled' && planned && !terminal
-  const canTriage = (status === 'triage' || status === 'scheduled') && !planned && !terminal
 
   const statusAction: LoopTaskAction = blocked ? 'unblock' : 'block'
   const statusLabel = blocked ? 'Unblock' : 'Block'
 
   return (
     <div className="flex flex-wrap gap-1.5" data-testid="loop-task-actions">
-      {canTriage && (
-        <Button
-          aria-label={`Triage ${row.taskId}`}
-          className="h-7 gap-1.5 px-2 text-xs"
-          disabled={!onTaskAction}
-          onClick={() => onTaskAction?.('triage', row)}
-          title="Clarify this task, improve its specification, and plan dependencies when useful."
-          type="button"
-          variant="default"
-        >
-          <Codicon name="sparkle" size="0.82rem" />
-          <span>Triage</span>
-        </Button>
-      )}
-      {canSubmit && (
-        <Button
-          aria-label={`Submit ${row.taskId}`}
-          className="h-7 gap-1.5 px-2 text-xs"
-          disabled={!onTaskAction}
-          onClick={() => onTaskAction?.('submit', row)}
-          title="Submit this planned task graph for Kanban execution."
-          type="button"
-          variant="default"
-        >
-          <Codicon name="send" size="0.82rem" />
-          <span>Submit</span>
-        </Button>
-      )}
-      {!terminal && (
+      {allowMutations && !terminal && (
         <Button
           aria-label={`${statusLabel} ${row.taskId}`}
           className="h-7 gap-1.5 px-2 text-xs"
@@ -1052,7 +1037,7 @@ function LoopTaskActions({
         <Codicon name="comment-discussion" size="0.82rem" />
         <span>Ask in chat</span>
       </Button>
-      {!archived && (
+      {allowMutations && loopTaskAllowsDependencyEdits(row) && (
         <Button
           aria-label={`Archive ${row.taskId}`}
           className="h-7 gap-1.5 px-2 text-xs"
@@ -1928,7 +1913,7 @@ function LoopRootAgentsCard({
   allRows?: LoopRow[]
   canvasScopeKey?: string
   groups: RootOverviewGroups
-  onCreateTask?: (idea: string, assignee: string) => Promise<null | string>
+  onCreateTask?: (idea: string, options?: LoopTaskCreateOptions) => Promise<null | string>
   onLinkTasks?: (parentId: string, childId: string) => Promise<boolean>
   onUnlinkTasks?: (parentId: string, childId: string) => Promise<boolean>
   onOpenTaskTab?: (row: LoopRow) => void
@@ -1999,19 +1984,17 @@ function LoopRootOverview({
   onOpenTaskTab,
   onSavePositions,
   positions,
-  rootTaskId,
   onTaskAction
 }: {
   allRows?: LoopRow[]
   canvasScopeKey?: string
   group: LoopDependencyGroup
-  onCreateTask?: (idea: string, assignee: string) => Promise<null | string>
+  onCreateTask?: (idea: string, options?: LoopTaskCreateOptions) => Promise<null | string>
   onLinkTasks?: (parentId: string, childId: string) => Promise<boolean>
   onUnlinkTasks?: (parentId: string, childId: string) => Promise<boolean>
   onOpenTaskTab?: (row: LoopRow) => void
   onSavePositions?: (positions: LoopTaskGraphPosition[], rootTaskId?: string) => Promise<boolean>
   positions?: LoopTaskGraphPosition[]
-  rootTaskId?: string
   onTaskAction?: (action: LoopTaskAction, row: LoopRow) => void
 }) {
   const root = group.anchor
@@ -2031,7 +2014,7 @@ function LoopRootOverview({
         onUnlinkTasks={onUnlinkTasks}
         positions={positions}
         root={root}
-        rootTaskId={rootTaskId}
+        rootTaskId={root.taskId}
       />
     </div>
   )
@@ -2045,6 +2028,7 @@ function LoopTaskDetails({
   onAddComment,
   onBack,
   onTaskAction,
+  rootTaskId,
   row
 }: {
   backLabel?: null | string
@@ -2054,6 +2038,7 @@ function LoopTaskDetails({
   onAddComment?: LoopTaskCommentSubmit
   onBack?: () => void
   onTaskAction?: (action: LoopTaskAction, row: LoopRow) => void
+  rootTaskId?: string
   row: LoopRow
 }) {
   return (
@@ -2078,11 +2063,32 @@ function LoopTaskDetails({
             <LoopStatusIndicator row={row} />
             <LoopPriorityIndicator row={row} />
             <h3 className="m-0 min-w-0 truncate text-sm font-semibold text-(--ui-text-primary)">{row.title}</h3>
+            {loopTaskPhaseLabel(row) ? (
+              <span
+                className="shrink-0 rounded bg-(--ui-fill-quaternary) px-1.5 py-0.5 text-[0.62rem] font-medium text-(--ui-text-tertiary)"
+                data-testid={`loop-task-phase-${row.taskId}`}
+              >
+                {loopTaskPhaseLabel(row)}
+              </span>
+            ) : null}
           </div>
-          <LoopTaskActions onTaskAction={onTaskAction} row={row} />
+          <LoopTaskActions allowMutations={row.taskId !== rootTaskId} onTaskAction={onTaskAction} row={row} />
         </div>
       </section>
       <LoopForegroundHandoffCard row={row} />
+
+      {row.specificationFailure ? (
+        <DetailSection title={row.specificationFailure.backing_off ? 'Specification retry' : 'Specification failure'}>
+          <div className="grid gap-1 text-xs text-(--ui-text-secondary)" data-testid="loop-specification-failure">
+            <p className="m-0">
+              {row.specificationFailure.reason?.trim() || 'The task specification could not be generated.'}
+            </p>
+            {row.specificationFailure.backing_off ? (
+              <p className="m-0 text-(--ui-text-tertiary)">Retry scheduled automatically.</p>
+            ) : null}
+          </div>
+        </DetailSection>
+      ) : null}
 
       {/* Markdown task description/spec with a graceful empty state. */}
       <DetailSection title="Description">
@@ -2937,6 +2943,7 @@ export function LoopPanel({
                         : undefined
                     }
                     onTaskAction={onTaskAction}
+                    rootTaskId={rootTaskId || overviewAnchor?.taskId || state.rootTaskId}
                     row={activeTaskTabRow}
                   />
                 </div>
@@ -2963,7 +2970,6 @@ export function LoopPanel({
                   onTaskAction={onTaskAction}
                   onUnlinkTasks={onUnlinkTasks}
                   positions={positions}
-                  rootTaskId={rootTaskId || state.rootTaskId}
                 />
               </div>
             ) : selected ? (
@@ -2976,6 +2982,7 @@ export function LoopPanel({
                   onAddComment={onAddTaskComment}
                   onBack={detailBack}
                   onTaskAction={onTaskAction}
+                  rootTaskId={rootTaskId || state.rootTaskId}
                   row={selected}
                 />
               </div>

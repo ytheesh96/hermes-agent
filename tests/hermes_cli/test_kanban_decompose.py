@@ -88,6 +88,23 @@ def _patch_list_profiles(names: list[str]):
     ]
 
 
+def _create_live_skeleton(title: str = "Foreground-authored shell") -> tuple[str, str]:
+    with kb.connect() as conn:
+        root = kb.create_task(conn, title="Live Loop root", initial_status="scheduled")
+        with kb.write_txn(conn):
+            conn.execute(
+                "UPDATE tasks SET created_by = ? WHERE id = ?",
+                (f"loop:{root}", root),
+            )
+        skeleton = kb.create_task(
+            conn,
+            title=title,
+            created_by=f"loop:{root}",
+            needs_specification=True,
+        )
+    return root, skeleton
+
+
 def test_decompose_with_fanout_creates_children(kanban_home):
     with kb.connect() as conn:
         tid = kb.create_task(conn, title="ship a feature", triage=True)
@@ -232,6 +249,187 @@ def test_loop_safe_single_task_fallback_stays_scheduled_and_planned(kanban_home)
         "source": "foreground_triage",
         "state": "planned",
     }
+
+
+def test_live_skeleton_single_task_spec_preserves_foreground_title(kanban_home):
+    with kb.connect() as conn:
+        root = kb.create_task(
+            conn,
+            title="Stable Loop root",
+            initial_status="scheduled",
+        )
+        with kb.write_txn(conn):
+            conn.execute(
+                "UPDATE tasks SET created_by = ? WHERE id = ?",
+                (f"loop:{root}", root),
+            )
+        skeleton = kb.create_task(
+            conn,
+            title="Foreground-authored node title",
+            created_by=f"loop:{root}",
+            needs_specification=True,
+        )
+
+    llm_payload = jsonlib.dumps({
+        "fanout": False,
+        "rationale": "single unit",
+        "title": "Model-tightened replacement title",
+        "body": "Detailed worker specification from the decomposer.",
+        "assignee": "engineer",
+    })
+    patches = _patch_list_profiles(["orchestrator", "engineer"])
+    for item in patches:
+        item.start()
+    try:
+        with _patch_aux_client(llm_payload), _patch_extra_body():
+            outcome = decomp.decompose_task(skeleton, author="auto-decomposer")
+    finally:
+        for item in patches:
+            item.stop()
+
+    assert outcome.ok is True
+    assert outcome.new_title == "Foreground-authored node title"
+    with kb.connect() as conn:
+        task = kb.get_task(conn, skeleton)
+    assert task is not None
+    assert task.title == "Foreground-authored node title"
+    assert task.body == "Detailed worker specification from the decomposer."
+    assert task.assignee == "engineer"
+    assert task.needs_specification is False
+
+
+def test_live_skeleton_single_task_requires_worker_ready_body(kanban_home):
+    _, skeleton = _create_live_skeleton()
+    llm_payload = jsonlib.dumps(
+        {
+            "fanout": False,
+            "title": "Model title",
+            "body": "   ",
+            "assignee": "engineer",
+        }
+    )
+    patches = _patch_list_profiles(["orchestrator", "engineer"])
+    for item in patches:
+        item.start()
+    try:
+        with _patch_aux_client(llm_payload), _patch_extra_body():
+            outcome = decomp.decompose_task(skeleton, author="auto-decomposer")
+    finally:
+        for item in patches:
+            item.stop()
+
+    assert outcome.ok is False
+    assert "nonempty worker-ready body" in outcome.reason
+    with kb.connect() as conn:
+        task = kb.get_task(conn, skeleton)
+        failures = [
+            event
+            for event in kb.list_events(conn, skeleton)
+            if event.kind == "specification_failed"
+        ]
+        assert kb.child_ids(conn, skeleton) == []
+    assert task is not None
+    assert task.status == "triage" and task.needs_specification is True
+    assert "nonempty worker-ready body" in failures[-1].payload["reason"]
+
+
+@pytest.mark.parametrize(
+    ("child", "reason"),
+    [
+        (
+            {"title": "Child", "body": "Do it", "parents": [99]},
+            "not a valid dependency index",
+        ),
+        (
+            {"title": "Child", "body": "Do it", "parents": ["0"]},
+            "must be an integer index",
+        ),
+        (
+            {"title": "Child", "body": "", "parents": []},
+            "nonempty worker-ready specification",
+        ),
+        (
+            {"title": "Child", "body": 7, "parents": []},
+            "nonempty worker-ready specification",
+        ),
+        (
+            {"title": "Child", "body": "Do it"},
+            "parents must be a list",
+        ),
+    ],
+)
+def test_live_skeleton_fanout_fails_closed_on_malformed_children(
+    kanban_home,
+    child,
+    reason,
+):
+    _, skeleton = _create_live_skeleton()
+    llm_payload = jsonlib.dumps(
+        {"fanout": True, "rationale": "split", "tasks": [child]}
+    )
+    patches = _patch_list_profiles(["orchestrator", "engineer"])
+    for item in patches:
+        item.start()
+    try:
+        with _patch_aux_client(llm_payload), _patch_extra_body():
+            outcome = decomp.decompose_task(skeleton, author="auto-decomposer")
+    finally:
+        for item in patches:
+            item.stop()
+
+    assert outcome.ok is False
+    assert reason in outcome.reason
+    with kb.connect() as conn:
+        task = kb.get_task(conn, skeleton)
+        failures = [
+            event
+            for event in kb.list_events(conn, skeleton)
+            if event.kind == "specification_failed"
+        ]
+        assert kb.child_ids(conn, skeleton) == []
+    assert task is not None
+    assert task.status == "triage" and task.needs_specification is True
+    assert reason in failures[-1].payload["reason"]
+
+
+def test_live_skeleton_fanout_honors_graph_node_limit(kanban_home):
+    _, skeleton = _create_live_skeleton()
+    llm_payload = jsonlib.dumps(
+        {
+            "fanout": True,
+            "rationale": "too broad",
+            "tasks": [
+                {"title": f"Child {index}", "body": "Do it", "parents": []}
+                for index in range(3)
+            ],
+        }
+    )
+    patches = _patch_list_profiles(["orchestrator", "engineer"])
+    for item in patches:
+        item.start()
+    try:
+        with _patch_aux_client(llm_payload), _patch_extra_body(), patch(
+            "hermes_cli.kanban_decompose._load_config",
+            return_value={"loop": {"max_graph_nodes": 2}},
+        ):
+            outcome = decomp.decompose_task(skeleton, author="auto-decomposer")
+    finally:
+        for item in patches:
+            item.stop()
+
+    assert outcome.ok is False
+    assert "maximum is 2" in outcome.reason
+    with kb.connect() as conn:
+        task = kb.get_task(conn, skeleton)
+        failures = [
+            event
+            for event in kb.list_events(conn, skeleton)
+            if event.kind == "specification_failed"
+        ]
+        assert kb.child_ids(conn, skeleton) == []
+    assert task is not None
+    assert task.status == "triage" and task.needs_specification is True
+    assert "maximum is 2" in failures[-1].payload["reason"]
 
 
 def test_decompose_fanout_false_assigns_default_when_unassigned(kanban_home):
@@ -416,7 +614,7 @@ def test_decompose_unknown_assignee_falls_back_to_default(kanban_home):
 
 def test_decompose_handles_malformed_llm_json(kanban_home):
     with kb.connect() as conn:
-        tid = kb.create_task(conn, title="x", triage=True)
+        tid = kb.create_task(conn, title="x", needs_specification=True)
 
     patches = _patch_list_profiles(["orchestrator"])
     for p in patches:
@@ -430,6 +628,180 @@ def test_decompose_handles_malformed_llm_json(kanban_home):
 
     assert outcome.ok is False
     assert "malformed JSON" in outcome.reason
+    with kb.connect() as conn:
+        task = kb.get_task(conn, tid)
+        failures = [
+            event for event in kb.list_events(conn, tid)
+            if event.kind == "specification_failed"
+        ]
+        assert kb.child_ids(conn, tid) == []
+    assert task is not None and task.status == "triage"
+    assert task.needs_specification is True
+    assert failures[-1].payload["reason"] == "LLM returned malformed JSON"
+    assert failures[-1].payload["retry_after"] > failures[-1].created_at
+    assert tid not in decomp.list_triage_ids()
+
+    # Once the durable backoff expires, the watcher may retry the same shell.
+    with kb.connect() as conn, kb.write_txn(conn):
+        payload = dict(failures[-1].payload)
+        payload["retry_after"] = 0
+        conn.execute(
+            "UPDATE task_events SET payload = ? WHERE id = ?",
+            (jsonlib.dumps(payload), failures[-1].id),
+        )
+    assert tid in decomp.list_triage_ids()
+
+
+def test_decompose_persists_api_failure_and_backoff(kanban_home):
+    with kb.connect() as conn:
+        tid = kb.create_task(conn, title="compile me", needs_specification=True)
+
+    client = MagicMock()
+    client.chat.completions.create = MagicMock(side_effect=RuntimeError("offline"))
+    patches = _patch_list_profiles(["orchestrator"])
+    for item in patches:
+        item.start()
+    try:
+        with patch(
+            "agent.auxiliary_client.get_text_auxiliary_client",
+            return_value=(client, "test-model"),
+        ), _patch_extra_body():
+            outcome = decomp.decompose_task(tid, author="auto-decomposer")
+    finally:
+        for item in patches:
+            item.stop()
+
+    assert outcome.ok is False
+    assert outcome.reason == "LLM error: RuntimeError"
+    with kb.connect() as conn:
+        task = kb.get_task(conn, tid)
+        failures = [
+            event for event in kb.list_events(conn, tid)
+            if event.kind == "specification_failed"
+        ]
+    assert task is not None and task.status == "triage"
+    assert task.needs_specification is True
+    assert failures[-1].payload["reason"] == "LLM error: RuntimeError"
+    assert tid not in decomp.list_triage_ids()
+
+
+def test_decompose_rejects_output_after_foreground_edit_during_llm_call(kanban_home):
+    with kb.connect() as conn:
+        tid = kb.create_task(
+            conn,
+            title="Initial shell",
+            body="Initial context",
+            needs_specification=True,
+        )
+
+    llm_payload = jsonlib.dumps({
+        "fanout": True,
+        "rationale": "split it",
+        "tasks": [
+            {
+                "title": "Stale generated child",
+                "body": "This must not be persisted.",
+                "assignee": "engineer",
+                "parents": [],
+            },
+        ],
+    })
+
+    def edit_then_respond(**_kwargs):
+        with kb.connect() as edit_conn, kb.write_txn(edit_conn):
+            edit_conn.execute(
+                "UPDATE tasks SET title = ?, body = ? WHERE id = ?",
+                ("Foreground revision", "New constraints", tid),
+            )
+            kb._append_event(
+                edit_conn,
+                tid,
+                "edited",
+                {"fields": ["title", "body"], "author": "foreground"},
+            )
+        return _fake_aux_response(llm_payload)
+
+    client = MagicMock()
+    client.chat.completions.create = MagicMock(side_effect=edit_then_respond)
+    patches = _patch_list_profiles(["orchestrator", "engineer"])
+    for item in patches:
+        item.start()
+    try:
+        with patch(
+            "agent.auxiliary_client.get_text_auxiliary_client",
+            return_value=(client, "test-model"),
+        ), _patch_extra_body():
+            outcome = decomp.decompose_task(tid, author="auto-decomposer")
+    finally:
+        for item in patches:
+            item.stop()
+
+    assert outcome.ok is False
+    assert "stale decomposer output rejected" in outcome.reason
+    with kb.connect() as conn:
+        task = kb.get_task(conn, tid)
+        children = kb.child_ids(conn, tid)
+        failures = [
+            event for event in kb.list_events(conn, tid)
+            if event.kind == "specification_failed"
+        ]
+    assert task is not None
+    assert (task.title, task.body) == ("Foreground revision", "New constraints")
+    assert task.status == "triage" and task.needs_specification is True
+    assert children == []
+    assert failures == []
+    assert tid in decomp.list_triage_ids()
+
+
+def test_failed_llm_call_does_not_backoff_a_concurrently_edited_revision(kanban_home):
+    with kb.connect() as conn:
+        tid = kb.create_task(
+            conn,
+            title="Initial shell",
+            body="Initial context",
+            needs_specification=True,
+        )
+
+    def edit_then_fail(**_kwargs):
+        with kb.connect() as edit_conn, kb.write_txn(edit_conn):
+            edit_conn.execute(
+                "UPDATE tasks SET body = ? WHERE id = ?",
+                ("Foreground correction", tid),
+            )
+            kb._append_event(
+                edit_conn,
+                tid,
+                "edited",
+                {"fields": ["body"], "author": "foreground"},
+            )
+        raise RuntimeError("transient old-revision failure")
+
+    client = MagicMock()
+    client.chat.completions.create = MagicMock(side_effect=edit_then_fail)
+    patches = _patch_list_profiles(["orchestrator"])
+    for item in patches:
+        item.start()
+    try:
+        with patch(
+            "agent.auxiliary_client.get_text_auxiliary_client",
+            return_value=(client, "test-model"),
+        ), _patch_extra_body():
+            outcome = decomp.decompose_task(tid, author="auto-decomposer")
+    finally:
+        for item in patches:
+            item.stop()
+
+    assert outcome.ok is False
+    with kb.connect() as conn:
+        task = kb.get_task(conn, tid)
+        failures = [
+            event for event in kb.list_events(conn, tid)
+            if event.kind == "specification_failed"
+        ]
+    assert task is not None and task.body == "Foreground correction"
+    assert task.needs_specification is True and task.status == "triage"
+    assert failures == []
+    assert tid in decomp.list_triage_ids()
 
 
 def test_decompose_retries_empty_length_output(kanban_home):
@@ -505,6 +877,69 @@ def test_decomposer_prompt_preserves_dynamic_loop_expansion():
     assert "delegate durable Loop subtasks" in decomp._SYSTEM_PROMPT
 
 
+def test_live_skeleton_prompt_uses_only_root_and_adjacent_graph_context(kanban_home):
+    with kb.connect() as conn:
+        root_id = kb.create_task(conn, title="Ship live graph", body="Keep the workflow dynamic", initial_status="scheduled")
+        with kb.write_txn(conn):
+            conn.execute(
+                "UPDATE tasks SET created_by = ? WHERE id = ?",
+                (f"loop:{root_id}", root_id),
+            )
+        parent_id = kb.create_task(
+            conn,
+            title="Research constraints",
+            created_by=f"loop:{root_id}",
+        )
+        kb.complete_task(conn, parent_id, summary="The existing dispatcher is reusable.")
+        skeleton_id = kb.create_task(
+            conn,
+            title="Implement the live compiler",
+            created_by=f"loop:{root_id}",
+            parents=[parent_id],
+            needs_specification=True,
+        )
+        downstream_id = kb.create_task(
+            conn,
+            title="Verify end to end",
+            created_by=f"loop:{root_id}",
+            parents=[skeleton_id],
+            needs_specification=True,
+        )
+        assert kb.get_task(conn, skeleton_id).status == "triage"
+        assert kb.get_task(conn, downstream_id).status == "todo"
+
+    response = jsonlib.dumps(
+        {
+            "fanout": False,
+            "rationale": "single unit",
+            "title": "Implement the live compiler",
+            "body": "Use the existing dispatcher and preserve dependency gates.",
+            "assignee": "engineer",
+        }
+    )
+    client = _mock_client_returning(response)
+    patches = _patch_list_profiles(["orchestrator", "engineer"])
+    for item in patches:
+        item.start()
+    try:
+        with patch(
+            "agent.auxiliary_client.get_text_auxiliary_client",
+            return_value=(client, "test-model"),
+        ), _patch_extra_body():
+            outcome = decomp.decompose_task(skeleton_id, author="auto-decomposer")
+    finally:
+        for item in patches:
+            item.stop()
+
+    assert outcome.ok, outcome.reason
+    prompt = client.chat.completions.create.call_args.kwargs["messages"][1]["content"]
+    assert "Loop root request:" in prompt
+    assert "Ship live graph" in prompt
+    assert "The existing dispatcher is reusable." in prompt
+    assert "Immediate downstream work" in prompt
+    assert "Verify end to end" in prompt
+
+
 def test_decompose_returns_false_when_task_not_triage(kanban_home):
     with kb.connect() as conn:
         tid = kb.create_task(conn, title="x")  # ready, not triage
@@ -523,7 +958,7 @@ def test_decompose_returns_false_when_task_not_triage(kanban_home):
 
 def test_decompose_no_aux_client_configured(kanban_home):
     with kb.connect() as conn:
-        tid = kb.create_task(conn, title="x", triage=True)
+        tid = kb.create_task(conn, title="x", needs_specification=True)
 
     patches = _patch_list_profiles(["orchestrator"])
     for p in patches:
@@ -540,3 +975,12 @@ def test_decompose_no_aux_client_configured(kanban_home):
 
     assert outcome.ok is False
     assert "no auxiliary client" in outcome.reason
+    with kb.connect() as conn:
+        task = kb.get_task(conn, tid)
+        failures = [
+            event for event in kb.list_events(conn, tid)
+            if event.kind == "specification_failed"
+        ]
+    assert task is not None and task.needs_specification is True
+    assert failures[-1].payload["reason"] == "no auxiliary client configured"
+    assert tid not in decomp.list_triage_ids()

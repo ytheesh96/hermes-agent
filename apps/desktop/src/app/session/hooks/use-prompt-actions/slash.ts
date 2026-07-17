@@ -1,5 +1,6 @@
 import { type MutableRefObject, useCallback } from 'react'
 
+import { buildLoopTriageDraft } from '@/app/chat/loop-intake'
 import type { TenantLoopSource } from '@/app/chat/loop-state'
 import { createLoopDraftTask, getProfiles, loopSourceFromDraftResult, mergeLoopDraftSource } from '@/hermes'
 import type { Translations } from '@/i18n'
@@ -92,10 +93,7 @@ export function useSlashCommand(deps: SlashCommandDeps) {
   } = deps
 
   return useCallback(
-    async (
-      rawCommand: string,
-      options?: { loopAssignee?: string; sessionId?: string; recordInput?: boolean }
-    ) => {
+    async (rawCommand: string, options?: { sessionId?: string; recordInput?: boolean }) => {
       const ensureSessionId = async (sessionHint?: string) =>
         sessionHint || activeSessionIdRef.current || (await createBackendSessionForSend())
 
@@ -429,7 +427,7 @@ export function useSlashCommand(deps: SlashCommandDeps) {
             const sourceSessionId = sessionHint || selectedStoredSessionIdRef.current || sessionId
 
             const result = await createLoopDraftTask({
-              ...(options?.loopAssignee ? { assignee: options.loopAssignee } : {}),
+              assignee: null,
               idempotencyKey: `loop-draft:${sourceSessionId}:${crypto.randomUUID()}`,
               profile,
               sessionId: sourceSessionId,
@@ -455,13 +453,25 @@ export function useSlashCommand(deps: SlashCommandDeps) {
               })
             }
 
-            const createdTaskId = result.task?.id
+            const createdTaskId = result.task?.id || source?.root_task_id
 
             if (createdTaskId) {
               onOpenLoop(createdTaskId)
             }
 
             const taskTitle = result.task?.title || source?.tasks?.[0]?.title || title || 'Loop draft'
+
+            if (createdTaskId) {
+              await runSlash(
+                buildLoopTriageDraft(
+                  { taskId: createdTaskId, title: taskTitle },
+                  result.source?.board || result.board || source?.board
+                ),
+                sessionId,
+                false
+              )
+            }
+
             notify({ kind: 'success', message: `Task added · ${taskTitle}` })
           } catch (err) {
             notifyError(err, 'Create Loop draft failed')

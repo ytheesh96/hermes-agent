@@ -405,6 +405,94 @@ def _handle_loop_create(args: dict[str, Any], **_kwargs) -> str:
         return tool_error(f"loop_create: {exc}")
 
 
+def _handle_loop_create_graph(args: dict[str, Any], **_kwargs) -> str:
+    """Persist one live Loop graph fragment and wake the existing dispatcher.
+
+    This is the internal batch boundary used by ``delegate_task(mode='loop',
+    decompose=True)``.  It deliberately is not another model-facing tool: the
+    existing delegation schema is the narrow public contract.
+    """
+    guard = _require_durable_mutation_contract(args)
+    if guard:
+        return guard
+    nodes = args.get("nodes")
+    if not isinstance(nodes, list) or not nodes:
+        return tool_error("nodes must be a non-empty list")
+
+    board = args.get("board")
+    session_id = str(args.get("session_id") or get_source_session_id() or "").strip() or None
+    warnings: list[str] = []
+    try:
+        kb, conn = _connect(board=board)
+        try:
+            result = kb.create_loop_skeleton_graph(
+                conn,
+                nodes=nodes,
+                root_task_id=str(args.get("root_task_id") or "").strip() or None,
+                shared_context=args.get("shared_context"),
+                session_id=session_id,
+                tenant=str(args.get("tenant") or "").strip() or None,
+                workspace_kind=str(args.get("workspace_kind") or "scratch"),
+                workspace_path=args.get("workspace_path"),
+                board=board,
+                created_by=str(args.get("created_by") or "").strip() or None,
+                idempotency_scope=str(args.get("idempotency_scope") or "").strip() or None,
+            )
+
+            root_task_id = str(result.get("root_task_id") or "").strip()
+            if root_task_id and kb.get_task(conn, root_task_id) is not None:
+                latest = conn.execute(
+                    "SELECT payload FROM task_events WHERE task_id = ? AND kind = 'loop_intake_state' "
+                    "ORDER BY id DESC LIMIT 1",
+                    (root_task_id,),
+                ).fetchone()
+                try:
+                    latest_intake = json.loads(latest["payload"] or "{}") if latest else {}
+                except (TypeError, ValueError):
+                    latest_intake = {}
+                if latest_intake.get("state") != "live" or latest_intake.get("dispatchable") is not True:
+                    with kb.write_txn(conn):
+                        kb._append_event(
+                            conn,
+                            root_task_id,
+                            "loop_intake_state",
+                            {
+                                "needed": True,
+                                "state": "live",
+                                "source": "foreground_graph",
+                                "dispatchable": True,
+                            },
+                        )
+
+            from tools.kanban_notify import maybe_auto_subscribe
+
+            subscription_candidates = [
+                item["task_id"] for item in result.get("items", [])
+            ]
+            if root_task_id:
+                subscription_candidates.append(root_task_id)
+            subscribed_ids = [
+                task_id
+                for task_id in dict.fromkeys(subscription_candidates)
+                if maybe_auto_subscribe(conn, task_id)
+            ]
+            dispatch = _poke_dispatcher_once(kb, conn, board, warnings)
+            return _json_ok(
+                **result,
+                dispatch=dispatch,
+                subscribed_ids=subscribed_ids,
+                subscribed=bool(subscribed_ids),
+                foreground_reentry="on_final_or_blocker",
+                warnings=warnings,
+            )
+        finally:
+            conn.close()
+    except ValueError as exc:
+        return tool_error(f"loop_create_graph: {exc}")
+    except Exception as exc:
+        return tool_error(f"loop_create_graph: {type(exc).__name__}: {exc}")
+
+
 def _handle_loop_status(args: dict[str, Any], **_kwargs) -> str:
     task_id = _loop_item_id(args)
     if not task_id:
@@ -561,8 +649,9 @@ def _handle_loop_request_review(args: dict[str, Any], **_kwargs) -> str:
 LOOP_GRAPH_SCHEMA = {
     "name": "loop_graph",
     "description": (
-        "Read or safely update a durable Loop task graph, or triage a specified root into a scheduled plan. "
-        "Patch uses expected_revision + mutation_id guards; triage never dispatches work. "
+        "Read or safely update a live durable Loop task graph. "
+        "Patch uses expected_revision + mutation_id guards; create new executable nodes with "
+        "delegate_task(mode='loop', decompose=true). "
         "Responses are compact: success/error plus graph revision data."
     ),
     "parameters": {
@@ -580,9 +669,10 @@ LOOP_GRAPH_SCHEMA = {
             "operations": {
                 "type": "array",
                 "description": (
-                    "Patch ops for current clients: update_node, resolve_handoff, validate. "
-                    "update_node edits title, body, or suggested_owner on a safe Loop root/task. "
-                    "Create executable work and dependencies through the normal Kanban task APIs."
+                    "Patch ops for submitted nodes: update_node, set_parents, archive_node, "
+                    "resolve_handoff, validate. Mutations are allowed only while a task is still "
+                    "pending; running and completed work is immutable. Create new nodes with "
+                    "delegate_task(mode='loop', decompose=true)."
                 ),
                 "items": {"type": "object"},
             },
