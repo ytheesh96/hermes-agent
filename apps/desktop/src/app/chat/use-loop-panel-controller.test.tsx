@@ -2,8 +2,6 @@ import { QueryClient, QueryClientProvider } from '@tanstack/react-query'
 import { cleanup, fireEvent, render, screen, waitFor } from '@testing-library/react'
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 
-import { PREVIEW_PANE_ID } from '@/store/layout'
-import { $paneStates } from '@/store/panes'
 import { openSessionInNewWindow } from '@/store/windows'
 
 import { onComposerSubmitRequest } from './composer/focus'
@@ -37,6 +35,7 @@ vi.mock('@/hermes', () => hermesMocks)
 vi.mock('@/store/notifications', () => notificationMocks)
 
 vi.mock('@/store/windows', () => ({
+  isSecondaryWindow: () => false,
   openSessionInNewWindow: vi.fn()
 }))
 
@@ -245,7 +244,6 @@ function renderControllerHarness({ gatewayOpen = false }: { gatewayOpen?: boolea
 
 describe('useLoopPanelController', () => {
   beforeEach(() => {
-    $paneStates.set({ [PREVIEW_PANE_ID]: { open: false } })
     hermesMocks.getLoopSessionSource.mockResolvedValue(demoLoopSource())
     hermesMocks.getLoopTaskDetail.mockResolvedValue({ task: null })
     hermesMocks.getLoopCanvasPositions.mockResolvedValue({
@@ -265,23 +263,19 @@ describe('useLoopPanelController', () => {
 
   afterEach(() => {
     cleanup()
-    $paneStates.set({})
     vi.mocked(openSessionInNewWindow).mockReset()
     Object.values(hermesMocks).forEach(mock => mock.mockReset())
     Object.values(notificationMocks).forEach(mock => mock.mockReset())
     window.history.replaceState(null, '', '/')
   })
 
-  it('reopens the shared work rail pane when a Loop row is selected from a persisted-closed state', () => {
+  it('opens and selects a Loop row', () => {
     renderControllerHarness()
-
-    expect($paneStates.get()[PREVIEW_PANE_ID]?.open).toBe(false)
 
     fireEvent.click(screen.getByRole('button', { name: /open loop row/i }))
 
     expect(screen.getByTestId('loop-open').textContent).toBe('true')
     expect(screen.getByTestId('loop-selected').textContent).toBe('t_root')
-    expect($paneStates.get()[PREVIEW_PANE_ID]?.open).toBe(true)
   })
 
   it('opens the Loop canvas without selecting or creating a task', () => {
@@ -292,7 +286,6 @@ describe('useLoopPanelController', () => {
     expect(screen.getByTestId('loop-open').textContent).toBe('true')
     expect(screen.getByTestId('loop-selected').textContent).toBe('')
     expect(screen.getByTestId('loop-scope').textContent).toBe('session-1')
-    expect($paneStates.get()[PREVIEW_PANE_ID]?.open).toBe(true)
     expect(hermesMocks.getLoopSessionSource).not.toHaveBeenCalled()
   })
 
@@ -338,7 +331,6 @@ describe('useLoopPanelController', () => {
 
     await waitFor(() => expect(screen.getByTestId('loop-selected').textContent).toBe('t_new'))
     expect(screen.getByTestId('loop-open').textContent).toBe('true')
-    expect($paneStates.get()[PREVIEW_PANE_ID]?.open).toBe(true)
   })
 
   it('starts foreground Triage automatically after creating the initial Loop root', async () => {
@@ -644,7 +636,6 @@ describe('useLoopPanelController', () => {
 
     await waitFor(() => expect(screen.getByTestId('loop-open').textContent).toBe('true'))
     expect(screen.getByTestId('loop-selected').textContent).toBe('Loop draft')
-    expect($paneStates.get()[PREVIEW_PANE_ID]?.open).toBe(true)
   })
 
   it('auto-opens a bare Loop launch query without selecting the persistence anchor', async () => {
@@ -654,7 +645,6 @@ describe('useLoopPanelController', () => {
 
     await waitFor(() => expect(screen.getByTestId('loop-open').textContent).toBe('true'))
     expect(screen.getByTestId('loop-selected').textContent).toBe('')
-    expect($paneStates.get()[PREVIEW_PANE_ID]?.open).toBe(true)
   })
 
   it('does not reselect the launch-query Loop row after the user changes selection', async () => {

@@ -534,22 +534,10 @@ def decompose_task(
         )
 
     try:
-        from agent.auxiliary_client import (  # type: ignore
-            get_auxiliary_extra_body,
-            get_text_auxiliary_client,
-        )
+        from agent.auxiliary_client import call_llm  # type: ignore
     except Exception as exc:
         logger.debug("decompose: auxiliary client import failed: %s", exc)
         return failed("auxiliary client unavailable")
-
-    try:
-        client, model = get_text_auxiliary_client("kanban_decomposer")
-    except Exception as exc:
-        logger.debug("decompose: get_text_auxiliary_client failed: %s", exc)
-        return failed("auxiliary client unavailable")
-
-    if client is None or not model:
-        return failed("no auxiliary client configured")
 
     user_msg = _USER_TEMPLATE.format(
         task_id=task.id,
@@ -564,8 +552,12 @@ def decompose_task(
     finish_reason: str | None = None
     for max_tokens in _max_token_attempts():
         try:
-            resp = client.chat.completions.create(
-                model=model,
+            # Route through call_llm so auxiliary.kanban_decomposer.* config
+            # (provider/model/base_url, extra_body, reasoning_effort, retries)
+            # applies while retaining the fork's bounded retry for truncated
+            # JSON responses.
+            resp = call_llm(
+                task="kanban_decomposer",
                 messages=[
                     {"role": "system", "content": _SYSTEM_PROMPT},
                     {"role": "user", "content": user_msg},
@@ -573,7 +565,6 @@ def decompose_task(
                 temperature=0.3,
                 max_tokens=max_tokens,
                 timeout=timeout or 180,
-                extra_body=get_auxiliary_extra_body() or None,
             )
         except Exception as exc:
             logger.info(

@@ -17,7 +17,7 @@ import {
 import { queryClient } from '@/lib/query-client'
 import { setSessionYolo } from '@/lib/yolo-session'
 import { openCommandPalettePage } from '@/store/command-palette'
-import { type ComposerAttachment, setComposerDraft } from '@/store/composer'
+import { setComposerDraft } from '@/store/composer'
 import { reconcileKanbanSessionSourceForComposer } from '@/store/composer-status'
 import { notify, notifyError } from '@/store/notifications'
 import { setPetScale } from '@/store/pet-gallery'
@@ -35,7 +35,13 @@ import {
 
 import type { BrowserManageResponse, SessionTitleResponse, SlashExecResponse } from '../../../types'
 
-import { type GatewayRequest, isSessionIdCandidate, renderCommandsCatalog, slashStatusText } from './utils'
+import {
+  type GatewayRequest,
+  isSessionIdCandidate,
+  renderCommandsCatalog,
+  slashStatusText,
+  type SubmitTextOptions
+} from './utils'
 
 /** Everything a slash handler needs about the invocation it's serving. */
 interface SlashActionCtx {
@@ -65,10 +71,7 @@ interface SlashCommandDeps {
   resumeStoredSession: (storedSessionId: string) => Promise<void> | void
   selectedStoredSessionIdRef: MutableRefObject<string | null>
   startFreshSessionDraft: () => void
-  submitPromptText: (
-    rawText: string,
-    options?: { attachments?: ComposerAttachment[]; fromQueue?: boolean }
-  ) => Promise<boolean>
+  submitPromptText: (rawText: string, options?: SubmitTextOptions) => Promise<boolean>
 }
 
 /** The /slash command dispatcher, extracted from usePromptActions. */
