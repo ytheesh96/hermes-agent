@@ -230,6 +230,110 @@ def _workflow_boundary_message(
     )
 
 
+def _direct_boundary_message(
+    *,
+    event: Any,
+    task: Any,
+    sub: dict[str, Any],
+    title: str,
+    board_tag: str,
+) -> str | None:
+    """Render one visible legacy task-subscription event."""
+
+    kind = event.kind
+    who = task.assignee if task and task.assignee else None
+    tag = f"@{who} " if who else ""
+    if kind == "completed":
+        # Prefer the run summary, then fall back to the legacy task result.
+        handoff = ""
+        payload_summary = None
+        if event.payload and event.payload.get("summary"):
+            payload_summary = str(event.payload["summary"])
+        if payload_summary:
+            lines = payload_summary.strip().splitlines()
+            handoff = f"\n{(lines[0] if lines else payload_summary)[:200]}"
+        elif task and task.result:
+            lines = task.result.strip().splitlines()
+            handoff = f"\n{(lines[0] if lines else task.result)[:160]}"
+        return (
+            f"✔ {board_tag}{tag}Kanban {sub['task_id']} done"
+            f" — {title}{handoff}"
+        )
+    if kind == "loop_descendant_completed":
+        payload = event.payload or {}
+        source_id = payload.get("source_task_id") or sub["task_id"]
+        source_assignee = payload.get("assignee")
+        source_tag = f"@{source_assignee} " if source_assignee else ""
+        source_title = str(payload.get("title") or source_id)[:120]
+        handoff = ""
+        if payload.get("summary"):
+            summary = str(payload["summary"])
+            summary_lines = summary.strip().splitlines()
+            handoff = (
+                f"\n{(summary_lines[0] if summary_lines else summary)[:200]}"
+            )
+        return (
+            f"✔ {board_tag}{source_tag}Kanban {source_id} done"
+            f" — {source_title}{handoff}"
+        )
+    if kind in {"blocked", "block_loop_detected"}:
+        reason = ""
+        if event.payload and event.payload.get("reason"):
+            reason = f": {str(event.payload['reason'])[:160]}"
+        return f"⏸ {board_tag}{tag}Kanban {sub['task_id']} blocked{reason}"
+    if kind == "loop_descendant_blocked":
+        payload = event.payload or {}
+        source_id = payload.get("source_task_id") or sub["task_id"]
+        source_assignee = payload.get("assignee")
+        source_tag = f"@{source_assignee} " if source_assignee else ""
+        reason = ""
+        if payload.get("reason"):
+            reason = f": {str(payload['reason'])[:160]}"
+        return f"⏸ {board_tag}{source_tag}Kanban {source_id} blocked{reason}"
+    if kind == "gave_up":
+        error = ""
+        if event.payload and event.payload.get("error"):
+            error = f"\n{str(event.payload['error'])[:200]}"
+        return (
+            f"✖ {board_tag}{tag}Kanban {sub['task_id']} gave up "
+            f"after repeated spawn failures{error}"
+        )
+    if kind == "loop_descendant_gave_up":
+        payload = event.payload or {}
+        source_id = payload.get("source_task_id") or sub["task_id"]
+        source_assignee = payload.get("assignee")
+        source_tag = f"@{source_assignee} " if source_assignee else ""
+        trigger = str(payload.get("trigger_outcome") or "worker")
+        error = ""
+        if payload.get("error"):
+            error = f"\n{str(payload['error'])[:200]}"
+        return (
+            f"✖ {board_tag}{source_tag}Kanban {source_id} gave up "
+            f"after repeated {trigger} failures{error}"
+        )
+    if kind == "crashed":
+        return (
+            f"✖ {board_tag}{tag}Kanban {sub['task_id']} worker crashed "
+            f"(pid gone); dispatcher will retry"
+        )
+    if kind == "timed_out":
+        limit = 0
+        if event.payload and event.payload.get("limit_seconds"):
+            limit = int(event.payload["limit_seconds"])
+        return (
+            f"⏱ {board_tag}{tag}Kanban {sub['task_id']} timed out "
+            f"(max_runtime={limit}s); will retry"
+        )
+    if kind == "status":
+        new_status = ""
+        if event.payload and event.payload.get("status"):
+            new_status = str(event.payload["status"])
+        return f"🔄 {board_tag}{tag}Kanban {sub['task_id']} → {new_status}"
+    # archived / unblocked are claimed so they cannot wedge later events, but
+    # intentionally produce neither a visible ping nor a foreground wake.
+    return None
+
+
 def _direct_boundary_comment_context(events: list[Any]) -> str:
     """Render comments captured on direct/root terminal boundaries."""
 
@@ -369,6 +473,281 @@ def _release_singleton_lock(handle) -> None:
         pass
 
 
+def _notifier_file_fingerprint(
+    path: Path,
+) -> tuple[int, int, int, int] | None:
+    try:
+        stat = path.stat()
+    except OSError:
+        return None
+    return (
+        int(stat.st_dev),
+        int(stat.st_ino),
+        int(stat.st_mtime_ns),
+        int(stat.st_size),
+    )
+
+
+def _notifier_db_fingerprint(
+    path: str,
+) -> tuple[
+    tuple[int, int, int, int] | None,
+    tuple[int, int, int, int] | None,
+]:
+    main = Path(path)
+    return (
+        _notifier_file_fingerprint(main),
+        _notifier_file_fingerprint(main.with_name(f"{main.name}-wal")),
+    )
+
+
+def _notifier_claim_retry_deadline(
+    conn: sqlite3.Connection,
+) -> int | None:
+    row = conn.execute(
+        """
+        SELECT MIN(pending_expires_at)
+          FROM (
+                SELECT pending_expires_at
+                  FROM kanban_notify_subs
+                 WHERE pending_claim_token IS NOT NULL
+                   AND pending_expires_at IS NOT NULL
+                UNION ALL
+                SELECT pending_expires_at
+                  FROM workflow_notify_subs
+                 WHERE pending_claim_token IS NOT NULL
+                   AND pending_expires_at IS NOT NULL
+          )
+        """
+    ).fetchone()
+    if row is None or row[0] is None:
+        return None
+    return int(row[0])
+
+
+def _dispatcher_board_db_fingerprint(
+    kanban_db: Any,
+    slug: str,
+) -> tuple[str, int | None, int | None]:
+    """Return the identity used to quarantine one corrupt-looking board."""
+
+    path = kanban_db.kanban_db_path(slug)
+    try:
+        resolved = str(path.expanduser().resolve())
+    except Exception:
+        resolved = str(path)
+    try:
+        stat = path.stat()
+    except OSError:
+        return (resolved, None, None)
+    return (resolved, stat.st_mtime_ns, stat.st_size)
+
+
+def _dispatcher_is_corrupt_board_db_error(
+    kanban_db: Any,
+    exc: Exception,
+) -> bool:
+    """Recognize the two SQLite corruption failures the watcher quarantines."""
+
+    corrupt_guard_error = getattr(kanban_db, "KanbanDbCorruptError", None)
+    if corrupt_guard_error is not None and isinstance(exc, corrupt_guard_error):
+        return True
+    if not isinstance(exc, sqlite3.DatabaseError):
+        return False
+    msg = str(exc).lower()
+    return (
+        "file is not a database" in msg
+        or "database disk image is malformed" in msg
+    )
+
+
+def _dispatcher_spawnable_pending(
+    kanban_db: Any,
+    conn: sqlite3.Connection,
+    slug: str,
+) -> bool:
+    """Best-effort health probe using the dispatch connection."""
+
+    try:
+        return bool(
+            kanban_db.has_spawnable_ready(conn)
+            or kanban_db.has_spawnable_review(conn)
+        )
+    except Exception:
+        # Health telemetry is best-effort and must not discard a valid
+        # dispatch result.
+        logger.debug(
+            "kanban dispatcher: health probe failed on board %s",
+            slug,
+            exc_info=True,
+        )
+        return False
+
+
+def _dispatcher_tick_one_board(
+    *,
+    kanban_db: Any,
+    slug: str,
+    dispatch_options: dict[str, Any],
+    disabled_corrupt_boards: dict[
+        str, tuple[tuple[str, int | None, int | None], float]
+    ],
+    corrupt_retry_after_seconds: float,
+) -> "tuple[Optional[object], bool]":
+    """Run one dispatch and health probe for a specific board."""
+
+    conn = None
+    fingerprint = _dispatcher_board_db_fingerprint(kanban_db, slug)
+    disabled_entry = disabled_corrupt_boards.get(slug)
+    if disabled_entry is not None:
+        disabled_fingerprint, disabled_at = disabled_entry
+        age = time.monotonic() - disabled_at
+        if (
+            disabled_fingerprint == fingerprint
+            and age < corrupt_retry_after_seconds
+        ):
+            return None, False
+        if disabled_fingerprint == fingerprint:
+            logger.info(
+                "kanban dispatcher: board %s database fingerprint unchanged "
+                "after %.0fs quarantine; retrying dispatch",
+                slug,
+                age,
+            )
+        else:
+            logger.info(
+                "kanban dispatcher: board %s database changed; retrying dispatch",
+                slug,
+            )
+        disabled_corrupt_boards.pop(slug, None)
+
+    try:
+        conn = kanban_db.connect(board=slug)
+        # `connect()` runs the schema + idempotent migration on first open per
+        # process. Keeping the health probe on this connection avoids a second
+        # open and board enumeration on every tick.
+        result = kanban_db.dispatch_once(
+            conn,
+            board=slug,
+            **dispatch_options,
+        )
+        return result, _dispatcher_spawnable_pending(kanban_db, conn, slug)
+    except sqlite3.DatabaseError as exc:
+        if _dispatcher_is_corrupt_board_db_error(kanban_db, exc):
+            disabled_corrupt_boards[slug] = (fingerprint, time.monotonic())
+            logger.error(
+                "kanban dispatcher: board %s database %s is not a valid "
+                "SQLite database; pausing dispatch for this board until "
+                "the file changes, the gateway restarts, or the "
+                "quarantine timer expires. Move or restore the file, "
+                "then run `hermes kanban init` if you need a fresh board.",
+                slug,
+                fingerprint[0],
+            )
+            return None, False
+        logger.exception("kanban dispatcher: tick failed on board %s", slug)
+        return None, False
+    except Exception as exc:
+        if _dispatcher_is_corrupt_board_db_error(kanban_db, exc):
+            disabled_corrupt_boards[slug] = (fingerprint, time.monotonic())
+            logger.error(
+                "kanban dispatcher: board %s database %s is not a valid "
+                "SQLite database; pausing dispatch for this board until "
+                "the file changes, the gateway restarts, or the "
+                "quarantine timer expires. Move or restore the file, "
+                "then run `hermes kanban init` if you need a fresh board.",
+                slug,
+                fingerprint[0],
+            )
+            return None, False
+        logger.exception("kanban dispatcher: tick failed on board %s", slug)
+        return None, False
+    finally:
+        if conn is not None:
+            try:
+                conn.close()
+            except Exception:
+                pass
+
+
+def _dispatcher_auto_decompose_tick(
+    *,
+    kanban_db: Any,
+    auto_decompose_per_tick: int,
+    boards: list[dict[str, Any]],
+) -> int:
+    """Specify or fan out up to N triage tasks across active boards."""
+
+    try:
+        from hermes_cli import kanban_decompose as decompose
+    except Exception as exc:  # pragma: no cover
+        logger.warning(
+            "kanban auto-decompose: import failed (%s); skipping",
+            exc,
+        )
+        return 0
+
+    attempted = 0
+    successes = 0
+    for board in boards:
+        slug = board.get("slug") or kanban_db.DEFAULT_BOARD
+        if attempted >= auto_decompose_per_tick:
+            break
+        # Pin this board only in the current worker context. An LLM
+        # specification can take minutes; mutating the process-wide
+        # environment here would misroute unrelated gateway threads.
+        with kanban_db.scoped_current_board(slug):
+            try:
+                triage_ids = decompose.list_triage_ids()
+            except Exception as exc:
+                logger.debug(
+                    "kanban auto-decompose: list_triage_ids failed on board %s (%s)",
+                    slug,
+                    exc,
+                )
+                triage_ids = []
+            for task_id in triage_ids:
+                if attempted >= auto_decompose_per_tick:
+                    break
+                attempted += 1
+                try:
+                    outcome = decompose.decompose_task(
+                        task_id,
+                        author="auto-decomposer",
+                    )
+                except Exception:
+                    logger.exception(
+                        "kanban auto-decompose: decompose_task crashed on %s",
+                        task_id,
+                    )
+                    continue
+                if outcome.ok:
+                    successes += 1
+                    if outcome.fanout and outcome.child_ids:
+                        logger.info(
+                            "kanban auto-decompose [%s]: %s → %d children",
+                            slug,
+                            task_id,
+                            len(outcome.child_ids),
+                        )
+                    else:
+                        logger.info(
+                            "kanban auto-decompose [%s]: %s → single task (no fanout)",
+                            slug,
+                            task_id,
+                        )
+                else:
+                    # Common no-op reasons (no aux client configured) should
+                    # not spam logs every tick.
+                    logger.debug(
+                        "kanban auto-decompose [%s]: %s skipped: %s",
+                        slug,
+                        task_id,
+                        outcome.reason,
+                    )
+    return successes
+
+
 class GatewayKanbanWatchersMixin:
     """Kanban watcher / notifier / dispatcher loops for GatewayRunner."""
 
@@ -376,6 +755,262 @@ class GatewayKanbanWatchersMixin:
     _workflow_notify_lease_seconds = 30 * 60
     _workflow_notifier_max_concurrency = 8
     _kanban_notifier_full_scan_seconds = 60.0
+
+    def _cutover_legacy_workflow_routes(
+        self,
+        *,
+        kanban_db: Any,
+        conn: sqlite3.Connection,
+    ) -> None:
+        """Finish route-by-route migration after each legacy cursor drains."""
+
+        for legacy_sub in kanban_db.list_notify_subs(conn):
+            legacy_task = kanban_db.get_task(
+                conn,
+                legacy_sub.get("task_id"),
+            )
+            workflow_id = str(
+                getattr(legacy_task, "workflow_id", "") or ""
+            ).strip()
+            if not workflow_id:
+                continue
+            try:
+                kanban_db.cutover_legacy_workflow_route(
+                    conn,
+                    workflow_id=workflow_id,
+                    platform=legacy_sub.get("platform"),
+                    chat_id=legacy_sub.get("chat_id"),
+                    chat_type=legacy_sub.get("chat_type"),
+                    thread_id=legacy_sub.get("thread_id"),
+                    user_id=legacy_sub.get("user_id"),
+                    notifier_profile=legacy_sub.get("notifier_profile"),
+                )
+            except Exception:
+                logger.debug(
+                    "kanban notifier: legacy workflow cutover deferred for %s",
+                    legacy_sub.get("task_id"),
+                    exc_info=True,
+                )
+
+    def _collect_workflow_notification_deliveries(
+        self,
+        *,
+        kanban_db: Any,
+        conn: sqlite3.Connection,
+        slug: str,
+        active_platforms: set[str],
+        notifier_profile: Optional[str],
+        deliveries: list[dict[str, Any]],
+    ) -> None:
+        """Claim workflow-isolated boundary batches for one board."""
+
+        for sub in kanban_db.list_workflow_notify_subs(conn):
+            owner_profile = sub.get("notifier_profile") or None
+            if owner_profile and owner_profile != notifier_profile:
+                owner_adapters = getattr(
+                    self,
+                    "_profile_adapters",
+                    {},
+                ).get(owner_profile)
+                if not owner_adapters:
+                    continue
+            platform = str(sub.get("platform") or "").lower()
+            if platform not in active_platforms:
+                continue
+            old_cursor, cursor, events, claim_token = (
+                kanban_db.claim_ready_workflow_events_for_sub(
+                    conn,
+                    workflow_id=sub["workflow_id"],
+                    notifier_profile=sub.get("notifier_profile"),
+                    platform=sub["platform"],
+                    chat_id=sub["chat_id"],
+                    thread_id=sub.get("thread_id") or "",
+                    limit=20,
+                )
+            )
+            workflow = kanban_db.get_workflow(conn, sub["workflow_id"])
+            if not events:
+                if (
+                    workflow is not None
+                    and workflow.status in {"closed", "archived"}
+                ):
+                    kanban_db.remove_workflow_notify_sub_if_idle(
+                        conn,
+                        workflow_id=sub["workflow_id"],
+                        notifier_profile=sub.get("notifier_profile"),
+                        platform=sub["platform"],
+                        chat_id=sub["chat_id"],
+                        thread_id=sub.get("thread_id") or "",
+                    )
+                continue
+            task_map = {
+                str(event.task_id): kanban_db.get_task(conn, event.task_id)
+                for event in events
+            }
+            deliveries.append(
+                {
+                    "delivery_kind": "workflow",
+                    "sub": sub,
+                    "old_cursor": old_cursor,
+                    "cursor": cursor,
+                    "claim_token": claim_token,
+                    "events": events,
+                    "tasks": task_map,
+                    "task": next(
+                        (
+                            task
+                            for task in task_map.values()
+                            if task is not None
+                        ),
+                        None,
+                    ),
+                    "workflow": workflow,
+                    "workflow_id": sub["workflow_id"],
+                    "board": slug,
+                }
+            )
+
+    def _collect_task_notification_deliveries(
+        self,
+        *,
+        kanban_db: Any,
+        conn: sqlite3.Connection,
+        slug: str,
+        active_platforms: set[str],
+        notifier_profile: Optional[str],
+        terminal_kinds: tuple[str, ...],
+        deliveries: list[dict[str, Any]],
+    ) -> None:
+        """Claim legacy task/subtree notification batches for one board."""
+
+        subs = kanban_db.list_notify_subs(conn)
+        if not subs:
+            logger.debug(
+                "kanban notifier: board %s has no subscriptions",
+                slug,
+            )
+        descendant_routes_by_root: dict[str, list[dict[str, Any]]] = {}
+        for candidate in subs:
+            if str(candidate.get("scope") or "task") == "descendants":
+                descendant_routes_by_root.setdefault(
+                    str(candidate.get("task_id") or ""),
+                    [],
+                ).append(candidate)
+
+        for sub in subs:
+            owner_profile = sub.get("notifier_profile") or None
+            if owner_profile and owner_profile != notifier_profile:
+                owner_adapters = getattr(
+                    self,
+                    "_profile_adapters",
+                    {},
+                ).get(owner_profile)
+                if not owner_adapters:
+                    logger.debug(
+                        "kanban notifier: subscription for %s owned by profile "
+                        "%s; current profile %s has no adapter for it, skipping",
+                        sub.get("task_id"),
+                        owner_profile,
+                        notifier_profile,
+                    )
+                    continue
+            platform = (sub.get("platform") or "").lower()
+            if platform not in active_platforms:
+                logger.debug(
+                    "kanban notifier: subscription for %s on %s skipped; "
+                    "adapter not connected",
+                    sub.get("task_id"),
+                    platform or "<missing>",
+                )
+                continue
+            old_cursor, cursor, events, claim_token = (
+                kanban_db.claim_unseen_events_for_sub(
+                    conn,
+                    task_id=sub["task_id"],
+                    platform=sub["platform"],
+                    chat_id=sub["chat_id"],
+                    thread_id=sub.get("thread_id") or "",
+                    kinds=terminal_kinds,
+                    limit=20,
+                )
+            )
+            if not events:
+                # Repair the ACK→unsubscribe crash window through the DB's
+                # lease-aware compare-and-swap.
+                task = kanban_db.get_task(conn, sub["task_id"])
+                root_task_id = kanban_db.loop_root_for_task(
+                    conn,
+                    sub["task_id"],
+                )
+                keep_workflow_subscription = (
+                    str(sub.get("scope") or "task") == "descendants"
+                    and str(root_task_id or "") == str(sub["task_id"])
+                    and task is not None
+                    and task.status != "archived"
+                )
+                if (
+                    task
+                    and task.status in {"done", "archived"}
+                    and not keep_workflow_subscription
+                ):
+                    kanban_db.remove_notify_sub_if_idle(
+                        conn,
+                        task_id=sub["task_id"],
+                        platform=sub["platform"],
+                        chat_id=sub["chat_id"],
+                        thread_id=sub.get("thread_id") or "",
+                    )
+                continue
+
+            task = kanban_db.get_task(conn, sub["task_id"])
+            root_task_id = kanban_db.loop_root_for_task(
+                conn,
+                sub["task_id"],
+            )
+            matching_root_route = bool(
+                root_task_id
+                and root_task_id != sub["task_id"]
+                and any(
+                    _same_notification_route(sub, root_sub)
+                    for root_sub in descendant_routes_by_root.get(
+                        root_task_id,
+                        [],
+                    )
+                )
+            )
+            root_route_owned_event_ids = (
+                kanban_db.loop_root_mirrored_source_event_ids(
+                    conn,
+                    root_task_id,
+                    [event.id for event in events],
+                )
+                if matching_root_route
+                else set()
+            )
+            logger.debug(
+                "kanban notifier: claimed %d event(s) for %s on board %s "
+                "cursor %s→%s",
+                len(events),
+                sub["task_id"],
+                slug,
+                old_cursor,
+                cursor,
+            )
+            deliveries.append(
+                {
+                    "sub": sub,
+                    "old_cursor": old_cursor,
+                    "cursor": cursor,
+                    "claim_token": claim_token,
+                    "events": events,
+                    "task": task,
+                    "board": slug,
+                    "root_task_id": root_task_id,
+                    "root_route_owned_event_ids": (
+                        root_route_owned_event_ids
+                    ),
+                }
+            )
 
     async def _kanban_notifier_watcher(self, interval: float = 5.0) -> None:
         """Poll ``kanban_notify_subs`` and deliver terminal events to users.
@@ -508,57 +1143,6 @@ class GatewayKanbanWatchersMixin:
                     now_monotonic = time.monotonic()
                     now_epoch = int(time.time())
 
-                    def _file_fingerprint(
-                        path: Path,
-                    ) -> tuple[int, int, int, int] | None:
-                        try:
-                            stat = path.stat()
-                        except OSError:
-                            return None
-                        return (
-                            int(stat.st_dev),
-                            int(stat.st_ino),
-                            int(stat.st_mtime_ns),
-                            int(stat.st_size),
-                        )
-
-                    def _db_fingerprint(
-                        path: str,
-                    ) -> tuple[
-                        tuple[int, int, int, int] | None,
-                        tuple[int, int, int, int] | None,
-                    ]:
-                        main = Path(path)
-                        return (
-                            _file_fingerprint(main),
-                            _file_fingerprint(
-                                main.with_name(f"{main.name}-wal")
-                            ),
-                        )
-
-                    def _claim_retry_deadline(
-                        conn: sqlite3.Connection,
-                    ) -> int | None:
-                        row = conn.execute(
-                            """
-                            SELECT MIN(pending_expires_at)
-                              FROM (
-                                    SELECT pending_expires_at
-                                      FROM kanban_notify_subs
-                                     WHERE pending_claim_token IS NOT NULL
-                                       AND pending_expires_at IS NOT NULL
-                                    UNION ALL
-                                    SELECT pending_expires_at
-                                      FROM workflow_notify_subs
-                                     WHERE pending_claim_token IS NOT NULL
-                                       AND pending_expires_at IS NOT NULL
-                              )
-                            """
-                        ).fetchone()
-                        if row is None or row[0] is None:
-                            return None
-                        return int(row[0])
-
                     # Enumerate every board on disk, but poll each resolved DB
                     # path once. Multiple slugs can point at the same DB when
                     # HERMES_KANBAN_DB pins the board path; without this guard
@@ -585,7 +1169,7 @@ class GatewayKanbanWatchersMixin:
                         seen_db_paths.add(resolved_db_path)
                         cacheable = not resolved_db_path.startswith("slug:")
                         fingerprint = (
-                            _db_fingerprint(resolved_db_path)
+                            _notifier_db_fingerprint(resolved_db_path)
                             if cacheable
                             else None
                         )
@@ -628,222 +1212,30 @@ class GatewayKanbanWatchersMixin:
                             # Opportunistically finish route-by-route migration
                             # after the legacy cursor drains. BEGIN IMMEDIATE in
                             # the DB helper makes the high-water swap lossless.
-                            for legacy_sub in _kb.list_notify_subs(conn):
-                                legacy_task = _kb.get_task(
-                                    conn, legacy_sub.get("task_id")
-                                )
-                                legacy_workflow_id = str(
-                                    getattr(legacy_task, "workflow_id", "") or ""
-                                ).strip()
-                                if not legacy_workflow_id:
-                                    continue
-                                try:
-                                    _kb.cutover_legacy_workflow_route(
-                                        conn,
-                                        workflow_id=legacy_workflow_id,
-                                        platform=legacy_sub.get("platform"),
-                                        chat_id=legacy_sub.get("chat_id"),
-                                        chat_type=legacy_sub.get("chat_type"),
-                                        thread_id=legacy_sub.get("thread_id"),
-                                        user_id=legacy_sub.get("user_id"),
-                                        notifier_profile=legacy_sub.get(
-                                            "notifier_profile"
-                                        ),
-                                    )
-                                except Exception:
-                                    logger.debug(
-                                        "kanban notifier: legacy workflow "
-                                        "cutover deferred for %s",
-                                        legacy_sub.get("task_id"),
-                                        exc_info=True,
-                                    )
-
-                            workflow_subs = _kb.list_workflow_notify_subs(conn)
-                            for sub in workflow_subs:
-                                owner_profile = sub.get("notifier_profile") or None
-                                if owner_profile and owner_profile != notifier_profile:
-                                    owner_adapters = getattr(
-                                        self, "_profile_adapters", {}
-                                    ).get(owner_profile)
-                                    if not owner_adapters:
-                                        continue
-                                platform = str(sub.get("platform") or "").lower()
-                                if platform not in active_platforms:
-                                    continue
-                                old_cursor, cursor, events, claim_token = (
-                                    _kb.claim_ready_workflow_events_for_sub(
-                                        conn,
-                                        workflow_id=sub["workflow_id"],
-                                        notifier_profile=sub.get(
-                                            "notifier_profile"
-                                        ),
-                                        platform=sub["platform"],
-                                        chat_id=sub["chat_id"],
-                                        thread_id=sub.get("thread_id") or "",
-                                        limit=20,
-                                    )
-                                )
-                                workflow = _kb.get_workflow(
-                                    conn, sub["workflow_id"]
-                                )
-                                if not events:
-                                    if (
-                                        workflow is not None
-                                        and workflow.status in {
-                                            "closed",
-                                            "archived",
-                                        }
-                                    ):
-                                        _kb.remove_workflow_notify_sub_if_idle(
-                                            conn,
-                                            workflow_id=sub["workflow_id"],
-                                            notifier_profile=sub.get(
-                                                "notifier_profile"
-                                            ),
-                                            platform=sub["platform"],
-                                            chat_id=sub["chat_id"],
-                                            thread_id=sub.get("thread_id") or "",
-                                        )
-                                    continue
-                                task_map = {
-                                    str(event.task_id): _kb.get_task(
-                                        conn, event.task_id
-                                    )
-                                    for event in events
-                                }
-                                deliveries.append(
-                                    {
-                                        "delivery_kind": "workflow",
-                                        "sub": sub,
-                                        "old_cursor": old_cursor,
-                                        "cursor": cursor,
-                                        "claim_token": claim_token,
-                                        "events": events,
-                                        "tasks": task_map,
-                                        "task": next(
-                                            (
-                                                task
-                                                for task in task_map.values()
-                                                if task is not None
-                                            ),
-                                            None,
-                                        ),
-                                        "workflow": workflow,
-                                        "workflow_id": sub["workflow_id"],
-                                        "board": slug,
-                                    }
-                                )
-
-                            subs = _kb.list_notify_subs(conn)
-                            if not subs:
-                                logger.debug("kanban notifier: board %s has no subscriptions", slug)
-                            descendant_routes_by_root: dict[str, list[dict[str, Any]]] = {}
-                            for candidate in subs:
-                                if str(candidate.get("scope") or "task") == "descendants":
-                                    descendant_routes_by_root.setdefault(
-                                        str(candidate.get("task_id") or ""),
-                                        [],
-                                    ).append(candidate)
-                            for sub in subs:
-                                owner_profile = sub.get("notifier_profile") or None
-                                if owner_profile and owner_profile != notifier_profile:
-                                    _owner_adapters = getattr(self, "_profile_adapters", {}).get(owner_profile)
-                                    if not _owner_adapters:
-                                        logger.debug(
-                                            "kanban notifier: subscription for %s owned by profile %s; current profile %s has no adapter for it, skipping",
-                                            sub.get("task_id"), owner_profile, notifier_profile,
-                                        )
-                                        continue
-                                platform = (sub.get("platform") or "").lower()
-                                if platform not in active_platforms:
-                                    logger.debug(
-                                        "kanban notifier: subscription for %s on %s skipped; adapter not connected",
-                                        sub.get("task_id"), platform or "<missing>",
-                                    )
-                                    continue
-                                old_cursor, cursor, events, claim_token = (
-                                    _kb.claim_unseen_events_for_sub(
-                                        conn,
-                                        task_id=sub["task_id"],
-                                        platform=sub["platform"],
-                                        chat_id=sub["chat_id"],
-                                        thread_id=sub.get("thread_id") or "",
-                                        kinds=TERMINAL_KINDS,
-                                        limit=20,
-                                    )
-                                )
-                                if not events:
-                                    # Repair the ACK→unsubscribe crash window.
-                                    # A concurrent watcher can also return no
-                                    # events because this row has a live claim,
-                                    # so deletion must go through the DB's
-                                    # lease-aware CAS.
-                                    task = _kb.get_task(conn, sub["task_id"])
-                                    root_task_id = _kb.loop_root_for_task(
-                                        conn, sub["task_id"]
-                                    )
-                                    keep_workflow_subscription = (
-                                        str(sub.get("scope") or "task")
-                                        == "descendants"
-                                        and str(root_task_id or "")
-                                        == str(sub["task_id"])
-                                        and task is not None
-                                        and task.status != "archived"
-                                    )
-                                    if (
-                                        task
-                                        and task.status in {"done", "archived"}
-                                        and not keep_workflow_subscription
-                                    ):
-                                        _kb.remove_notify_sub_if_idle(
-                                            conn,
-                                            task_id=sub["task_id"],
-                                            platform=sub["platform"],
-                                            chat_id=sub["chat_id"],
-                                            thread_id=sub.get("thread_id") or "",
-                                        )
-                                    continue
-                                task = _kb.get_task(conn, sub["task_id"])
-                                root_task_id = _kb.loop_root_for_task(
-                                    conn, sub["task_id"]
-                                )
-                                matching_root_route = bool(
-                                    root_task_id
-                                    and root_task_id != sub["task_id"]
-                                    and any(
-                                        _same_notification_route(sub, root_sub)
-                                        for root_sub in descendant_routes_by_root.get(
-                                            root_task_id, []
-                                        )
-                                    )
-                                )
-                                root_route_owned_event_ids = (
-                                    _kb.loop_root_mirrored_source_event_ids(
-                                        conn,
-                                        root_task_id,
-                                        [event.id for event in events],
-                                    )
-                                    if matching_root_route
-                                    else set()
-                                )
-                                logger.debug(
-                                    "kanban notifier: claimed %d event(s) for %s on board %s cursor %s→%s",
-                                    len(events), sub["task_id"], slug, old_cursor, cursor,
-                                )
-                                deliveries.append({
-                                    "sub": sub,
-                                    "old_cursor": old_cursor,
-                                    "cursor": cursor,
-                                    "claim_token": claim_token,
-                                    "events": events,
-                                    "task": task,
-                                    "board": slug,
-                                    "root_task_id": root_task_id,
-                                    "root_route_owned_event_ids": (
-                                        root_route_owned_event_ids
-                                    ),
-                                })
-                            next_claim_retry_at = _claim_retry_deadline(conn)
+                            self._cutover_legacy_workflow_routes(
+                                kanban_db=_kb,
+                                conn=conn,
+                            )
+                            self._collect_workflow_notification_deliveries(
+                                kanban_db=_kb,
+                                conn=conn,
+                                slug=slug,
+                                active_platforms=active_platforms,
+                                notifier_profile=notifier_profile,
+                                deliveries=deliveries,
+                            )
+                            self._collect_task_notification_deliveries(
+                                kanban_db=_kb,
+                                conn=conn,
+                                slug=slug,
+                                active_platforms=active_platforms,
+                                notifier_profile=notifier_profile,
+                                terminal_kinds=TERMINAL_KINDS,
+                                deliveries=deliveries,
+                            )
+                            next_claim_retry_at = (
+                                _notifier_claim_retry_deadline(conn)
+                            )
                         except Exception as exc:
                             # A failed full pass must never poison the unchanged
                             # cache. Retry it on the next notifier interval.
@@ -997,108 +1389,14 @@ class GatewayKanbanWatchersMixin:
 
                     for ev in events_to_deliver:
                         kind = ev.kind
-                        # Identity prefix: attribute terminal pings to the
-                        # worker that did the work. Makes fleets (where one
-                        # chat subscribes to many tasks) legible at a glance.
-                        who = (task.assignee if task and task.assignee else None)
-                        tag = f"@{who} " if who else ""
-                        if kind == "completed":
-                            # Prefer the run's summary (the worker's
-                            # intentional human-facing handoff, carried
-                            # in the event payload), then fall back to
-                            # task.result for legacy rows written before
-                            # runs shipped.
-                            handoff = ""
-                            payload_summary = None
-                            if ev.payload and ev.payload.get("summary"):
-                                payload_summary = str(ev.payload["summary"])
-                            if payload_summary:
-                                lines = payload_summary.strip().splitlines()
-                                h = lines[0][:200] if lines else payload_summary[:200]
-                                handoff = f"\n{h}"
-                            elif task and task.result:
-                                lines = task.result.strip().splitlines()
-                                r = lines[0][:160] if lines else task.result[:160]
-                                handoff = f"\n{r}"
-                            msg = (
-                                f"✔ {board_tag}{tag}Kanban {sub['task_id']} done"
-                                f" — {title}{handoff}"
-                            )
-                        elif kind == "loop_descendant_completed":
-                            payload = ev.payload or {}
-                            source_id = payload.get("source_task_id") or sub["task_id"]
-                            source_assignee = payload.get("assignee")
-                            source_tag = f"@{source_assignee} " if source_assignee else ""
-                            source_title = str(payload.get("title") or source_id)[:120]
-                            handoff = ""
-                            if payload.get("summary"):
-                                summary_lines = str(payload["summary"]).strip().splitlines()
-                                handoff = f"\n{(summary_lines[0] if summary_lines else str(payload['summary']))[:200]}"
-                            msg = (
-                                f"✔ {board_tag}{source_tag}Kanban {source_id} done"
-                                f" — {source_title}{handoff}"
-                            )
-                        elif kind in {"blocked", "block_loop_detected"}:
-                            reason = ""
-                            if ev.payload and ev.payload.get("reason"):
-                                reason = f": {str(ev.payload['reason'])[:160]}"
-                            msg = f"⏸ {board_tag}{tag}Kanban {sub['task_id']} blocked{reason}"
-                        elif kind == "loop_descendant_blocked":
-                            payload = ev.payload or {}
-                            source_id = payload.get("source_task_id") or sub["task_id"]
-                            source_assignee = payload.get("assignee")
-                            source_tag = f"@{source_assignee} " if source_assignee else ""
-                            reason = ""
-                            if payload.get("reason"):
-                                reason = f": {str(payload['reason'])[:160]}"
-                            msg = f"⏸ {board_tag}{source_tag}Kanban {source_id} blocked{reason}"
-                        elif kind == "gave_up":
-                            err = ""
-                            if ev.payload and ev.payload.get("error"):
-                                err = f"\n{str(ev.payload['error'])[:200]}"
-                            msg = (
-                                f"✖ {board_tag}{tag}Kanban {sub['task_id']} gave up "
-                                f"after repeated spawn failures{err}"
-                            )
-                        elif kind == "loop_descendant_gave_up":
-                            payload = ev.payload or {}
-                            source_id = payload.get("source_task_id") or sub["task_id"]
-                            source_assignee = payload.get("assignee")
-                            source_tag = f"@{source_assignee} " if source_assignee else ""
-                            trigger = str(payload.get("trigger_outcome") or "worker")
-                            err = ""
-                            if payload.get("error"):
-                                err = f"\n{str(payload['error'])[:200]}"
-                            msg = (
-                                f"✖ {board_tag}{source_tag}Kanban {source_id} gave up "
-                                f"after repeated {trigger} failures{err}"
-                            )
-                        elif kind == "crashed":
-                            msg = (
-                                f"✖ {board_tag}{tag}Kanban {sub['task_id']} worker crashed "
-                                f"(pid gone); dispatcher will retry"
-                            )
-                        elif kind == "timed_out":
-                            limit = 0
-                            if ev.payload and ev.payload.get("limit_seconds"):
-                                limit = int(ev.payload["limit_seconds"])
-                            msg = (
-                                f"⏱ {board_tag}{tag}Kanban {sub['task_id']} timed out "
-                                f"(max_runtime={limit}s); will retry"
-                            )
-                        elif kind == "status":
-                            new_status = ""
-                            if ev.payload and ev.payload.get("status"):
-                                new_status = str(ev.payload["status"])
-                            msg = f"🔄 {board_tag}{tag}Kanban {sub['task_id']} → {new_status}"
-                        else:
-                            # archived / unblocked are claimed by TERMINAL_KINDS
-                            # (so the cursor advances past them and they can't
-                            # wedge a later completed/blocked event behind an
-                            # unclaimed row) but are intentionally SILENT: an
-                            # archive needs no user ping, and unblocked is an
-                            # internal transition. They are also excluded from
-                            # _WAKE_KINDS below, so they never wake the creator.
+                        msg = _direct_boundary_message(
+                            event=ev,
+                            task=task,
+                            sub=sub,
+                            title=title,
+                            board_tag=board_tag,
+                        )
+                        if msg is None:
                             continue
                         metadata: dict[str, Any] = {}
                         if sub.get("thread_id"):
@@ -1262,144 +1560,16 @@ class GatewayKanbanWatchersMixin:
                             and task.status in {"done", "archived"}
                             and not keep_workflow_subscription
                         )
-                        _WAKE_KINDS = (
-                            "completed",
-                            "gave_up",
-                            "crashed",
-                            "timed_out",
-                            "blocked",
-                            "block_loop_detected",
-                            "loop_descendant_completed",
-                            "loop_descendant_blocked",
-                            "loop_descendant_gave_up",
+                        wake_failed = await self._wake_kanban_direct_delivery(
+                            delivery=d,
+                            sub=sub,
+                            task=task,
+                            events_for_wake=events_for_wake,
+                            platform=plat,
+                            platform_str=platform_str,
+                            route_profile=route_profile,
+                            adapter=adapter,
                         )
-                        root_route_owned_event_ids = {
-                            int(event_id)
-                            for event_id in (
-                                d.get("root_route_owned_event_ids") or set()
-                            )
-                        }
-                        wake_events = [
-                            event
-                            for event in events_for_wake
-                            if int(event.id) not in root_route_owned_event_ids
-                        ]
-                        _wake_kinds = {
-                            ev.kind for ev in wake_events if ev.kind in _WAKE_KINDS
-                        }
-                        wake_failed = False
-                        if _wake_kinds:
-                            try:
-                                descendant_events = [
-                                    ev
-                                    for ev in wake_events
-                                    if ev.kind in _DESCENDANT_BOUNDARY_KINDS
-                                ]
-                                descendant_event = (
-                                    descendant_events[0]
-                                    if descendant_events
-                                    else None
-                                )
-                                descendant_payload = (
-                                    descendant_event.payload or {}
-                                    if descendant_event is not None
-                                    else {}
-                                )
-                                _wake_task_id = str(
-                                    descendant_payload.get("source_task_id")
-                                    or sub["task_id"]
-                                )
-                                _title = str(
-                                    descendant_payload.get("title")
-                                    or (task.title if task else sub["task_id"])
-                                )[:120]
-                                _assignee = str(
-                                    descendant_payload.get("assignee")
-                                    or (task.assignee if task else "")
-                                )
-                                _synth = _descendant_wake_message(
-                                    root_task_id=str(sub["task_id"]),
-                                    board=str(board_slug),
-                                    events=wake_events,
-                                )
-                                if not _synth:
-                                    _parts = []
-                                    if "completed" in _wake_kinds:
-                                        _parts.append(t("gateway.kanban.wake.completed"))
-                                    if "gave_up" in _wake_kinds:
-                                        _parts.append(t("gateway.kanban.wake.gave_up"))
-                                    if "crashed" in _wake_kinds:
-                                        _parts.append(t("gateway.kanban.wake.crashed"))
-                                    if "timed_out" in _wake_kinds:
-                                        _parts.append(t("gateway.kanban.wake.timed_out"))
-                                    if "blocked" in _wake_kinds:
-                                        _parts.append(t("gateway.kanban.wake.blocked"))
-                                    if "block_loop_detected" in _wake_kinds:
-                                        _parts.append(t("gateway.kanban.wake.blocked"))
-                                    _status = (
-                                        t("gateway.kanban.wake.status_joiner").join(_parts)
-                                        or t("gateway.kanban.wake.status_default")
-                                    )
-                                    _synth = t(
-                                        "gateway.kanban.wake.message",
-                                        task_id=_wake_task_id,
-                                        status=_status,
-                                        title=_title,
-                                        assignee=_assignee,
-                                        board=board_slug,
-                                    )
-                                _synth += _direct_boundary_comment_context(
-                                    wake_events
-                                )
-                                from gateway.session import SessionSource
-                                from gateway.platforms.base import MessageEvent, MessageType
-
-                                chat_type = str(
-                                    sub.get("chat_type")
-                                    or (
-                                        "thread"
-                                        if sub.get("thread_id")
-                                        else "group"
-                                    )
-                                )
-                                _source = SessionSource(
-                                    platform=plat,
-                                    chat_id=sub["chat_id"],
-                                    chat_type=chat_type,
-                                    thread_id=sub.get("thread_id") or None,
-                                    user_id=sub.get("user_id"),
-                                    profile=route_profile,
-                                )
-                                _synth_event = MessageEvent(
-                                    text=_synth,
-                                    message_type=MessageType.TEXT,
-                                    source=_source,
-                                    internal=True,
-                                )
-                                await adapter.handle_message(_synth_event)
-                                logger.info(
-                                    "kanban notifier: woke agent for %s on "
-                                    "%s/%s profile=%s events=%s",
-                                    sub["task_id"],
-                                    platform_str,
-                                    sub["chat_id"],
-                                    sub_profile or "default",
-                                    _wake_kinds,
-                                )
-                            except Exception as _wk_err:
-                                wake_failed = True
-                                logger.warning(
-                                    "kanban notifier: wakeup injection failed for %s: %s",
-                                    sub["task_id"], _wk_err, exc_info=True,
-                                )
-                                await asyncio.to_thread(
-                                    self._kanban_rewind,
-                                    sub,
-                                    d["cursor"],
-                                    d.get("old_cursor", 0),
-                                    d.get("claim_token"),
-                                    board_slug,
-                                )
                         if not wake_failed:
                             claim_completed = await asyncio.to_thread(
                                 self._kanban_advance,
@@ -1427,6 +1597,156 @@ class GatewayKanbanWatchersMixin:
                 if not self._running:
                     return
                 await asyncio.sleep(1)
+
+    async def _wake_kanban_direct_delivery(
+        self,
+        *,
+        delivery: dict[str, Any],
+        sub: dict[str, Any],
+        task: Any,
+        events_for_wake: list[Any],
+        platform: Any,
+        platform_str: str,
+        route_profile: Optional[str],
+        adapter: Any,
+    ) -> bool:
+        """Inject one internal foreground wake; return True when it failed."""
+
+        wake_kinds = {
+            "completed",
+            "gave_up",
+            "crashed",
+            "timed_out",
+            "blocked",
+            "block_loop_detected",
+            "loop_descendant_completed",
+            "loop_descendant_blocked",
+            "loop_descendant_gave_up",
+        }
+        root_route_owned_event_ids = {
+            int(event_id)
+            for event_id in (
+                delivery.get("root_route_owned_event_ids") or set()
+            )
+        }
+        wake_events = [
+            event
+            for event in events_for_wake
+            if int(event.id) not in root_route_owned_event_ids
+        ]
+        triggered_kinds = {
+            event.kind for event in wake_events if event.kind in wake_kinds
+        }
+        if not triggered_kinds:
+            return False
+
+        board_slug = delivery.get("board")
+        try:
+            descendant_event = next(
+                (
+                    event
+                    for event in wake_events
+                    if event.kind in _DESCENDANT_BOUNDARY_KINDS
+                ),
+                None,
+            )
+            descendant_payload = (
+                descendant_event.payload or {}
+                if descendant_event is not None
+                else {}
+            )
+            wake_task_id = str(
+                descendant_payload.get("source_task_id") or sub["task_id"]
+            )
+            title = str(
+                descendant_payload.get("title")
+                or (task.title if task else sub["task_id"])
+            )[:120]
+            assignee = str(
+                descendant_payload.get("assignee")
+                or (task.assignee if task else "")
+            )
+            message = _descendant_wake_message(
+                root_task_id=str(sub["task_id"]),
+                board=str(board_slug),
+                events=wake_events,
+            )
+            if not message:
+                parts = []
+                if "completed" in triggered_kinds:
+                    parts.append(t("gateway.kanban.wake.completed"))
+                if "gave_up" in triggered_kinds:
+                    parts.append(t("gateway.kanban.wake.gave_up"))
+                if "crashed" in triggered_kinds:
+                    parts.append(t("gateway.kanban.wake.crashed"))
+                if "timed_out" in triggered_kinds:
+                    parts.append(t("gateway.kanban.wake.timed_out"))
+                if "blocked" in triggered_kinds:
+                    parts.append(t("gateway.kanban.wake.blocked"))
+                if "block_loop_detected" in triggered_kinds:
+                    parts.append(t("gateway.kanban.wake.blocked"))
+                status = (
+                    t("gateway.kanban.wake.status_joiner").join(parts)
+                    or t("gateway.kanban.wake.status_default")
+                )
+                message = t(
+                    "gateway.kanban.wake.message",
+                    task_id=wake_task_id,
+                    status=status,
+                    title=title,
+                    assignee=assignee,
+                    board=board_slug,
+                )
+            message += _direct_boundary_comment_context(wake_events)
+            from gateway.platforms.base import MessageEvent, MessageType
+            from gateway.session import SessionSource
+
+            chat_type = str(
+                sub.get("chat_type")
+                or ("thread" if sub.get("thread_id") else "group")
+            )
+            source = SessionSource(
+                platform=platform,
+                chat_id=sub["chat_id"],
+                chat_type=chat_type,
+                thread_id=sub.get("thread_id") or None,
+                user_id=sub.get("user_id"),
+                profile=route_profile,
+            )
+            await adapter.handle_message(
+                MessageEvent(
+                    text=message,
+                    message_type=MessageType.TEXT,
+                    source=source,
+                    internal=True,
+                )
+            )
+            logger.info(
+                "kanban notifier: woke agent for %s on "
+                "%s/%s profile=%s events=%s",
+                sub["task_id"],
+                platform_str,
+                sub["chat_id"],
+                str(sub.get("notifier_profile") or "").strip() or "default",
+                triggered_kinds,
+            )
+            return False
+        except Exception as exc:
+            logger.warning(
+                "kanban notifier: wakeup injection failed for %s: %s",
+                sub["task_id"],
+                exc,
+                exc_info=True,
+            )
+            await asyncio.to_thread(
+                self._kanban_rewind,
+                sub,
+                delivery["cursor"],
+                delivery.get("old_cursor", 0),
+                delivery.get("claim_token"),
+                board_slug,
+            )
+            return True
 
     async def _deliver_kanban_workflow_routes(
         self,
@@ -2347,171 +2667,14 @@ class GatewayKanbanWatchersMixin:
         disabled_corrupt_boards: dict[
             str, tuple[tuple[str, int | None, int | None], float]
         ] = {}
-
-        def _board_db_fingerprint(slug: str) -> tuple[str, int | None, int | None]:
-            path = _kb.kanban_db_path(slug)
-            try:
-                resolved = str(path.expanduser().resolve())
-            except Exception:
-                resolved = str(path)
-            try:
-                stat = path.stat()
-            except OSError:
-                return (resolved, None, None)
-            return (resolved, stat.st_mtime_ns, stat.st_size)
-
-        def _is_corrupt_board_db_error(exc: Exception) -> bool:
-            corrupt_guard_error = getattr(_kb, "KanbanDbCorruptError", None)
-            if corrupt_guard_error is not None and isinstance(exc, corrupt_guard_error):
-                return True
-            if not isinstance(exc, sqlite3.DatabaseError):
-                return False
-            msg = str(exc).lower()
-            return (
-                "file is not a database" in msg
-                or "database disk image is malformed" in msg
-            )
-
-        def _tick_once_for_board(
-            slug: str,
-        ) -> "tuple[Optional[object], bool]":
-            """Run one dispatch and health probe for a specific board.
-
-            Runs in a worker thread via `asyncio.to_thread`. `board=slug`
-            is passed through `dispatch_once` so `resolve_workspace` and
-            `_default_spawn` see the right paths. The spawnable-pending
-            health state is read before this same connection closes, avoiding
-            a second open and a second board enumeration each tick.
-            """
-            conn = None
-            fingerprint = _board_db_fingerprint(slug)
-            disabled_entry = disabled_corrupt_boards.get(slug)
-
-            def _spawnable_pending(
-                board_conn: sqlite3.Connection,
-            ) -> bool:
-                try:
-                    return bool(
-                        _kb.has_spawnable_ready(board_conn)
-                        or _kb.has_spawnable_review(board_conn)
-                    )
-                except Exception:
-                    # Health telemetry is best-effort and must not discard a
-                    # valid dispatch result.
-                    logger.debug(
-                        "kanban dispatcher: health probe failed on board %s",
-                        slug,
-                        exc_info=True,
-                    )
-                    return False
-
-            def _foreground_session_busy(session_id: str) -> bool:
-                session_id = str(session_id or "")
-                if not session_id:
-                    return False
-                if session_id in getattr(self, "_running_agents", {}):
-                    return True
-                try:
-                    from hermes_cli.active_sessions import active_session_registry_snapshot
-
-                    for entry in active_session_registry_snapshot():
-                        if str(entry.get("session_id") or "") != session_id:
-                            continue
-                        metadata = entry.get("metadata")
-                        if not isinstance(metadata, dict):
-                            continue
-                        running = metadata.get("running")
-                        if running is True or str(running).strip().lower() in {
-                            "1",
-                            "true",
-                            "yes",
-                            "on",
-                        }:
-                            return True
-                except Exception:
-                    logger.debug(
-                        "kanban dispatcher: active-session busy lookup failed",
-                        exc_info=True,
-                    )
-                return False
-
-            if disabled_entry is not None:
-                disabled_fingerprint, disabled_at = disabled_entry
-                age = time.monotonic() - disabled_at
-                if (
-                    disabled_fingerprint == fingerprint
-                    and age < CORRUPT_BOARD_RETRY_AFTER_SECONDS
-                ):
-                    return None, False
-                if disabled_fingerprint == fingerprint:
-                    logger.info(
-                        "kanban dispatcher: board %s database fingerprint unchanged "
-                        "after %.0fs quarantine; retrying dispatch",
-                        slug,
-                        age,
-                    )
-                else:
-                    logger.info(
-                        "kanban dispatcher: board %s database changed; retrying dispatch",
-                        slug,
-                    )
-                disabled_corrupt_boards.pop(slug, None)
-            try:
-                conn = _kb.connect(board=slug)
-                # `connect()` runs the schema + idempotent migration on
-                # first open per process; the previous explicit
-                # `init_db()` call here busted the per-process cache and
-                # re-ran the migration on a second connection, racing
-                # the first. See the matching comment in
-                # `_kanban_notifier_watcher` and issue #21378.
-                result = _kb.dispatch_once(
-                    conn,
-                    board=slug,
-                    max_spawn=max_spawn,
-                    max_in_progress=max_in_progress,
-                    failure_limit=failure_limit,
-                    stale_timeout_seconds=stale_timeout_seconds,
-                    default_assignee=default_assignee,
-                    max_in_progress_per_profile=max_in_progress_per_profile,
-                )
-                ready_pending = _spawnable_pending(conn)
-                return result, ready_pending
-            except sqlite3.DatabaseError as exc:
-                if _is_corrupt_board_db_error(exc):
-                    disabled_corrupt_boards[slug] = (fingerprint, time.monotonic())
-                    logger.error(
-                        "kanban dispatcher: board %s database %s is not a valid "
-                        "SQLite database; pausing dispatch for this board until "
-                        "the file changes, the gateway restarts, or the "
-                        "quarantine timer expires. Move or restore the file, "
-                        "then run `hermes kanban init` if you need a fresh board.",
-                        slug,
-                        fingerprint[0],
-                    )
-                    return None, False
-                logger.exception("kanban dispatcher: tick failed on board %s", slug)
-                return None, False
-            except Exception as exc:
-                if _is_corrupt_board_db_error(exc):
-                    disabled_corrupt_boards[slug] = (fingerprint, time.monotonic())
-                    logger.error(
-                        "kanban dispatcher: board %s database %s is not a valid "
-                        "SQLite database; pausing dispatch for this board until "
-                        "the file changes, the gateway restarts, or the "
-                        "quarantine timer expires. Move or restore the file, "
-                        "then run `hermes kanban init` if you need a fresh board.",
-                        slug,
-                        fingerprint[0],
-                    )
-                    return None, False
-                logger.exception("kanban dispatcher: tick failed on board %s", slug)
-                return None, False
-            finally:
-                if conn is not None:
-                    try:
-                        conn.close()
-                    except Exception:
-                        pass
+        dispatch_options = {
+            "max_spawn": max_spawn,
+            "max_in_progress": max_in_progress,
+            "failure_limit": failure_limit,
+            "stale_timeout_seconds": stale_timeout_seconds,
+            "default_assignee": default_assignee,
+            "max_in_progress_per_profile": max_in_progress_per_profile,
+        }
 
         def _active_boards() -> list[dict[str, Any]]:
             """Return the one authoritative board snapshot for this tick."""
@@ -2527,7 +2690,15 @@ class GatewayKanbanWatchersMixin:
             out: list[tuple[str, "Optional[object]", bool]] = []
             for b in boards:
                 slug = b.get("slug") or _kb.DEFAULT_BOARD
-                result, ready_pending = _tick_once_for_board(slug)
+                result, ready_pending = _dispatcher_tick_one_board(
+                    kanban_db=_kb,
+                    slug=slug,
+                    dispatch_options=dispatch_options,
+                    disabled_corrupt_boards=disabled_corrupt_boards,
+                    corrupt_retry_after_seconds=(
+                        CORRUPT_BOARD_RETRY_AFTER_SECONDS
+                    ),
+                )
                 out.append((slug, result, ready_pending))
             return out
 
@@ -2558,65 +2729,11 @@ class GatewayKanbanWatchersMixin:
             boards. Returns the number of triage tasks that were
             successfully decomposed or specified this tick.
             """
-            try:
-                from hermes_cli import kanban_decompose as _decomp
-            except Exception as exc:  # pragma: no cover
-                logger.warning(
-                    "kanban auto-decompose: import failed (%s); skipping", exc,
-                )
-                return 0
-            attempted = 0
-            successes = 0
-            for b in boards:
-                slug = b.get("slug") or _kb.DEFAULT_BOARD
-                if attempted >= auto_decompose_per_tick:
-                    break
-                # Pin this board only in the current worker context. An LLM
-                # specification can take minutes; mutating the process-wide
-                # environment here would misroute unrelated gateway threads.
-                with _kb.scoped_current_board(slug):
-                    try:
-                        triage_ids = _decomp.list_triage_ids()
-                    except Exception as exc:
-                        logger.debug(
-                            "kanban auto-decompose: list_triage_ids failed on board %s (%s)",
-                            slug, exc,
-                        )
-                        triage_ids = []
-                    for tid in triage_ids:
-                        if attempted >= auto_decompose_per_tick:
-                            break
-                        attempted += 1
-                        try:
-                            outcome = _decomp.decompose_task(
-                                tid, author="auto-decomposer",
-                            )
-                        except Exception:
-                            logger.exception(
-                                "kanban auto-decompose: decompose_task crashed on %s",
-                                tid,
-                            )
-                            continue
-                        if outcome.ok:
-                            successes += 1
-                            if outcome.fanout and outcome.child_ids:
-                                logger.info(
-                                    "kanban auto-decompose [%s]: %s → %d children",
-                                    slug, tid, len(outcome.child_ids),
-                                )
-                            else:
-                                logger.info(
-                                    "kanban auto-decompose [%s]: %s → single task (no fanout)",
-                                    slug, tid,
-                                )
-                        else:
-                            # Common no-op reasons (no aux client configured) shouldn't
-                            # spam logs every tick. Log at debug.
-                            logger.debug(
-                                "kanban auto-decompose [%s]: %s skipped: %s",
-                                slug, tid, outcome.reason,
-                            )
-            return successes
+            return _dispatcher_auto_decompose_tick(
+                kanban_db=_kb,
+                auto_decompose_per_tick=auto_decompose_per_tick,
+                boards=boards,
+            )
 
         logger.info(
             "kanban dispatcher: embedded in gateway (interval=%.1fs)", interval
