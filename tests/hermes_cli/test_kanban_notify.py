@@ -26,26 +26,38 @@ def kanban_home(tmp_path, monkeypatch):
     return home
 
 
-def _create_loop_root_and_child(conn):
-    root = kb.create_task(conn, title="loop root", assignee="orchestrator")
+def _create_loop_root_and_child(conn, *, session_id=None):
+    root = kb.create_task(
+        conn,
+        title="loop root",
+        assignee="orchestrator",
+        session_id=session_id,
+    )
     child = kb.create_task(
         conn,
         title="loop child",
         assignee="worker1",
         created_by=f"loop:{root}",
+        session_id=session_id,
     )
     return root, child
 
 
-def test_root_subscription_claims_semantic_descendant_block_once(kanban_home):
+def test_descendant_scope_claims_child_block_once(kanban_home):
     conn = kb.connect()
     try:
-        root, child = _create_loop_root_and_child(conn)
-        kb.add_notify_sub(conn, task_id=root, platform="telegram", chat_id="chat1")
+        root, child = _create_loop_root_and_child(conn, session_id="loop-session")
+        kb.add_notify_sub(
+            conn,
+            task_id=root,
+            platform="telegram",
+            chat_id="chat1",
+            scope="descendants",
+        )
 
         assert kb.block_task(conn, child, reason="review-required: QA should inspect")
 
-        _old, _cursor, events = kb.claim_unseen_events_for_sub(
+        _old, _cursor, events, _token = kb.claim_unseen_events_for_sub(
             conn,
             task_id=root,
             platform="telegram",
@@ -60,9 +72,11 @@ def test_root_subscription_claims_semantic_descendant_block_once(kanban_home):
         assert payload["source_task_id"] == child
         assert payload["source_kind"] == "blocked"
         assert payload["reason"] == "review-required: QA should inspect"
+        assert payload["recurrences"] == 1
+        assert "kind" in payload
         assert payload["loop_root_task_id"] == root
 
-        _old2, _cursor2, replay = kb.claim_unseen_events_for_sub(
+        _old2, _cursor2, replay, _token2 = kb.claim_unseen_events_for_sub(
             conn,
             task_id=root,
             platform="telegram",
@@ -74,38 +88,157 @@ def test_root_subscription_claims_semantic_descendant_block_once(kanban_home):
         conn.close()
 
 
-def test_root_subscription_ignores_nonsemantic_descendant_terminal_events(kanban_home):
+def test_descendant_block_loop_mirror_preserves_recurrence_context(kanban_home):
     conn = kb.connect()
     try:
-        root, nonsemantic_child = _create_loop_root_and_child(conn)
-        routine_child = kb.create_task(
-            conn,
-            title="routine child",
-            assignee="worker1",
-            created_by=f"loop:{root}",
-        )
-        kb.add_notify_sub(conn, task_id=root, platform="telegram", chat_id="chat1")
-
-        assert kb.block_task(conn, nonsemantic_child, reason="ordinary implementation issue")
-        assert kb.complete_task(conn, routine_child, summary="ordinary child done")
-
-        _old, _cursor, events = kb.claim_unseen_events_for_sub(
+        root, child = _create_loop_root_and_child(conn)
+        kb.add_notify_sub(
             conn,
             task_id=root,
             platform="telegram",
             chat_id="chat1",
-            kinds=("loop_descendant_blocked", "loop_descendant_gave_up", "completed"),
+            scope="descendants",
         )
-        assert events == []
+        assert kb.block_task(
+            conn,
+            child,
+            reason="capability is still unavailable",
+            kind="capability",
+        )
+        assert kb.unblock_task(conn, child)
+        assert kb.block_task(
+            conn,
+            child,
+            reason="capability is still unavailable",
+            kind="capability",
+        )
+
+        _old, _cursor, events, _token = kb.claim_unseen_events_for_sub(
+            conn,
+            task_id=root,
+            platform="telegram",
+            chat_id="chat1",
+            kinds=("loop_descendant_blocked",),
+        )
+        assert len(events) == 2
+        payload = events[-1].payload or {}
+        assert payload["source_kind"] == "block_loop_detected"
+        assert payload["kind"] == "capability"
+        assert payload["recurrences"] == 2
+        assert payload["limit"] == kb.BLOCK_RECURRENCE_LIMIT
     finally:
         conn.close()
 
 
-def test_root_subscription_claims_descendant_gave_up_once(kanban_home):
+def test_descendant_scope_claims_child_completion_and_includes_comments(kanban_home):
     conn = kb.connect()
     try:
         root, child = _create_loop_root_and_child(conn)
-        kb.add_notify_sub(conn, task_id=root, platform="telegram", chat_id="chat1")
+        kb.add_notify_sub(
+            conn,
+            task_id=root,
+            platform="telegram",
+            chat_id="chat1",
+            scope="descendants",
+        )
+        kb.add_comment(
+            conn,
+            child,
+            author="worker1",
+            body="Please run the focused integration review next.",
+        )
+
+        # A comment is advisory state only: it does not mirror to the root or
+        # wake the foreground until the worker crosses a completion/block
+        # boundary.
+        _old, _cursor, before_boundary, _token = kb.claim_unseen_events_for_sub(
+            conn,
+            task_id=root,
+            platform="telegram",
+            chat_id="chat1",
+            kinds=("loop_descendant_completed",),
+        )
+        assert before_boundary == []
+
+        assert kb.complete_task(conn, child, summary="implementation ready")
+
+        _old, _cursor, events, _token = kb.claim_unseen_events_for_sub(
+            conn,
+            task_id=root,
+            platform="telegram",
+            chat_id="chat1",
+            kinds=("loop_descendant_completed",),
+        )
+        assert len(events) == 1
+        payload = events[0].payload or {}
+        assert events[0].kind == "loop_descendant_completed"
+        assert payload["source_task_id"] == child
+        assert payload["summary"] == "implementation ready"
+        assert len(payload["comments"]) == 1
+        assert payload["comments"][0]["author"] == "worker1"
+        assert (
+            payload["comments"][0]["body"]
+            == "Please run the focused integration review next."
+        )
+        assert isinstance(payload["comments"][0]["created_at"], int)
+    finally:
+        conn.close()
+
+
+def test_task_scope_does_not_claim_descendant_boundaries(kanban_home):
+    conn = kb.connect()
+    try:
+        root, child = _create_loop_root_and_child(conn)
+        kb.add_notify_sub(
+            conn,
+            task_id=root,
+            platform="telegram",
+            chat_id="task-route",
+            scope="task",
+        )
+        kb.add_notify_sub(
+            conn,
+            task_id=root,
+            platform="telegram",
+            chat_id="tree-route",
+            scope="descendants",
+        )
+        assert kb.complete_task(conn, child, summary="child complete")
+
+        _old, _cursor, task_events, _token = kb.claim_unseen_events_for_sub(
+            conn,
+            task_id=root,
+            platform="telegram",
+            chat_id="task-route",
+            kinds=("loop_descendant_completed",),
+        )
+        assert task_events == []
+
+        _old, _cursor, tree_events, _token = kb.claim_unseen_events_for_sub(
+            conn,
+            task_id=root,
+            platform="telegram",
+            chat_id="tree-route",
+            kinds=("loop_descendant_completed",),
+        )
+        assert [event.kind for event in tree_events] == [
+            "loop_descendant_completed"
+        ]
+    finally:
+        conn.close()
+
+
+def test_descendant_scope_claims_child_gave_up_once(kanban_home):
+    conn = kb.connect()
+    try:
+        root, child = _create_loop_root_and_child(conn)
+        kb.add_notify_sub(
+            conn,
+            task_id=root,
+            platform="telegram",
+            chat_id="chat1",
+            scope="descendants",
+        )
 
         blocked = kb._record_task_failure(
             conn,
@@ -117,7 +250,7 @@ def test_root_subscription_claims_descendant_gave_up_once(kanban_home):
         )
         assert blocked is True
 
-        _old, _cursor, events = kb.claim_unseen_events_for_sub(
+        _old, _cursor, events, _token = kb.claim_unseen_events_for_sub(
             conn,
             task_id=root,
             platform="telegram",
@@ -134,7 +267,7 @@ def test_root_subscription_claims_descendant_gave_up_once(kanban_home):
         assert payload["error"] == "worker crashed repeatedly"
         assert payload["trigger_outcome"] == "crashed"
 
-        _old2, _cursor2, replay = kb.claim_unseen_events_for_sub(
+        _old2, _cursor2, replay, _token2 = kb.claim_unseen_events_for_sub(
             conn,
             task_id=root,
             platform="telegram",
@@ -168,6 +301,7 @@ async def test_notifier_unsubs_after_completed_event(kanban_home):
     runner._kanban_sub_fail_counts = {}
 
     fake_adapter = MagicMock()
+    fake_adapter.handle_message = AsyncMock()
 
     async def _send_and_stop(chat_id, msg, metadata=None):
         runner._running = False
@@ -228,6 +362,7 @@ async def test_notifier_unsubs_after_abnormal_events(kind, kanban_home):
     runner._kanban_sub_fail_counts = {}
 
     fake_adapter = MagicMock()
+    fake_adapter.handle_message = AsyncMock()
 
     async def _send_and_stop(chat_id, msg, metadata=None):
         runner._running = False
@@ -251,8 +386,8 @@ async def test_notifier_unsubs_after_abnormal_events(kind, kanban_home):
     assert kind.replace('_', ' ') in fake_adapter.send.call_args[0][1]
 
     # ...but the subscription survives so a respawn-then-same-event cycle
-    # reaches the user too. The cursor (last_event_id) advanced inside
-    # the same write txn as the claim, so the same event won't re-fire.
+    # reaches the user too. The successful foreground delivery commits
+    # the durable claim, so the same event won't re-fire.
     conn = kb.connect()
     try:
         subs = kb.list_notify_subs(conn, tid)
@@ -264,8 +399,8 @@ async def test_notifier_unsubs_after_abnormal_events(kind, kanban_home):
     )
     assert int(subs[0]["last_event_id"]) >= 1, (
         "Cursor should have advanced past the delivered event "
-        "(claim_unseen_events_for_sub advances atomically inside the "
-        "same write txn as the read)."
+        "(the exact notification claim should be acknowledged after "
+        "successful delivery)."
     )
 
 
@@ -288,6 +423,7 @@ async def test_notifier_second_blocked_delivers(kanban_home):
         delivered_msgs.append(msg)
 
     fake_adapter = MagicMock()
+    fake_adapter.handle_message = AsyncMock()
     fake_adapter.send = AsyncMock(side_effect=_capture_send)
     runner.adapters = {Platform.TELEGRAM: fake_adapter}
 
@@ -348,21 +484,22 @@ async def test_notifier_second_blocked_delivers(kanban_home):
 
 
 @pytest.mark.asyncio
-async def test_notifier_delivers_semantic_descendant_block_to_root_sub(kanban_home):
-    """A Loop root subscription should receive semantic child blockers."""
+async def test_notifier_delivers_descendant_block_to_tree_sub(kanban_home):
+    """A tree-scoped Loop root subscription receives child blockers."""
     import hermes_cli.kanban_db as kb
     from gateway.run import GatewayRunner
     from gateway.config import Platform
 
     conn = kb.connect()
     try:
-        root, child = _create_loop_root_and_child(conn)
+        root, child = _create_loop_root_and_child(conn, session_id="loop-session")
         kb.add_notify_sub(
             conn,
             task_id=root,
             platform="telegram",
             chat_id="chat1",
             thread_id="thread1",
+            scope="descendants",
         )
         assert kb.block_task(conn, child, reason="needs-user: choose one")
     finally:
@@ -373,11 +510,13 @@ async def test_notifier_delivers_semantic_descendant_block_to_root_sub(kanban_ho
     runner._kanban_sub_fail_counts = {}
 
     fake_adapter = MagicMock()
+    fake_adapter.handle_message = AsyncMock()
 
     async def _send_and_stop(chat_id, msg, metadata=None):
         runner._running = False
 
     fake_adapter.send = AsyncMock(side_effect=_send_and_stop)
+    fake_adapter.handle_message = AsyncMock()
     runner.adapters = {Platform.TELEGRAM: fake_adapter}
 
     _orig_sleep = asyncio.sleep
@@ -399,6 +538,12 @@ async def test_notifier_delivers_semantic_descendant_block_to_root_sub(kanban_ho
     assert root not in call_msg.split("blocked", 1)[0]
     assert "needs-user: choose one" in call_msg
     assert call_metadata["thread_id"] == "thread1"
+    fake_adapter.handle_message.assert_awaited_once()
+    wake_event = fake_adapter.handle_message.await_args.args[0]
+    assert child in wake_event.text
+    assert wake_event.internal is True
+    assert wake_event.source.chat_id == "chat1"
+    assert wake_event.source.thread_id == "thread1"
 
     conn = kb.connect()
     try:
@@ -408,6 +553,189 @@ async def test_notifier_delivers_semantic_descendant_block_to_root_sub(kanban_ho
         conn.close()
     assert len(root_subs) == 1
     assert child_subs == []
+
+
+@pytest.mark.asyncio
+async def test_notifier_deduplicates_root_mirror_when_child_has_the_same_route(
+    kanban_home,
+):
+    """A shared root/child route gets one notification and one foreground wake."""
+    from gateway.config import Platform
+    from gateway.run import GatewayRunner
+
+    conn = kb.connect()
+    try:
+        root, child = _create_loop_root_and_child(conn, session_id="loop-session")
+        for task_id in (root, child):
+            kb.add_notify_sub(
+                conn,
+                task_id=task_id,
+                platform="telegram",
+                chat_id="chat1",
+                thread_id="thread1",
+                scope="descendants" if task_id == root else "task",
+            )
+        assert kb.block_task(conn, child, reason="needs-user: choose once")
+    finally:
+        conn.close()
+
+    runner = object.__new__(GatewayRunner)
+    runner._running = True
+    runner._kanban_sub_fail_counts = {}
+    fake_adapter = MagicMock()
+    fake_adapter.handle_message = AsyncMock()
+
+    async def _send_and_stop(chat_id, msg, metadata=None):
+        runner._running = False
+
+    fake_adapter.send = AsyncMock(side_effect=_send_and_stop)
+    fake_adapter.handle_message = AsyncMock()
+    runner.adapters = {Platform.TELEGRAM: fake_adapter}
+
+    original_sleep = asyncio.sleep
+
+    async def _fast_sleep(_):
+        await original_sleep(0)
+
+    with patch("gateway.run.asyncio.sleep", side_effect=_fast_sleep):
+        await asyncio.wait_for(
+            runner._kanban_notifier_watcher(interval=1),
+            timeout=10.0,
+        )
+
+    fake_adapter.send.assert_awaited_once()
+    assert child in fake_adapter.send.await_args.args[1]
+    fake_adapter.handle_message.assert_awaited_once()
+    assert child in fake_adapter.handle_message.await_args.args[0].text
+
+
+@pytest.mark.asyncio
+async def test_notifier_keeps_direct_wake_when_root_was_subscribed_after_boundary(
+    kanban_home,
+):
+    """A same-route root row cannot suppress a child event it never mirrored."""
+    from gateway.config import Platform
+    from gateway.run import GatewayRunner
+
+    conn = kb.connect()
+    try:
+        root, child = _create_loop_root_and_child(
+            conn,
+            session_id="loop-session",
+        )
+        kb.add_notify_sub(
+            conn,
+            task_id=child,
+            platform="telegram",
+            chat_id="chat1",
+            thread_id="thread1",
+        )
+        assert kb.complete_task(conn, child, summary="boundary before root sub")
+        assert not [
+            event
+            for event in kb.list_events(conn, root)
+            if event.kind == "loop_descendant_completed"
+        ]
+        kb.add_notify_sub(
+            conn,
+            task_id=root,
+            platform="telegram",
+            chat_id="chat1",
+            thread_id="thread1",
+            scope="descendants",
+        )
+    finally:
+        conn.close()
+
+    runner = object.__new__(GatewayRunner)
+    runner._running = True
+    runner._kanban_sub_fail_counts = {}
+    fake_adapter = MagicMock()
+
+    async def _send_and_stop(chat_id, msg, metadata=None):
+        runner._running = False
+
+    fake_adapter.send = AsyncMock(side_effect=_send_and_stop)
+    fake_adapter.handle_message = AsyncMock()
+    runner.adapters = {Platform.TELEGRAM: fake_adapter}
+
+    original_sleep = asyncio.sleep
+
+    async def _fast_sleep(_):
+        await original_sleep(0)
+
+    with patch("gateway.run.asyncio.sleep", side_effect=_fast_sleep):
+        await asyncio.wait_for(
+            runner._kanban_notifier_watcher(interval=1),
+            timeout=10.0,
+        )
+
+    fake_adapter.handle_message.assert_awaited_once()
+    wake = fake_adapter.handle_message.await_args.args[0]
+    assert child in wake.text
+    assert "boundary before root sub" in wake.text
+
+
+@pytest.mark.asyncio
+async def test_notifier_keeps_root_mirror_for_same_route_owned_by_another_profile(
+    kanban_home,
+):
+    """A different bot/profile subscription is not a duplicate delivery route."""
+    from gateway.config import Platform
+    from gateway.run import GatewayRunner
+
+    conn = kb.connect()
+    try:
+        root, child = _create_loop_root_and_child(conn, session_id="loop-session")
+        kb.add_notify_sub(
+            conn,
+            task_id=root,
+            platform="telegram",
+            chat_id="chat1",
+            thread_id="thread1",
+            notifier_profile="default",
+            scope="descendants",
+        )
+        kb.add_notify_sub(
+            conn,
+            task_id=child,
+            platform="telegram",
+            chat_id="chat1",
+            thread_id="thread1",
+            notifier_profile="business-partner",
+        )
+        assert kb.block_task(conn, child, reason="needs-user: default must still wake")
+    finally:
+        conn.close()
+
+    runner = object.__new__(GatewayRunner)
+    runner._running = True
+    runner._kanban_sub_fail_counts = {}
+    runner._kanban_notifier_profile = "default"
+    fake_adapter = MagicMock()
+    fake_adapter.handle_message = AsyncMock()
+
+    async def _send_and_stop(chat_id, msg, metadata=None):
+        runner._running = False
+
+    fake_adapter.send = AsyncMock(side_effect=_send_and_stop)
+    fake_adapter.handle_message = AsyncMock()
+    runner.adapters = {Platform.TELEGRAM: fake_adapter}
+
+    original_sleep = asyncio.sleep
+
+    async def _fast_sleep(_):
+        await original_sleep(0)
+
+    with patch("gateway.run.asyncio.sleep", side_effect=_fast_sleep):
+        await asyncio.wait_for(
+            runner._kanban_notifier_watcher(interval=1),
+            timeout=10.0,
+        )
+
+    fake_adapter.send.assert_awaited_once()
+    assert child in fake_adapter.send.await_args.args[1]
+    fake_adapter.handle_message.assert_awaited_once()
 
 
 # ---------------------------------------------------------------------------
@@ -441,6 +769,7 @@ async def test_notifier_does_not_call_init_db(kanban_home):
     runner._kanban_sub_fail_counts = {}
 
     fake_adapter = MagicMock()
+    fake_adapter.handle_message = AsyncMock()
     fake_adapter.send = AsyncMock()
     runner.adapters = {Platform.TELEGRAM: fake_adapter}
 
@@ -540,6 +869,7 @@ async def test_notifier_skips_subscription_owned_by_other_profile(kanban_home):
     runner._kanban_notifier_profile = "business-partner"
 
     fake_adapter = MagicMock()
+    fake_adapter.handle_message = AsyncMock()
     fake_adapter.send = AsyncMock()
     runner.adapters = {Platform.TELEGRAM: fake_adapter}
 
@@ -596,6 +926,7 @@ async def test_notifier_delivers_subscription_owned_by_current_profile(kanban_ho
     runner._kanban_notifier_profile = "default"
 
     fake_adapter = MagicMock()
+    fake_adapter.handle_message = AsyncMock()
 
     async def _send_and_stop(chat_id, msg, metadata=None):
         runner._running = False
@@ -724,6 +1055,7 @@ async def test_notifier_uploads_artifacts_on_completion(kanban_home, tmp_path, m
     runner._kanban_sub_fail_counts = {}
 
     fake_adapter = MagicMock()
+    fake_adapter.handle_message = AsyncMock()
     fake_adapter.name = "telegram"
 
     sends: list = []
@@ -808,6 +1140,7 @@ async def test_notifier_artifact_delivery_skips_missing_files(kanban_home, tmp_p
     runner._kanban_sub_fail_counts = {}
 
     fake_adapter = MagicMock()
+    fake_adapter.handle_message = AsyncMock()
     fake_adapter.name = "telegram"
 
     documents_uploaded: list = []

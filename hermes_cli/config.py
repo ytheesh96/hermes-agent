@@ -2270,6 +2270,16 @@ DEFAULT_CONFIG = {
         "provider": "",
     },
 
+    # Live Loop graph construction.  This is a durable graph bound, separate
+    # from delegation.max_concurrent_children (which limits ephemeral agents).
+    "loop": {
+        "max_graph_nodes": 32,
+        # Durable JIT-specification retry/lease windows. The lease prevents two
+        # watchers compiling the same skeleton; failures back off before retry.
+        "specification_retry_seconds": 60,
+        "specification_lease_seconds": 300,
+    },
+
     # Subagent delegation — override the provider:model used by delegate_task
     # so child agents can run on a different (cheaper/faster) provider and model.
     # Uses the same runtime provider resolution as CLI/gateway startup, so all
@@ -2799,7 +2809,7 @@ DEFAULT_CONFIG = {
         # raise these to keep more early failure evidence.
         "worker_log_rotate_bytes": 2 * 1024 * 1024,
         "worker_log_backup_count": 1,
-        # Profile assigned to the root/orchestration task after Triage
+        # Profile assigned to the original decomposition-shell task after Triage
         # decomposition. When unset, falls back to the default profile (the
         # one `hermes` launches with no -p flag). This does not control the
         # decomposer prompt, model, or skills; configure that LLM path under

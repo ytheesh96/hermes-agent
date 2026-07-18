@@ -4,8 +4,9 @@ import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 
 import {
   addLoopTaskComment,
+  archiveLoopNodes,
   createLoopDraftTask,
-  decomposeLoopTask,
+  getKanbanCapabilities,
   getLoopCanvasPositions,
   getLoopSessionSource,
   getLoopTaskDetail,
@@ -13,7 +14,6 @@ import {
   type LoopCanvasPosition,
   loopSourceFromDraftResult,
   mergeLoopDraftSource,
-  reviewLoopHandoffForTask,
   saveLoopCanvasPositions,
   unlinkLoopTasks,
   updateLoopTaskStatus
@@ -23,14 +23,16 @@ import { notify, notifyError } from '@/store/notifications'
 import { $activeGatewayProfile } from '@/store/profile'
 import { openSessionInNewWindow } from '@/store/windows'
 
-import { requestComposerInsert } from './composer/focus'
-import { buildLoopChatDraft } from './loop-intake'
-import type { LoopTaskAction } from './loop-panel'
+import { requestComposerInsert, requestComposerSubmit } from './composer/focus'
+import { buildLoopChatDraft, buildLoopTriageDraft } from './loop-intake'
+import type { LoopTaskAction, LoopTaskCreateOptions } from './loop-panel'
 import { loopSessionSourceRefetchInterval } from './loop-refresh'
 import {
   deriveLoopPanelStateFromTenantSource,
   type LoopPanelState,
   type LoopRow,
+  loopTaskAllowsDependencyEdits,
+  loopTaskAllowsDependencySource,
   type TenantLoopSource
 } from './loop-state'
 
@@ -42,16 +44,19 @@ interface LoopPanelControllerOptions {
   onAddContextRef: (refText: string, label?: string, detail?: string) => void
 }
 
-function normalizeLoopStatus(status?: null | string): string {
-  return (status || '').trim().toLowerCase().replaceAll('-', '_')
-}
+const LIVE_LOOP_GRAPH_BACKEND_REQUIRED =
+  'Backend update required: this Hermes backend does not support live Loop graph editing.'
 
 function archiveableLoopRows(state: LoopPanelState | null, fallback: LoopRow): LoopRow[] {
   const rows = state?.rows.length ? state.rows : [fallback]
   const seen = new Set<string>()
 
   return rows.filter(row => {
-    if (seen.has(row.taskId) || normalizeLoopStatus(row.status) === 'archived') {
+    if (
+      (fallback.workflowId && row.workflowId !== fallback.workflowId) ||
+      seen.has(row.taskId) ||
+      !loopTaskAllowsDependencyEdits(row)
+    ) {
       return false
     }
 
@@ -61,14 +66,30 @@ function archiveableLoopRows(state: LoopPanelState | null, fallback: LoopRow): L
   })
 }
 
-function shouldApproveLoopIntakeOnSubmit(row: LoopRow): boolean {
-  const intake = row.loopIntake
+function loopRelationWorkflowId(state: LoopPanelState | null, ...taskIds: string[]): string {
+  const workflowIds = new Set(
+    taskIds
+      .map(taskId => state?.rows.find(row => row.taskId === taskId)?.workflowId?.trim())
+      .filter((workflowId): workflowId is string => Boolean(workflowId))
+  )
 
-  if (!intake || intake.needed !== true || intake.dispatchable === true) {
-    return false
+  if (workflowIds.size === 1) {
+    return [...workflowIds][0]!
   }
 
-  return true
+  return workflowIds.size > 1 ? '' : state?.workflowId || ''
+}
+
+function loopDependencyTargetIsEditable(state: LoopPanelState | null, childId: string): boolean {
+  const child = state?.rows.find(row => row.taskId === childId)
+
+  return Boolean(child && loopTaskAllowsDependencyEdits(child))
+}
+
+function loopDependencySourceIsEditable(state: LoopPanelState | null, parentId: string): boolean {
+  const parent = state?.rows.find(row => row.taskId === parentId)
+
+  return Boolean(parent && loopTaskAllowsDependencySource(parent))
 }
 
 function loopPanelAutoOpenParams(): { enabled: boolean; taskId: null | string } {
@@ -135,14 +156,14 @@ export function useLoopPanelController({
   const autoOpenedLoopPanelRef = useRef<string | null>(null)
   const pendingSelectedLoopTaskIdRef = useRef<string | null>(null)
 
-  const loopPanelRootKey = loopPanelState?.rootTaskId || ''
+  const loopPanelWorkflowKey = loopPanelState?.workflowId || ''
   const loopCanvasScopeKey = loopSourceSessionId || activeSessionId || 'new'
   const loopSourceBoard = loopSourceQuery.data?.board || undefined
 
   const loopCanvasPositionsQuery = useQuery({
-    queryKey: ['loop-canvas-positions', activeGatewayProfile, loopSourceBoard, loopPanelRootKey, loopSourceSessionId],
-    queryFn: () => getLoopCanvasPositions(loopPanelRootKey, activeGatewayProfile, loopSourceBoard, loopSourceSessionId),
-    enabled: gatewayOpen && Boolean(loopPanelRootKey),
+    queryKey: ['loop-canvas-positions', activeGatewayProfile, loopSourceBoard, loopPanelWorkflowKey, loopSourceSessionId],
+    queryFn: () => getLoopCanvasPositions(loopPanelWorkflowKey, activeGatewayProfile, loopSourceBoard, loopSourceSessionId),
+    enabled: gatewayOpen && Boolean(loopPanelWorkflowKey),
     staleTime: 2_000
   })
 
@@ -195,60 +216,15 @@ export function useLoopPanelController({
     }
   })
 
-  const loopTaskDecomposeMutation = useMutation({
-    mutationFn: ({ approveIntake, taskId }: { approveIntake?: boolean; taskId: string }) =>
-      decomposeLoopTask(taskId, activeGatewayProfile, { approveIntake, board: loopSourceBoard }),
-    onSuccess: async result => {
-      if (!result.ok) {
-        notify({
-          kind: 'warning',
-          title: 'Loop submit blocked',
-          message: result.reason || `Could not submit ${result.task_id || 'Loop task'}`
-        })
-      }
-
-      await queryClient.invalidateQueries({
-        queryKey: ['loop-session-source', activeGatewayProfile, loopSourceSessionId]
-      })
-      await queryClient.invalidateQueries({ queryKey: ['loop-task-detail', activeGatewayProfile] })
-    },
-    onError: error => {
-      notifyError(error, 'Loop submit failed')
-    }
-  })
-
   const loopTaskArchiveMutation = useMutation({
-    mutationFn: async ({ taskIds }: { taskIds: string[] }) => {
-      await Promise.all(
-        taskIds.map(taskId =>
-          updateLoopTaskStatus(taskId, 'archived', activeGatewayProfile, { board: loopSourceBoard })
-        )
-      )
-    },
+    mutationFn: ({ taskIds, workflowId }: { taskIds: string[]; workflowId: string }) =>
+      archiveLoopNodes(workflowId, taskIds, activeGatewayProfile, loopSourceBoard, loopSourceSessionId),
+    onError: error => notifyError(error, 'Archive Loop task failed'),
     onSuccess: async () => {
       await queryClient.invalidateQueries({
         queryKey: ['loop-session-source', activeGatewayProfile, loopSourceSessionId]
       })
       await queryClient.invalidateQueries({ queryKey: ['loop-task-detail', activeGatewayProfile] })
-    }
-  })
-
-  const loopReviewDecisionMutation = useMutation({
-    mutationFn: ({
-      action,
-      taskId
-    }: {
-      action: Extract<LoopTaskAction, 'accept-review' | 'escalate-review' | 'reject-review'>
-      taskId: string
-    }) => reviewLoopHandoffForTask(taskId, action, activeGatewayProfile, { board: loopSourceQuery.data?.board }),
-    onSuccess: async () => {
-      await queryClient.invalidateQueries({
-        queryKey: ['loop-session-source', activeGatewayProfile, loopSourceSessionId]
-      })
-      await queryClient.invalidateQueries({ queryKey: ['loop-task-detail', activeGatewayProfile] })
-    },
-    onError: error => {
-      console.error('Loop review decision failed', error)
     }
   })
 
@@ -337,27 +313,53 @@ export function useLoopPanelController({
   }, [])
 
   const handleCreateLoopTask = useCallback(
-    async (idea: string, assignee: string): Promise<null | string> => {
+    async (idea: string, options: LoopTaskCreateOptions = {}): Promise<null | string> => {
       const title = idea.trim()
       const sourceSessionId = loopSourceSessionId || (await ensureLoopSourceSessionId?.())?.trim()
+      const targetWorkflowId = options.workflowId || loopPanelWorkflowKey || undefined
+      const creatingWorkflow = !targetWorkflowId
 
       if (!title || !sourceSessionId) {
         return null
       }
 
       try {
+        if (!creatingWorkflow) {
+          let liveLoopGraph = false
+
+          try {
+            const capabilities = await queryClient.fetchQuery({
+              queryFn: () => getKanbanCapabilities(activeGatewayProfile),
+              queryKey: ['kanban-capabilities', activeGatewayProfile],
+              staleTime: Infinity
+            })
+
+            liveLoopGraph = capabilities.live_loop_graph === true
+          } catch {
+            // Older managed backends do not expose this route. Do not let them
+            // silently create an orphan when they ignore graph metadata.
+          }
+
+          if (!liveLoopGraph) {
+            throw new Error(LIVE_LOOP_GRAPH_BACKEND_REQUIRED)
+          }
+        }
+
         const result = await createLoopDraftTask({
-          assignee,
+          assignee: creatingWorkflow ? null : undefined,
           board: loopSourceBoard,
+          childIds: options.childId ? [options.childId] : undefined,
           idempotencyKey: `loop-draft:${sourceSessionId}:${crypto.randomUUID()}`,
+          parents: options.parentId ? [options.parentId] : undefined,
           profile: activeGatewayProfile,
           sessionId: sourceSessionId,
-          title
+          title,
+          workflowId: targetWorkflowId
         })
 
         const source = loopSourceFromDraftResult(sourceSessionId, result)
 
-        if (source && !loopPanelRootKey) {
+        if (source && !loopPanelWorkflowKey) {
           const queryKey = ['loop-session-source', activeGatewayProfile, sourceSessionId]
 
           const reconciledSource = mergeLoopDraftSource(queryClient.getQueryData<TenantLoopSource>(queryKey), source)
@@ -372,8 +374,16 @@ export function useLoopPanelController({
 
         const taskId = result.task?.id
 
-        if (!loopPanelRootKey) {
+        if (!loopPanelWorkflowKey) {
           handleOpenLoopPanel(taskId)
+        }
+
+        if (creatingWorkflow && taskId) {
+          const createdBoard = result.source?.board || result.board || loopSourceBoard
+
+          requestComposerSubmit(buildLoopTriageDraft({ taskId, title: result.task?.title || title }, createdBoard), {
+            target: 'main'
+          })
         }
 
         notify({ kind: 'success', message: `Task added · ${result.task?.title || title}` })
@@ -390,7 +400,7 @@ export function useLoopPanelController({
       activeSessionId,
       ensureLoopSourceSessionId,
       handleOpenLoopPanel,
-      loopPanelRootKey,
+      loopPanelWorkflowKey,
       loopSourceBoard,
       loopSourceSessionId,
       queryClient
@@ -405,16 +415,16 @@ export function useLoopPanelController({
   )
 
   const handleSaveLoopCanvasPositions = useCallback(
-    async (positions: LoopCanvasPosition[], rootTaskId?: string): Promise<boolean> => {
-      const targetRootTaskId = rootTaskId?.trim() || loopPanelRootKey
+    async (positions: LoopCanvasPosition[], workflowId?: string): Promise<boolean> => {
+      const targetWorkflowId = workflowId?.trim() || loopPanelWorkflowKey
 
-      if (!targetRootTaskId) {
+      if (!targetWorkflowId) {
         return false
       }
 
       try {
         const saved = await saveLoopCanvasPositions(
-          targetRootTaskId,
+          targetWorkflowId,
           positions,
           activeGatewayProfile,
           loopSourceBoard,
@@ -422,7 +432,7 @@ export function useLoopPanelController({
         )
 
         queryClient.setQueryData(
-          ['loop-canvas-positions', activeGatewayProfile, loopSourceBoard, targetRootTaskId, loopSourceSessionId],
+          ['loop-canvas-positions', activeGatewayProfile, loopSourceBoard, targetWorkflowId, loopSourceSessionId],
           saved
         )
 
@@ -433,18 +443,36 @@ export function useLoopPanelController({
         return false
       }
     },
-    [activeGatewayProfile, loopPanelRootKey, loopSourceBoard, loopSourceSessionId, queryClient]
+    [activeGatewayProfile, loopPanelWorkflowKey, loopSourceBoard, loopSourceSessionId, queryClient]
   )
 
   const handleLinkLoopTasks = useCallback(
     async (parentId: string, childId: string): Promise<boolean> => {
+      if (!loopDependencySourceIsEditable(loopPanelState, parentId)) {
+        notify({ kind: 'warning', message: 'This task is immutable while its generated work is active.' })
+
+        return false
+      }
+
+      if (!loopDependencyTargetIsEditable(loopPanelState, childId)) {
+        notify({ kind: 'warning', message: 'Dependencies can only be changed while the child task is pending.' })
+
+        return false
+      }
+
       try {
+        const workflowId = loopRelationWorkflowId(loopPanelState, parentId, childId)
+
+        if (!workflowId) {
+          throw new Error('Select tasks from one workflow before editing dependencies.')
+        }
+
         await linkLoopTasks(
           parentId,
           childId,
           activeGatewayProfile,
           loopSourceBoard,
-          loopPanelRootKey,
+          workflowId,
           loopSourceSessionId
         )
         await queryClient.invalidateQueries({
@@ -458,13 +486,38 @@ export function useLoopPanelController({
         return false
       }
     },
-    [activeGatewayProfile, loopPanelRootKey, loopSourceBoard, loopSourceSessionId, queryClient]
+    [activeGatewayProfile, loopPanelState, loopSourceBoard, loopSourceSessionId, queryClient]
   )
 
   const handleUnlinkLoopTasks = useCallback(
     async (parentId: string, childId: string): Promise<boolean> => {
+      if (!loopDependencySourceIsEditable(loopPanelState, parentId)) {
+        notify({ kind: 'warning', message: 'This task is immutable while its generated work is active.' })
+
+        return false
+      }
+
+      if (!loopDependencyTargetIsEditable(loopPanelState, childId)) {
+        notify({ kind: 'warning', message: 'Dependencies can only be changed while the child task is pending.' })
+
+        return false
+      }
+
       try {
-        const result = await unlinkLoopTasks(parentId, childId, activeGatewayProfile, loopSourceBoard)
+        const workflowId = loopRelationWorkflowId(loopPanelState, parentId, childId)
+
+        if (!workflowId) {
+          throw new Error('Select tasks from one workflow before editing dependencies.')
+        }
+
+        const result = await unlinkLoopTasks(
+          parentId,
+          childId,
+          activeGatewayProfile,
+          loopSourceBoard,
+          workflowId,
+          loopSourceSessionId
+        )
 
         await queryClient.invalidateQueries({
           queryKey: ['loop-session-source', activeGatewayProfile, loopSourceSessionId]
@@ -477,7 +530,7 @@ export function useLoopPanelController({
         return false
       }
     },
-    [activeGatewayProfile, loopSourceBoard, loopSourceSessionId, queryClient]
+    [activeGatewayProfile, loopPanelState, loopSourceBoard, loopSourceSessionId, queryClient]
   )
 
   const handleLoopTaskAction = useCallback(
@@ -508,33 +561,34 @@ export function useLoopPanelController({
         return
       }
 
-      if (action === 'decompose') {
-        loopTaskDecomposeMutation.mutate({
-          approveIntake: shouldApproveLoopIntakeOnSubmit(row),
-          taskId: row.taskId
-        })
-
-        return
-      }
-
       if (action === 'archive-loop') {
         const taskIds = archiveableLoopRows(loopPanelState, row).map(task => task.taskId)
+        const workflowId = row.workflowId?.trim() || loopPanelState?.workflowId || ''
 
-        if (taskIds.length) {
-          loopTaskArchiveMutation.mutate({ taskIds })
+        if (taskIds.length && workflowId) {
+          loopTaskArchiveMutation.mutate({ taskIds, workflowId })
         }
 
         return
       }
 
-      if (action === 'accept-review' || action === 'escalate-review' || action === 'reject-review') {
-        loopReviewDecisionMutation.mutate({ action, taskId: row.taskId })
+      if (action === 'archive' && !loopTaskAllowsDependencyEdits(row)) {
+        notify({ kind: 'warning', message: 'Only pending tasks can be archived from the Loop graph.' })
+
+        return
+      }
+
+      if (action === 'archive') {
+        const workflowId = row.workflowId?.trim() || loopPanelState?.workflowId || ''
+
+        if (workflowId) {
+          loopTaskArchiveMutation.mutate({ taskIds: [row.taskId], workflowId })
+        }
 
         return
       }
 
       const nextStatusByAction: Partial<Record<LoopTaskAction, string>> = {
-        archive: 'archived',
         block: 'blocked',
         park: 'scheduled',
         start: 'ready',
@@ -552,9 +606,7 @@ export function useLoopPanelController({
     [
       handleSelectLoopTaskId,
       loopPanelState,
-      loopReviewDecisionMutation,
       loopTaskArchiveMutation,
-      loopTaskDecomposeMutation,
       loopTaskStatusMutation,
       onAddContextRef
     ]
@@ -577,7 +629,7 @@ export function useLoopPanelController({
     onUnlinkTasks: handleUnlinkLoopTasks,
     open: loopPanelOpen,
     positions: loopCanvasPositionsQuery.data?.positions,
-    rootTaskId: loopPanelRootKey || undefined,
+    workflowId: loopPanelWorkflowKey || undefined,
     selectedTaskDetail: selectedLoopTaskDetailQuery.data,
     selectedTaskDetailError: selectedLoopTaskDetailError,
     selectedTaskId: selectedLoopTaskId,

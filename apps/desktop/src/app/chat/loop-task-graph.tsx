@@ -14,22 +14,23 @@ import {
 import { StatusIndicator, type StatusIndicatorKind } from '@/components/chat/status-indicator'
 import { Button } from '@/components/ui/button'
 import { Codicon } from '@/components/ui/codicon'
-import {
-  DropdownMenu,
-  DropdownMenuContent,
-  DropdownMenuRadioGroup,
-  DropdownMenuRadioItem,
-  DropdownMenuTrigger
-} from '@/components/ui/dropdown-menu'
-import { getLoopAssignees } from '@/hermes'
 import { useResizeObserver } from '@/hooks/use-resize-observer'
 import { cn } from '@/lib/utils'
 
-import type { LoopTaskAction } from './loop-panel'
-import type { LoopRow } from './loop-state'
+import type { LoopTaskAction, LoopTaskCreateOptions } from './loop-panel'
+import {
+  type LoopRow,
+  loopTaskAllowsDependencyEdits,
+  loopTaskAllowsDependencySource,
+  loopTaskPhaseLabel
+} from './loop-state'
 
 function normalizedLoopValue(value?: null | string): string {
   return (value || '').trim().toLowerCase().replaceAll('-', '_')
+}
+
+function loopGraphTargetAllowsDependency(row: LoopRow): boolean {
+  return loopTaskAllowsDependencyEdits(row)
 }
 
 const TERMINAL_LOOP_STATUSES = new Set(['archived', 'cancelled', 'complete', 'completed', 'done'])
@@ -53,7 +54,13 @@ function isActiveLoopRow(row: LoopRow): boolean {
   const status = normalizedLoopValue(row.status)
   const runStatus = normalizedLoopValue(row.latestRun?.status)
 
-  return row.active || status === 'running' || status === 'in_progress' || runStatus === 'running'
+  return (
+    row.active ||
+    (row.activeDecompositionChildCount || 0) > 0 ||
+    status === 'running' ||
+    status === 'in_progress' ||
+    runStatus === 'running'
+  )
 }
 
 function attentionText(row: LoopRow): string {
@@ -69,18 +76,7 @@ function attentionText(row: LoopRow): string {
     row.latestRun?.summary,
     row.reviewKind,
     row.resumeMode,
-    row.reviewSubjectAssignee,
-    ...(row.loopHandoffs || []).flatMap(handoff => [
-      handoff.handoff_kind,
-      handoff.intent,
-      handoff.target_actor,
-      handoff.queue_state,
-      handoff.state,
-      handoff.attention,
-      handoff.verification_state,
-      handoff.summary,
-      handoff.reason
-    ])
+    row.reviewSubjectAssignee
   ]
     .filter((value): value is string => Boolean(value))
     .join(' ')
@@ -91,6 +87,10 @@ function loopRowStatusIndicator(row: LoopRow): StatusIndicatorKind {
   const status = normalizedLoopValue(row.status)
   const runStatus = normalizedLoopValue(row.latestRun?.status)
   const runOutcome = normalizedLoopValue(row.latestRun?.outcome)
+
+  if (row.specificationFailure) {
+    return row.specificationFailure.backing_off ? 'attention' : 'failed'
+  }
 
   const failed =
     FAILED_LOOP_STATUSES.has(status) || FAILED_LOOP_STATUSES.has(runStatus) || FAILED_LOOP_STATUSES.has(runOutcome)
@@ -123,7 +123,12 @@ function loopRowStatusIndicator(row: LoopRow): StatusIndicatorKind {
 }
 
 function LoopStatusIndicator({ row }: { row: LoopRow }) {
-  return <StatusIndicator ariaLabel={`Status: ${row.status}`} kind={loopRowStatusIndicator(row)} />
+  return (
+    <StatusIndicator
+      ariaLabel={`Status: ${loopTaskPhaseLabel(row) || row.status}`}
+      kind={loopRowStatusIndicator(row)}
+    />
+  )
 }
 
 const loopTextValue = (value: unknown): string | undefined =>
@@ -292,7 +297,6 @@ const LOOP_GRAPH_COLUMN_GAP = 18
 const LOOP_GRAPH_COMPONENT_GAP = 72
 const LOOP_GRAPH_ROW_GAP = 34
 const LOOP_GRAPH_PADDING = 32
-const LOOP_GRAPH_ACTION_TRAY_GAP = 8
 const LOOP_GRAPH_CANVAS_PADDING = 32
 const LOOP_GRAPH_MIN_ZOOM = 0.3
 const LOOP_GRAPH_MAX_ZOOM = 2
@@ -701,8 +705,7 @@ function loopTaskGraphLayout(rows: LoopRow[]): LoopTaskGraphLayout {
 
     const maxRowColumns = Math.max(1, ...Array.from(rowsByDepth.values()).map(depthRows => depthRows.length))
 
-    const width =
-      maxRowColumns * LOOP_GRAPH_NODE_WIDTH + Math.max(0, maxRowColumns - 1) * LOOP_GRAPH_COLUMN_GAP
+    const width = maxRowColumns * LOOP_GRAPH_NODE_WIDTH + Math.max(0, maxRowColumns - 1) * LOOP_GRAPH_COLUMN_GAP
 
     return { rowsByDepth, sortedDepths, width }
   })
@@ -892,7 +895,6 @@ function LoopTaskGraphActionTray({
   const { row, x, y } = layout
   const status = normalizedLoopValue(row.status)
   const blocked = normalizedLoopValue(row.status) === 'blocked'
-  const archived = status === 'archived'
   const terminal = TERMINAL_LOOP_STATUSES.has(status)
 
   const statusAction: LoopTaskAction = blocked ? 'unblock' : 'block'
@@ -925,7 +927,7 @@ function LoopTaskGraphActionTray({
           <span>{statusLabel}</span>
         </Button>
       )}
-      {!archived ? (
+      {loopTaskAllowsDependencyEdits(row) ? (
         <Button
           aria-label={`Archive ${row.taskId}`}
           className="h-6 px-1.5 text-[0.68rem]"
@@ -955,7 +957,9 @@ function LoopTaskGraphNode({
   onConnectionActivate,
   onConnectionStart,
   onDragStart,
+  inputEnabled,
   onNudge,
+  outputEnabled = true,
   pathConnected,
   selected
 }: {
@@ -973,7 +977,9 @@ function LoopTaskGraphNode({
     event: ReactPointerEvent<HTMLButtonElement>
   ) => void
   onDragStart?: (layout: LoopTaskGraphNodeLayout, event: ReactPointerEvent<HTMLButtonElement>) => void
+  inputEnabled?: boolean
   onNudge?: (layout: LoopTaskGraphNodeLayout, deltaX: number, deltaY: number) => void
+  outputEnabled?: boolean
   pathConnected?: boolean
   selected?: boolean
 }) {
@@ -982,6 +988,8 @@ function LoopTaskGraphNode({
   const assignee = loopTextValue(row.assignee)
   const nodeKind = loopTaskGraphNodeKind(row)
   const dependencyCount = loopTaskGraphDependencyCount(row)
+  const phaseLabel = loopTaskPhaseLabel(row)
+  const dependenciesEditable = inputEnabled ?? loopTaskAllowsDependencyEdits(row)
 
   return (
     <div
@@ -1049,8 +1057,16 @@ function LoopTaskGraphNode({
             {row.title}
           </span>
         </div>
-        {assignee || currentTool ? (
+        {phaseLabel || assignee || currentTool ? (
           <div className="flex min-w-0 items-center gap-1.5">
+            {phaseLabel ? (
+              <span
+                className="min-w-0 truncate rounded-[0.2rem] bg-(--ui-fill-quaternary) px-1.5 py-0.5 text-[0.58rem] font-medium text-(--ui-text-tertiary)"
+                data-testid={`loop-task-graph-phase-${row.taskId}`}
+              >
+                {phaseLabel}
+              </span>
+            ) : null}
             {assignee ? (
               <span className="min-w-0 max-w-full truncate rounded-[0.2rem] bg-(--ui-bg-secondary) px-1.5 py-0.5 text-[0.58rem] font-medium text-(--ui-text-tertiary)">
                 {assignee}
@@ -1086,26 +1102,30 @@ function LoopTaskGraphNode({
           </div>
         )}
       </button>
-      <button
-        aria-label={`Connect a prerequisite into ${row.title}`}
-        aria-pressed={armedSide === 'input'}
-        className="absolute left-1/2 top-0 z-30 h-3 w-5 -translate-x-1/2 -translate-y-1/2 cursor-crosshair rounded-full border border-(--ui-stroke-secondary) bg-(--ui-surface-background) opacity-0 shadow-sm transition-opacity hover:border-(--ui-stroke-primary) focus:opacity-100 group-hover:opacity-100"
-        data-loop-connection-input={row.taskId}
-        onClick={() => onConnectionActivate?.(row.taskId, 'input')}
-        onPointerDown={event => onConnectionStart?.(row.taskId, 'input', event)}
-        title={`Drop a preceding task here · drag outward to create a prerequisite for ${row.title}`}
-        type="button"
-      />
-      <button
-        aria-label={`Connect a follow-up from ${row.title}`}
-        aria-pressed={armedSide === 'output'}
-        className="absolute bottom-0 left-1/2 z-30 h-3 w-5 -translate-x-1/2 translate-y-1/2 cursor-crosshair rounded-full border border-(--ui-stroke-secondary) bg-(--ui-surface-background) opacity-0 shadow-sm transition-opacity hover:border-(--ui-stroke-primary) focus:opacity-100 group-hover:opacity-100"
-        data-loop-connection-output={row.taskId}
-        onClick={() => onConnectionActivate?.(row.taskId, 'output')}
-        onPointerDown={event => onConnectionStart?.(row.taskId, 'output', event)}
-        title={`Drag to another task or empty space to add a follow-up for ${row.title}`}
-        type="button"
-      />
+      {dependenciesEditable ? (
+        <button
+          aria-label={`Connect a prerequisite into ${row.title}`}
+          aria-pressed={armedSide === 'input'}
+          className="absolute left-1/2 top-0 z-30 h-3 w-5 -translate-x-1/2 -translate-y-1/2 cursor-crosshair rounded-full border border-(--ui-stroke-secondary) bg-(--ui-surface-background) opacity-0 shadow-sm transition-opacity hover:border-(--ui-stroke-primary) focus:opacity-100 group-hover:opacity-100"
+          data-loop-connection-input={row.taskId}
+          onClick={() => onConnectionActivate?.(row.taskId, 'input')}
+          onPointerDown={event => onConnectionStart?.(row.taskId, 'input', event)}
+          title={`Drop a preceding task here · drag outward to create a prerequisite for ${row.title}`}
+          type="button"
+        />
+      ) : null}
+      {outputEnabled ? (
+        <button
+          aria-label={`Connect a follow-up from ${row.title}`}
+          aria-pressed={armedSide === 'output'}
+          className="absolute bottom-0 left-1/2 z-30 h-3 w-5 -translate-x-1/2 translate-y-1/2 cursor-crosshair rounded-full border border-(--ui-stroke-secondary) bg-(--ui-surface-background) opacity-0 shadow-sm transition-opacity hover:border-(--ui-stroke-primary) focus:opacity-100 group-hover:opacity-100"
+          data-loop-connection-output={row.taskId}
+          onClick={() => onConnectionActivate?.(row.taskId, 'output')}
+          onPointerDown={event => onConnectionStart?.(row.taskId, 'output', event)}
+          title={`Drag to another task or empty space to add a follow-up for ${row.title}`}
+          type="button"
+        />
+      ) : null}
     </div>
   )
 }
@@ -1164,42 +1184,19 @@ function LoopTaskGraphCreateNode({
   onCancel,
   onCreated,
   onCreateTask,
-  scopeKey
+  scopeKey,
+  workflowId
 }: {
   draft: LoopTaskGraphCreateDraft
   onCancel: () => void
   onCreated: (taskId: string, draft: LoopTaskGraphCreateDraft, scopeKey: string) => void
-  onCreateTask?: (idea: string, assignee: string) => Promise<null | string>
+  onCreateTask?: (idea: string, options?: LoopTaskCreateOptions) => Promise<null | string>
   scopeKey: string
+  workflowId?: string
 }) {
   const [actionsVisible, setActionsVisible] = useState(false)
-  const [assignee, setAssignee] = useState('orchestrator')
-  const [assignees, setAssignees] = useState(['orchestrator'])
   const [creating, setCreating] = useState(false)
   const [idea, setIdea] = useState('')
-
-  useEffect(() => {
-    let cancelled = false
-
-    const loadAssignees = async () => {
-      try {
-        const result = await getLoopAssignees()
-        const available = result.assignees.filter(item => item.on_disk).map(item => item.name)
-
-        if (!cancelled) {
-          setAssignees([...new Set(['orchestrator', ...available])])
-        }
-      } catch {
-        // Keep the compatibility default when the board API is unavailable.
-      }
-    }
-
-    void loadAssignees()
-
-    return () => {
-      cancelled = true
-    }
-  }, [])
 
   const createTask = useCallback(async () => {
     const taskIdea = idea.trim()
@@ -1211,7 +1208,13 @@ function LoopTaskGraphCreateNode({
     setCreating(true)
 
     try {
-      const taskId = await onCreateTask(taskIdea, assignee)
+      const options: LoopTaskCreateOptions = {
+        ...(draft.childId ? { childId: draft.childId } : {}),
+        ...(draft.parentId ? { parentId: draft.parentId } : {}),
+        ...(workflowId ? { workflowId } : {})
+      }
+
+      const taskId = Object.keys(options).length ? await onCreateTask(taskIdea, options) : await onCreateTask(taskIdea)
 
       if (taskId) {
         setIdea('')
@@ -1220,7 +1223,7 @@ function LoopTaskGraphCreateNode({
     } finally {
       setCreating(false)
     }
-  }, [assignee, creating, draft, idea, onCreateTask, onCreated, scopeKey])
+  }, [creating, draft, idea, onCreateTask, onCreated, scopeKey, workflowId])
 
   const hideActions = (relatedTarget: EventTarget | null) => {
     if (!loopGraphRelatedTargetBelongsToInteraction('create-task', relatedTarget)) {
@@ -1275,34 +1278,12 @@ function LoopTaskGraphCreateNode({
                 }
               }}
               placeholder="Rough idea…"
-              title="Create a title-only Loop task. Nothing runs until you submit it."
+              title="Create a title-only task in the live Loop graph."
               value={idea}
             />
           </label>
         </div>
-        <div className="flex min-w-0 items-center gap-1.5">
-          <DropdownMenu>
-            <DropdownMenuTrigger asChild>
-              <button
-                aria-label="Assignee"
-                className="inline-flex min-w-0 max-w-full cursor-pointer items-center gap-1 rounded-[0.2rem] bg-(--ui-bg-secondary) px-1.5 py-0.5 text-[0.58rem] font-medium text-(--ui-text-tertiary) outline-none hover:text-(--ui-text-primary) focus-visible:ring-1 focus-visible:ring-ring/50"
-                type="button"
-              >
-                <span className="truncate">{assignee}</span>
-                <Codicon className="shrink-0 opacity-60" name="chevron-down" size="0.55rem" />
-              </button>
-            </DropdownMenuTrigger>
-            <DropdownMenuContent align="start" collisionPadding={8}>
-              <DropdownMenuRadioGroup onValueChange={setAssignee} value={assignee}>
-                {assignees.map(name => (
-                  <DropdownMenuRadioItem key={name} value={name}>
-                    {name}
-                  </DropdownMenuRadioItem>
-                ))}
-              </DropdownMenuRadioGroup>
-            </DropdownMenuContent>
-          </DropdownMenu>
-        </div>
+        <span className="text-[0.58rem] text-(--ui-text-tertiary)">Routing is assigned automatically</span>
       </section>
       {actionsVisible ? (
         <div
@@ -1311,7 +1292,7 @@ function LoopTaskGraphCreateNode({
           data-testid="loop-task-graph-create-action-tray"
           style={{
             left: draft.x,
-            top: draft.y + LOOP_GRAPH_NODE_HEIGHT + LOOP_GRAPH_ACTION_TRAY_GAP
+            top: draft.y + LOOP_GRAPH_NODE_HEIGHT
           }}
         >
           <Button
@@ -1349,24 +1330,24 @@ export function LoopTaskGraph({
   onSelectTask,
   onTaskAction,
   positions,
-  rootTaskId,
   scopeKey,
   rows,
-  selectedTaskId
+  selectedTaskId,
+  workflowId
 }: {
   fullPanel?: boolean
-  onCreateTask?: (idea: string, assignee: string) => Promise<null | string>
+  onCreateTask?: (idea: string, options?: LoopTaskCreateOptions) => Promise<null | string>
   onLinkTasks?: (parentId: string, childId: string) => Promise<boolean>
   onUnlinkTasks?: (parentId: string, childId: string) => Promise<boolean>
   onOpenTaskTab?: (row: LoopRow) => void
-  onSavePositions?: (positions: LoopTaskGraphPosition[], rootTaskId?: string) => Promise<boolean>
+  onSavePositions?: (positions: LoopTaskGraphPosition[], workflowId?: string) => Promise<boolean>
   onSelectTask?: (row: LoopRow) => void
   onTaskAction?: (action: LoopTaskAction, row: LoopRow) => void
   positions?: LoopTaskGraphPosition[]
-  rootTaskId?: string
   scopeKey?: string
   rows: LoopRow[]
   selectedTaskId?: null | string
+  workflowId?: string
 }) {
   const [view, setView] = useState<LoopGraphView>(INITIAL_LOOP_GRAPH_VIEW)
   const [hoveredTaskId, setHoveredTaskId] = useState<null | string>(null)
@@ -1394,7 +1375,7 @@ export function LoopTaskGraph({
   const connectionDragRef = useRef<LoopTaskGraphConnectionDrag | null>(null)
   const suppressNodeClickRef = useRef<null | string>(null)
   const suppressConnectionClickRef = useRef(false)
-  const graphScopeKey = scopeKey || rootTaskId || rows[0]?.taskId || 'empty'
+  const graphScopeKey = scopeKey || workflowId || rows[0]?.taskId || 'empty'
   const graphScopeRef = useRef(graphScopeKey)
   const positionSaveQueueRef = useRef<Promise<void>>(Promise.resolve())
   const pendingPositionSavesRef = useRef(0)
@@ -1520,13 +1501,13 @@ export function LoopTaskGraph({
   const visibleEdges = useMemo(() => layout.edges.filter(edge => !edge.secondary), [layout.edges])
 
   const persistPositions = useCallback(
-    (next: Map<string, LoopTaskGraphPoint>, rootOverride?: string, createdTaskId?: string) => {
+    (next: Map<string, LoopTaskGraphPoint>, workflowOverride?: string, createdTaskId?: string) => {
       if (!onSavePositions) {
         return Promise.resolve(true)
       }
 
       const requestScope = graphScopeRef.current
-      const targetRootTaskId = rootOverride || rootTaskId
+      const targetWorkflowId = workflowOverride || workflowId
       pendingPositionSavesRef.current += 1
 
       const save = async () => {
@@ -1541,7 +1522,7 @@ export function LoopTaskGraph({
             loopTaskGraphPositionList(next).filter(
               position => nodeById.has(position.taskId) || position.taskId === createdTaskId
             ),
-            targetRootTaskId
+            targetWorkflowId
           )
         } catch {
           saved = false
@@ -1563,7 +1544,7 @@ export function LoopTaskGraph({
 
       return result
     },
-    [nodeById, onSavePositions, rootTaskId]
+    [nodeById, onSavePositions, workflowId]
   )
 
   const screenToWorld = useCallback(
@@ -1604,7 +1585,7 @@ export function LoopTaskGraph({
       setCreateDraft(null)
 
       void (async () => {
-        const positioned = await persistPositions(nextPositions, rootTaskId || taskId, taskId)
+        const positioned = await persistPositions(nextPositions, workflowId, taskId)
 
         if (!positioned) {
           setPositionOverrides(positionOverrides)
@@ -1613,15 +1594,9 @@ export function LoopTaskGraph({
         if (graphScopeRef.current !== requestScope) {
           return
         }
-
-        if (draft.parentId) {
-          await onLinkTasks?.(draft.parentId, taskId)
-        } else if (draft.childId) {
-          await onLinkTasks?.(taskId, draft.childId)
-        }
       })()
     },
-    [onLinkTasks, persistPositions, positionOverrides, rootTaskId]
+    [persistPositions, positionOverrides, workflowId]
   )
 
   const edgesWithPaths = useMemo(() => {
@@ -2016,14 +1991,18 @@ export function LoopTaskGraph({
       const portTaskId = element?.closest(`[${attribute}]`)?.getAttribute(attribute)
 
       if (portTaskId) {
-        return portTaskId
+        const target = nodeById.get(portTaskId)
+
+        return target && (side === 'input' || loopGraphTargetAllowsDependency(target.row)) ? portTaskId : null
       }
 
       const cardTaskId = element
         ?.closest('[data-loop-task-graph-interaction]')
         ?.getAttribute('data-loop-task-graph-interaction')
 
-      return cardTaskId && nodeById.has(cardTaskId) ? cardTaskId : null
+      const target = cardTaskId ? nodeById.get(cardTaskId) : null
+
+      return target && (side === 'input' || loopGraphTargetAllowsDependency(target.row)) ? cardTaskId || null : null
     },
     [nodeById]
   )
@@ -2060,7 +2039,7 @@ export function LoopTaskGraph({
 
       const node = nodeById.get(taskId)
 
-      if (!node) {
+      if (!node || (side === 'input' && !loopGraphTargetAllowsDependency(node.row))) {
         return
       }
 
@@ -2116,8 +2095,14 @@ export function LoopTaskGraph({
       if (armedConnection.taskId !== taskId && armedConnection.side !== side) {
         const parentId = armedConnection.side === 'output' ? armedConnection.taskId : taskId
         const childId = armedConnection.side === 'output' ? taskId : armedConnection.taskId
+        const child = nodeById.get(childId)
 
         setArmedConnection(null)
+
+        if (!child || !loopGraphTargetAllowsDependency(child.row)) {
+          return
+        }
+
         setUndoPositions(null)
         void onLinkTasks?.(parentId, childId)
 
@@ -2126,7 +2111,7 @@ export function LoopTaskGraph({
 
       setArmedConnection({ side, taskId })
     },
-    [armedConnection, graphScopeKey, onLinkTasks]
+    [armedConnection, graphScopeKey, nodeById, onLinkTasks]
   )
 
   const handleNodeNudge = useCallback(
@@ -2476,7 +2461,16 @@ export function LoopTaskGraph({
 
   const handleUnlinkTasks = useCallback(
     async (edge: LoopTaskGraphEdge) => {
-      if (!onUnlinkTasks) {
+      const parent = nodeById.get(edge.from)
+      const child = nodeById.get(edge.to)
+
+      if (
+        !onUnlinkTasks ||
+        !parent ||
+        !loopTaskAllowsDependencySource(parent.row) ||
+        !child ||
+        !loopGraphTargetAllowsDependency(child.row)
+      ) {
         return
       }
 
@@ -2490,7 +2484,7 @@ export function LoopTaskGraph({
         setRemovingEdgeKey(currentEdgeKey => (currentEdgeKey === edgeKey ? null : currentEdgeKey))
       }
     },
-    [onUnlinkTasks]
+    [nodeById, onUnlinkTasks]
   )
 
   return (
@@ -2766,6 +2760,7 @@ export function LoopTaskGraph({
             </defs>
             {edgesWithPaths.map(({ d, edge, railX }) => {
               const edgeKey = `${edge.from}:${edge.to}`
+              const target = nodeById.get(edge.to)
 
               const selectedConnected = selectedFocus.edgeKeys.has(edgeKey)
               const highlighted = activeFocus.edgeKeys.has(edgeKey)
@@ -2788,7 +2783,11 @@ export function LoopTaskGraph({
 
               return (
                 <g key={edgeKey}>
-                  {onUnlinkTasks ? (
+                  {onUnlinkTasks &&
+                  nodeById.get(edge.from) &&
+                  loopTaskAllowsDependencySource(nodeById.get(edge.from)!.row) &&
+                  target &&
+                  loopGraphTargetAllowsDependency(target.row) ? (
                     <path
                       d={d}
                       data-loop-task-graph-interaction={`edge:${edgeKey}`}
@@ -2809,7 +2808,9 @@ export function LoopTaskGraph({
                     data-selected-connected={selectedConnected ? 'true' : 'false'}
                     data-testid={`loop-task-graph-edge-${edge.from}-${edge.to}`}
                     fill="none"
-                    markerEnd={highlighted || !activeFocus.taskId ? 'url(#loop-graph-arrow)' : 'url(#loop-graph-arrow-dim)'}
+                    markerEnd={
+                      highlighted || !activeFocus.taskId ? 'url(#loop-graph-arrow)' : 'url(#loop-graph-arrow-dim)'
+                    }
                     opacity={opacity}
                     stroke="currentColor"
                     strokeLinecap="round"
@@ -2846,7 +2847,12 @@ export function LoopTaskGraph({
                 const to = nodeById.get(edge.to)
                 const size = 24 / view.scale
 
-                if (!from || !to) {
+                if (
+                  !from ||
+                  !to ||
+                  !loopTaskAllowsDependencySource(from.row) ||
+                  !loopGraphTargetAllowsDependency(to.row)
+                ) {
                   return null
                 }
 
@@ -2860,6 +2866,7 @@ export function LoopTaskGraph({
                     data-loop-task-graph-interaction={interactionId}
                     data-testid={`loop-task-graph-delete-${edge.from}-${edge.to}`}
                     disabled={removing}
+                    key={edgeKey}
                     onBlur={event => handleEdgeActionEnd(edgeKey, event.relatedTarget)}
                     onClick={event => {
                       event.stopPropagation()
@@ -2892,6 +2899,7 @@ export function LoopTaskGraph({
               onCreated={handleCreatedTask}
               onCreateTask={onCreateTask}
               scopeKey={graphScopeKey}
+              workflowId={workflowId}
             />
           ) : null}
           {layout.nodes.map(node => {
@@ -2905,6 +2913,7 @@ export function LoopTaskGraph({
                   armedSide={armedConnection?.taskId === node.row.taskId ? armedConnection.side : undefined}
                   connectionTarget={connectionTargetTaskId === node.row.taskId}
                   dimmed={dimmed}
+                  inputEnabled={loopGraphTargetAllowsDependency(node.row)}
                   layout={node}
                   onActionEnd={handleActionEnd}
                   onActionStart={handleActionStart}
@@ -2928,6 +2937,7 @@ export function LoopTaskGraph({
                   onConnectionStart={handleConnectionStart}
                   onDragStart={handleNodeDragStart}
                   onNudge={handleNodeNudge}
+                  outputEnabled={loopTaskAllowsDependencySource(node.row)}
                   pathConnected={pathConnected}
                   selected={node.row.taskId === selectedTaskId}
                 />

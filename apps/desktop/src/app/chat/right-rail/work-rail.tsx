@@ -5,7 +5,7 @@ import { Codicon } from '@/components/ui/codicon'
 import { cn } from '@/lib/utils'
 import { closeRightRail } from '@/store/preview'
 
-import { LoopPanel } from '../loop-panel'
+import { LoopPanel, type LoopTaskCreateOptions } from '../loop-panel'
 import type { LoopPanelController } from '../use-loop-panel-controller'
 
 import { ChatPreviewRail } from './preview'
@@ -22,7 +22,7 @@ type WorkRailTabId = 'loop' | 'preview'
 interface ChatWorkRailProps {
   artifactSourceBaseDir?: null | string
   loop: LoopPanelController
-  onCreateLoopTask?: (idea: string, assignee: string) => Promise<null | string>
+  onCreateLoopTask?: (idea: string, options?: LoopTaskCreateOptions) => Promise<null | string>
   onRestartServer?: (url: string, context?: string) => Promise<string>
   previewKey?: string
   previewLabel?: string
@@ -38,9 +38,9 @@ interface WorkRailTab {
 }
 
 function loopRailLabel(loop: LoopPanelController): string {
-  const root = loop.state?.rows.find(row => row.taskId === loop.state?.rootTaskId)
+  const firstTask = loop.state?.rows[0]
 
-  return root?.title || 'Loop'
+  return firstTask?.title || 'Loop'
 }
 
 export function ChatWorkRail({
@@ -204,11 +204,11 @@ export function ChatWorkRail({
             onUnlinkTasks={loop.onUnlinkTasks}
             open={loop.open}
             positions={loop.positions}
-            rootTaskId={loop.rootTaskId}
             selectedTaskDetail={loop.selectedTaskDetail}
             selectedTaskDetailError={loop.selectedTaskDetailError}
             selectedTaskId={loop.selectedTaskId}
             state={loop.state}
+            workflowId={loop.workflowId}
           />
         ) : (
           <ChatPreviewRail embedded onRestartServer={onRestartServer} setTitlebarToolGroup={setTitlebarToolGroup} />

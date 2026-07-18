@@ -136,6 +136,9 @@ class TestDelegateRequirements(unittest.TestCase):
         )
         self.assertIn(f"up to {_get_max_concurrent_children()}", fn["description"])
         self.assertIn(f"max_spawn_depth={_get_max_spawn_depth()}", fn["description"])
+        props = fn["parameters"]["properties"]
+        self.assertNotIn("decompose", props)
+        self.assertNotIn("decompose", props["tasks"]["items"]["properties"])
 
 
 class TestChildSystemPrompt(unittest.TestCase):
@@ -2327,6 +2330,31 @@ class TestDispatchDelegateTask(unittest.TestCase):
         self.assertEqual(captured["goal"], "test")
         self.assertNotIn("acp_command", captured["tasks"][0])
         self.assertNotIn("acp_args", captured["tasks"][0])
+
+    def test_live_loop_graph_ignores_legacy_root_and_decompose_arguments(self):
+        import run_agent
+
+        captured = {}
+
+        def fake_delegate_task(**kwargs):
+            captured.update(kwargs)
+            return "{}"
+
+        parent = _make_mock_parent(depth=0)
+        with patch("tools.delegate_tool.delegate_task", fake_delegate_task):
+            run_agent.AIAgent._dispatch_delegate_task(
+                parent,
+                {
+                    "mode": "loop",
+                    "decompose": True,
+                    "root_task_id": "t_root",
+                    "tasks": [{"id": "build", "title": "Build it"}],
+                },
+            )
+
+        self.assertNotIn("root_task_id", captured)
+        self.assertNotIn("decompose", captured)
+        self.assertEqual(captured["tasks"], [{"id": "build", "title": "Build it"}])
 
 class TestDelegateEventEnum(unittest.TestCase):
     """Tests for DelegateEvent enum and back-compat aliases."""

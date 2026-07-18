@@ -2,13 +2,14 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 
 import {
   addLoopTaskComment,
+  archiveLoopNodes,
   createLoopDraftTask,
-  decomposeLoopTask,
   getCronJobs,
   getGlobalModelInfo,
   getGlobalModelOptions,
   getHermesConfig,
   getHermesConfigDefaults,
+  getKanbanCapabilities,
   getLoopAssignees,
   getLoopCanvasPositions,
   getLoopSessionSource,
@@ -21,7 +22,6 @@ import {
   listSessions,
   loopSourceFromDraftResult,
   mergeLoopDraftSource,
-  reviewLoopHandoffForTask,
   saveLoopCanvasPositions,
   unlinkLoopTasks,
   updateLoopTaskStatus
@@ -200,37 +200,61 @@ describe('Hermes REST session helpers', () => {
     })
   })
 
+  it('probes live Loop graph support through the profile-scoped kanban API', async () => {
+    api.mockResolvedValue({ live_loop_graph: true })
+
+    await expect(getKanbanCapabilities('peacock')).resolves.toEqual({ live_loop_graph: true })
+
+    expect(api).toHaveBeenCalledWith({
+      path: '/api/plugins/kanban/capabilities',
+      profile: 'peacock'
+    })
+  })
+
   it('reads and saves Loop canvas positions through the profile-scoped kanban API', async () => {
     api
       .mockResolvedValueOnce({
         positions: [{ task_id: 't_child', updated_at: 42, x: 12.5, y: -8 }],
-        root_task_id: 't/root'
+        workflow_id: 'wf/root'
       })
       .mockResolvedValueOnce({
         ok: true,
         positions: [{ task_id: 't_child', updated_at: 43, x: 50, y: 75 }],
-        root_task_id: 't/root'
+        root_task_id: 'wf/root'
       })
 
-    await expect(getLoopCanvasPositions('t/root', 'peacock', 'developer', 'session/one')).resolves.toEqual({
+    await expect(getLoopCanvasPositions('wf/root', 'peacock', 'developer', 'session/one')).resolves.toEqual({
       positions: [{ taskId: 't_child', updatedAt: 42, x: 12.5, y: -8 }],
-      rootTaskId: 't/root'
+      workflowId: 'wf/root'
     })
     await expect(
-      saveLoopCanvasPositions('t/root', [{ taskId: 't_child', x: 50, y: 75 }], 'peacock', 'developer', 'session/one')
+      saveLoopCanvasPositions('wf/root', [{ taskId: 't_child', x: 50, y: 75 }], 'peacock', 'developer', 'session/one')
     ).resolves.toEqual({
       positions: [{ taskId: 't_child', updatedAt: 43, x: 50, y: 75 }],
-      rootTaskId: 't/root'
+      workflowId: 'wf/root'
     })
 
     expect(api).toHaveBeenNthCalledWith(1, {
-      path: '/api/plugins/kanban/loop-canvas/t%2Froot/positions?board=developer&session_id=session%2Fone',
+      path: '/api/plugins/kanban/loop-canvas/wf%2Froot/positions?board=developer&session_id=session%2Fone',
       profile: 'peacock'
     })
     expect(api).toHaveBeenNthCalledWith(2, {
       body: { positions: [{ task_id: 't_child', x: 50, y: 75 }] },
       method: 'PUT',
-      path: '/api/plugins/kanban/loop-canvas/t%2Froot/positions?board=developer&session_id=session%2Fone',
+      path: '/api/plugins/kanban/loop-canvas/wf%2Froot/positions?board=developer&session_id=session%2Fone',
+      profile: 'peacock'
+    })
+  })
+
+  it('archives Loop nodes atomically through the workflow-scoped canvas endpoint', async () => {
+    api.mockResolvedValue({ archived: ['t_one', 't_two'], ok: true })
+
+    await archiveLoopNodes('wf/root', [' t_one ', 't_two', 't_one'], 'peacock', 'developer', 'session/one')
+
+    expect(api).toHaveBeenCalledWith({
+      body: { session_id: 'session/one', task_ids: ['t_one', 't_two'] },
+      method: 'POST',
+      path: '/api/plugins/kanban/loop-canvas/wf%2Froot/archive-nodes?board=developer',
       profile: 'peacock'
     })
   })
@@ -239,8 +263,8 @@ describe('Hermes REST session helpers', () => {
     api.mockResolvedValue({ ok: true })
 
     await linkLoopTasks('t_parent', 't_child', 'peacock', 'developer')
-    await linkLoopTasks('t_parent', 't_child', 'peacock', 'developer', 't_root', 'session/one')
-    await unlinkLoopTasks('t_parent', 't_child', 'peacock', 'developer')
+    await linkLoopTasks('t_parent', 't_child', 'peacock', 'developer', 'wf_loop', 'session/one')
+    await unlinkLoopTasks('t_parent', 't_child', 'peacock', 'developer', 'wf_loop', 'session/one')
 
     expect(api).toHaveBeenNthCalledWith(1, {
       body: { child_id: 't_child', parent_id: 't_parent' },
@@ -252,7 +276,7 @@ describe('Hermes REST session helpers', () => {
       body: {
         child_id: 't_child',
         parent_id: 't_parent',
-        root_task_id: 't_root',
+        workflow_id: 'wf_loop',
         session_id: 'session/one'
       },
       method: 'POST',
@@ -261,7 +285,7 @@ describe('Hermes REST session helpers', () => {
     })
     expect(api).toHaveBeenNthCalledWith(3, {
       method: 'DELETE',
-      path: '/api/plugins/kanban/links?child_id=t_child&parent_id=t_parent&board=developer',
+      path: '/api/plugins/kanban/links?child_id=t_child&parent_id=t_parent&board=developer&workflow_id=wf_loop&session_id=session%2Fone',
       profile: 'peacock'
     })
   })
@@ -290,12 +314,15 @@ describe('Hermes REST session helpers', () => {
     })
   })
 
-  it('passes a caller-stable idempotency key for a deliberate Loop task add', async () => {
+  it('creates a live workflow task with its initial dependency edges in one request', async () => {
     api.mockResolvedValue({ task: { id: 't_loop', title: 'Draft Loop root' } })
 
     await createLoopDraftTask({
+      childIds: [' t_after ', 't_after'],
       idempotencyKey: 'loop-draft:session-1:add-1',
+      parents: [' t_before ', 't_before'],
       profile: 'peacock',
+      workflowId: ' wf_loop ',
       sessionId: 'session-1',
       title: 'Draft Loop root'
     })
@@ -304,14 +331,30 @@ describe('Hermes REST session helpers', () => {
       body: {
         assignee: 'orchestrator',
         body: undefined,
+        child_ids: ['t_after'],
         idempotency_key: 'loop-draft:session-1:add-1',
+        parents: ['t_before'],
         session_id: 'session-1',
-        title: 'Draft Loop root'
+        title: 'Draft Loop root',
+        workflow_id: 'wf_loop'
       },
       method: 'POST',
       path: '/api/plugins/kanban/loop-drafts',
       profile: 'peacock'
     })
+  })
+
+  it('preserves an explicit null Loop assignee for a foreground-owned task', async () => {
+    api.mockResolvedValue({ task: { id: 't_root', title: 'Foreground root' } })
+
+    await createLoopDraftTask({
+      assignee: null,
+      profile: 'peacock',
+      sessionId: 'session-1',
+      title: 'Foreground root'
+    })
+
+    expect(api).toHaveBeenCalledWith(expect.objectContaining({ body: expect.objectContaining({ assignee: null }) }))
   })
 
   it('merges a newly created Loop row without dropping the existing graph', () => {
@@ -322,7 +365,7 @@ describe('Hermes REST session helpers', () => {
     const merged = mergeLoopDraftSource(
       {
         links: [{ child_id: 't_child', parent_id: 't_root' }],
-        root_task_id: 't_root',
+        workflow_id: 'wf_loop',
         session_id: 'session-1',
         tasks: [
           { id: 't_root', status: 'scheduled', title: 'Root task' },
@@ -332,7 +375,7 @@ describe('Hermes REST session helpers', () => {
       incoming
     )
 
-    expect(merged.root_task_id).toBe('t_root')
+    expect(merged.workflow_id).toBe('wf_loop')
     expect(merged.tasks?.map(task => task.id)).toEqual(['t_root', 't_child', 't_second'])
     expect(merged.links).toEqual([{ child_id: 't_child', parent_id: 't_root' }])
   })
@@ -368,88 +411,6 @@ describe('Hermes REST session helpers', () => {
       },
       method: 'PATCH',
       path: '/api/plugins/kanban/tasks/t_blocked?board=developer',
-      profile: 'peacock'
-    })
-  })
-
-  it('decomposes Loop root tasks through the profile-scoped kanban API', async () => {
-    api.mockResolvedValue({ child_ids: [], fanout: false, ok: true, task_id: 't_root' })
-
-    await decomposeLoopTask('t_root', 'peacock', { board: 'developer' })
-
-    expect(api).toHaveBeenCalledWith({
-      body: {},
-      method: 'POST',
-      path: '/api/plugins/kanban/tasks/t_root/decompose?board=developer',
-      profile: 'peacock',
-      timeoutMs: 600_000
-    })
-  })
-
-  it('marks Loop intake approval when Submit decomposes a clarified draft', async () => {
-    api.mockResolvedValue({ child_ids: [], fanout: false, ok: true, task_id: 't_root' })
-
-    await decomposeLoopTask('t_root', 'peacock', { approveIntake: true, board: 'developer' })
-
-    expect(api).toHaveBeenCalledWith({
-      body: { approve_intake: true },
-      method: 'POST',
-      path: '/api/plugins/kanban/tasks/t_root/decompose?board=developer',
-      profile: 'peacock',
-      timeoutMs: 600_000
-    })
-  })
-
-  it('submits Loop handoff accept decisions through the profile-scoped kanban API', async () => {
-    api
-      .mockResolvedValueOnce({
-        handoffs: [
-          { id: 42, state: 'closed', task_id: 't_review', updated_at: 1 },
-          { id: 43, state: 'reviewing', task_id: 't_review', updated_at: 2 }
-        ],
-        ok: true
-      })
-      .mockResolvedValueOnce({ ok: true, outcome: 'approved' })
-
-    await reviewLoopHandoffForTask('t_review', 'accept-review', 'peacock', { board: 'developer' })
-
-    expect(api).toHaveBeenNthCalledWith(1, {
-      path: '/api/plugins/kanban/loop-handoffs?task_id=t_review&board=developer',
-      profile: 'peacock'
-    })
-    expect(api).toHaveBeenNthCalledWith(2, {
-      body: {
-        action: 'approve_release',
-        actor: 'desktop-loop-panel',
-        evidence_passed: true,
-        reason: 'Accepted from the Loop side panel after reviewing the foreground handoff.'
-      },
-      method: 'POST',
-      path: '/api/plugins/kanban/loop-handoffs/43/auto-action?board=developer',
-      profile: 'peacock'
-    })
-  })
-
-  it('submits Loop handoff escalation decisions with a safe escalation flag', async () => {
-    api
-      .mockResolvedValueOnce({
-        handoffs: [{ id: 44, state: 'assigned', task_id: 't_review', updated_at: 3 }],
-        ok: true
-      })
-      .mockResolvedValueOnce({ ok: true, outcome: 'escalated' })
-
-    await reviewLoopHandoffForTask('t_review', 'escalate-review', 'peacock')
-
-    expect(api).toHaveBeenNthCalledWith(2, {
-      body: {
-        action: 'approve_release',
-        actor: 'desktop-loop-panel',
-        evidence_passed: true,
-        prohibited_flags: ['product_decision'],
-        reason: 'Escalated from the Loop side panel because this needs a user decision.'
-      },
-      method: 'POST',
-      path: '/api/plugins/kanban/loop-handoffs/44/auto-action',
       profile: 'peacock'
     })
   })
