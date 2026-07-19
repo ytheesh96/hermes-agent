@@ -9,6 +9,7 @@
  *     "schemaVersion": 1,
  *     "commit":        "<40-char SHA>",
  *     "branch":        "<branch name>",
+ *     "repository":    "<GitHub owner/repo>",
  *     "builtAt":       "<ISO 8601 UTC timestamp>",
  *     "dirty":         true|false,
  *     "source":        "ci" | "local"
@@ -29,6 +30,7 @@ import { resolve, join, relative } from "path"
 import { execSync } from "child_process"
 
 const STAMP_SCHEMA_VERSION = 1
+const DEFAULT_REPOSITORY = "NousResearch/hermes-agent"
 
 const DESKTOP_ROOT = resolve(import.meta.dirname, "..")
 const REPO_ROOT = resolve(DESKTOP_ROOT, "..", "..")
@@ -43,6 +45,21 @@ function tryExec(cmd, opts) {
   }
 }
 
+function normalizeGitHubRepository(value) {
+  const input = String(value || "").trim().replace(/\/$/, "")
+  if (!input) return null
+
+  const slugMatch = input.match(/^([A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+?)(?:\.git)?$/)
+  if (slugMatch) return slugMatch[1]
+
+  const remoteMatch = input.match(/github\.com(?::|\/)([A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+?)(?:\.git)?$/i)
+  return remoteMatch ? remoteMatch[1] : null
+}
+
+function localRepository() {
+  return normalizeGitHubRepository(tryExec("git remote get-url origin", { cwd: REPO_ROOT }))
+}
+
 function fromCI() {
   const sha = process.env.GITHUB_SHA
   if (!sha) return null
@@ -50,6 +67,7 @@ function fromCI() {
   return {
     commit: sha,
     branch: branch,
+    repository: normalizeGitHubRepository(process.env.GITHUB_REPOSITORY) || localRepository() || DEFAULT_REPOSITORY,
     dirty: false, // CI builds from a checkout-of-ref by definition
     source: "ci"
   }
@@ -70,6 +88,7 @@ function fromLocalGit() {
   return {
     commit: sha,
     branch: branch === "HEAD" ? null : branch, // detached HEAD -> null
+    repository: localRepository() || DEFAULT_REPOSITORY,
     dirty: dirty,
     source: "local"
   }
@@ -104,6 +123,7 @@ function main() {
     schemaVersion: STAMP_SCHEMA_VERSION,
     commit: stamp.commit,
     branch: stamp.branch,
+    repository: stamp.repository,
     builtAt: new Date().toISOString(),
     dirty: stamp.dirty,
     source: stamp.source

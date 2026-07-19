@@ -11,6 +11,7 @@ import {
   cachedScriptPath,
   hasExistingGitCheckout,
   installedAgentInstallScript,
+  normalizeInstallStamp,
   resolveInstallScript,
   runBootstrap
 } from './bootstrap-runner'
@@ -77,24 +78,70 @@ test('existing checkout detection requires git metadata', () => {
   }
 })
 
-test('fresh bootstrap args include the packaged commit pin', () => {
-  const installStamp = { commit: 'a'.repeat(40), branch: 'main' }
+test('fresh bootstrap args include the packaged commit pin and repository', () => {
+  const installStamp = { commit: 'a'.repeat(40), branch: 'main', repository: 'ytheesh96/hermes-loop' }
 
-  assert.deepEqual(buildPinArgs(installStamp), ['-Commit', installStamp.commit, '-Branch', 'main'])
+  assert.deepEqual(buildPinArgs(installStamp), [
+    '-Commit',
+    installStamp.commit,
+    '-Branch',
+    'main',
+    '-Repository',
+    'ytheesh96/hermes-loop'
+  ])
   assert.deepEqual(
     buildPosixPinArgs({
       installStamp,
       activeRoot: '/tmp/hermes-agent',
       hermesHome: '/tmp/hermes'
     }),
-    ['--dir', '/tmp/hermes-agent', '--hermes-home', '/tmp/hermes', '--branch', 'main', '--commit', installStamp.commit]
+    [
+      '--dir',
+      '/tmp/hermes-agent',
+      '--hermes-home',
+      '/tmp/hermes',
+      '--branch',
+      'main',
+      '--commit',
+      installStamp.commit,
+      '--repository',
+      'ytheesh96/hermes-loop'
+    ]
   )
 })
 
-test('existing-checkout bootstrap args keep branch but skip the packaged commit pin', () => {
-  const installStamp = { commit: 'a'.repeat(40), branch: 'main' }
+test('install stamp normalization preserves schema v1 repository compatibility', () => {
+  const commit = 'd'.repeat(40)
 
-  assert.deepEqual(buildPinArgs(installStamp, { pinCommit: false }), ['-Branch', 'main'])
+  assert.deepEqual(normalizeInstallStamp({ schemaVersion: 1, commit }, '/tmp/legacy-stamp.json'), {
+    schemaVersion: 1,
+    commit,
+    branch: null,
+    repository: null,
+    builtAt: null,
+    dirty: false,
+    source: null,
+    path: '/tmp/legacy-stamp.json'
+  })
+  assert.equal(
+    normalizeInstallStamp(
+      { schemaVersion: 1, commit, repository: 'ytheesh96/hermes-loop' },
+      '/tmp/fork-stamp.json'
+    ).repository,
+    'ytheesh96/hermes-loop'
+  )
+  assert.equal(normalizeInstallStamp({ schemaVersion: 2, commit }, '/tmp/future-stamp.json'), null)
+})
+
+test('existing-checkout bootstrap args keep branch but skip the packaged commit pin', () => {
+  const installStamp = { commit: 'a'.repeat(40), branch: 'main', repository: 'ytheesh96/hermes-loop' }
+
+  assert.deepEqual(buildPinArgs(installStamp, { pinCommit: false }), [
+    '-Branch',
+    'main',
+    '-Repository',
+    'ytheesh96/hermes-loop'
+  ])
   assert.deepEqual(
     buildPosixPinArgs({
       installStamp,
@@ -102,7 +149,16 @@ test('existing-checkout bootstrap args keep branch but skip the packaged commit 
       hermesHome: '/tmp/hermes',
       pinCommit: false
     }),
-    ['--dir', '/tmp/hermes-agent', '--hermes-home', '/tmp/hermes', '--branch', 'main']
+    [
+      '--dir',
+      '/tmp/hermes-agent',
+      '--hermes-home',
+      '/tmp/hermes',
+      '--branch',
+      'main',
+      '--repository',
+      'ytheesh96/hermes-loop'
+    ]
   )
 })
 
@@ -186,6 +242,95 @@ test('resolveInstallScript rethrows when the 404 fallback is unavailable', async
       }),
       /HTTP 404|Failed to download/
     )
+  } finally {
+    fs.rmSync(home, { recursive: true, force: true })
+  }
+})
+
+test('resolveInstallScript downloads from the repository recorded in the install stamp', async () => {
+  const home = mkTmpHome()
+
+  try {
+    const commit = 'b'.repeat(40)
+    let downloadedRepository = null
+
+    const result = await resolveInstallScript({
+      installStamp: { commit, repository: 'ytheesh96/hermes-loop' },
+      sourceRepoRoot: null,
+      hermesHome: home,
+      emit: () => {},
+      _download: async (_commit, destination, repository) => {
+        downloadedRepository = repository
+        fs.mkdirSync(path.dirname(destination), { recursive: true })
+        fs.writeFileSync(destination, '#!/bin/sh\necho fork\n')
+      }
+    })
+
+    assert.equal(result.source, 'download')
+    assert.equal(downloadedRepository, 'ytheesh96/hermes-loop')
+  } finally {
+    fs.rmSync(home, { recursive: true, force: true })
+  }
+})
+
+test('resolveInstallScript rejects invalid stamped repository routing by using the upstream default', async () => {
+  const home = mkTmpHome()
+
+  try {
+    const commit = 'e'.repeat(40)
+    let downloadedRepository = null
+
+    await resolveInstallScript({
+      installStamp: { commit, repository: 'evil.example/owner/repo' },
+      sourceRepoRoot: null,
+      hermesHome: home,
+      emit: () => {},
+      _download: async (_commit, destination, repository) => {
+        downloadedRepository = repository
+        fs.mkdirSync(path.dirname(destination), { recursive: true })
+        fs.writeFileSync(destination, '#!/bin/sh\necho upstream\n')
+      }
+    })
+
+    assert.equal(downloadedRepository, 'NousResearch/hermes-agent')
+  } finally {
+    fs.rmSync(home, { recursive: true, force: true })
+  }
+})
+
+test('installer cache separates repositories that share the same commit', async () => {
+  const home = mkTmpHome()
+
+  try {
+    const commit = 'c'.repeat(40)
+    const downloads = []
+
+    const download = async (_commit, destination, repository) => {
+      downloads.push(repository)
+      fs.mkdirSync(path.dirname(destination), { recursive: true })
+      fs.writeFileSync(destination, `#!/bin/sh\necho ${repository}\n`)
+    }
+
+    const first = await resolveInstallScript({
+      installStamp: { commit, repository: 'NousResearch/hermes-agent' },
+      sourceRepoRoot: null,
+      hermesHome: home,
+      emit: () => {},
+      _download: download
+    })
+
+    const second = await resolveInstallScript({
+      installStamp: { commit, repository: 'ytheesh96/hermes-loop' },
+      sourceRepoRoot: null,
+      hermesHome: home,
+      emit: () => {},
+      _download: download
+    })
+
+    assert.deepEqual(downloads, ['NousResearch/hermes-agent', 'ytheesh96/hermes-loop'])
+    assert.notEqual(first.path, second.path)
+    assert.match(fs.readFileSync(first.path, 'utf8'), /NousResearch\/hermes-agent/)
+    assert.match(fs.readFileSync(second.path, 'utf8'), /ytheesh96\/hermes-loop/)
   } finally {
     fs.rmSync(home, { recursive: true, force: true })
   }

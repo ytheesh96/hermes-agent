@@ -37,7 +37,7 @@ import { canImportHermesCli, verifyHermesCli } from './backend-probes'
 import { waitForDashboardPortAnnouncement } from './backend-ready'
 import { shouldLatchBackendStartFailure } from './backend-start-failure'
 import { detectRemoteDisplay, isWindowsBinaryPathInWsl, isWslEnvironment } from './bootstrap-platform'
-import { runBootstrap } from './bootstrap-runner'
+import { INSTALL_STAMP_SCHEMA_VERSION, normalizeInstallStamp, runBootstrap } from './bootstrap-runner'
 import {
   authModeFromStatus,
   buildGatewayWsUrl,
@@ -348,9 +348,7 @@ const SOURCE_REPO_ROOT = path.resolve(APP_ROOT, '../..')
 // build hasn't been invoked, or schema mismatch). Callers must handle null.
 //
 // Schema:
-//   { schemaVersion: 1, commit, branch, builtAt, dirty, source }
-const INSTALL_STAMP_SCHEMA_VERSION = 1
-
+//   { schemaVersion: 1, commit, branch, repository, builtAt, dirty, source }
 function loadInstallStamp() {
   // Try packaged location first (resources/install-stamp.json), then the
   // dev/local build output (apps/desktop/build/install-stamp.json) so
@@ -366,24 +364,16 @@ function loadInstallStamp() {
       const raw = fs.readFileSync(p, 'utf8')
       const parsed = JSON.parse(raw)
 
-      if (parsed && typeof parsed === 'object' && typeof parsed.commit === 'string' && parsed.commit.length >= 7) {
-        if (parsed.schemaVersion !== INSTALL_STAMP_SCHEMA_VERSION) {
-          console.warn(
-            `[hermes] install-stamp.json schemaVersion ${parsed.schemaVersion} != expected ${INSTALL_STAMP_SCHEMA_VERSION}; ignoring`
-          )
+      const normalized = normalizeInstallStamp(parsed, p)
 
-          continue
-        }
+      if (normalized) {
+        return normalized
+      }
 
-        return Object.freeze({
-          schemaVersion: parsed.schemaVersion,
-          commit: parsed.commit,
-          branch: parsed.branch || null,
-          builtAt: parsed.builtAt || null,
-          dirty: Boolean(parsed.dirty),
-          source: parsed.source || null,
-          path: p
-        })
+      if (parsed && typeof parsed === 'object' && parsed.schemaVersion !== INSTALL_STAMP_SCHEMA_VERSION) {
+        console.warn(
+          `[hermes] install-stamp.json schemaVersion ${parsed.schemaVersion} != expected ${INSTALL_STAMP_SCHEMA_VERSION}; ignoring`
+        )
       }
     } catch (e) {
       console.warn(`[hermes] install-stamp.json found at ${p} , but parsing failed with ${e}`)

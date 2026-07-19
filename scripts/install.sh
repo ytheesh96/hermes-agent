@@ -43,8 +43,9 @@ NC='\033[0m' # No Color
 BOLD='\033[1m'
 
 # Configuration
-REPO_URL_SSH="git@github.com:NousResearch/hermes-agent.git"
-REPO_URL_HTTPS="https://github.com/NousResearch/hermes-agent.git"
+REPOSITORY="NousResearch/hermes-agent"
+REPO_URL_SSH="git@github.com:${REPOSITORY}.git"
+REPO_URL_HTTPS="https://github.com/${REPOSITORY}.git"
 HERMES_HOME="${HERMES_HOME:-$HOME/.hermes}"
 # INSTALL_DIR is resolved AFTER arg parsing and OS detection so we can pick an
 # FHS-style layout for root installs.  Track whether the user gave us an
@@ -117,6 +118,16 @@ while [[ $# -gt 0 ]]; do
             INSTALL_COMMIT="$2"
             shift 2
             ;;
+        --repository|-Repository)
+            if [[ ! "$2" =~ ^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$ ]]; then
+                echo "Invalid repository '$2' (expected OWNER/REPO)"
+                exit 1
+            fi
+            REPOSITORY="$2"
+            REPO_URL_SSH="git@github.com:${REPOSITORY}.git"
+            REPO_URL_HTTPS="https://github.com/${REPOSITORY}.git"
+            shift 2
+            ;;
         --manifest|-Manifest)
             MANIFEST_MODE=true
             shift
@@ -168,6 +179,7 @@ while [[ $# -gt 0 ]]; do
             echo "                   'hermes update' runs never inject bundled skills either"
             echo "  --branch NAME  Git branch to install (default: main)"
             echo "  --commit SHA   Pin checkout to a specific commit after clone/update"
+            echo "  --repository OWNER/REPO  GitHub repository to install"
             echo "  --manifest     Print desktop bootstrap stage manifest as JSON"
             echo "  --stage NAME   Run one desktop bootstrap stage"
             echo "  --json         Print a JSON result frame for --stage"
@@ -1213,6 +1225,17 @@ clone_repo() {
                 log_info "Local changes detected, stashing before update..."
                 git stash push --include-untracked -m "$stash_name"
                 autostash_ref="stash@{0}"
+            fi
+
+            local current_origin=""
+            current_origin="$(git remote get-url origin 2>/dev/null || true)"
+            if [ "$current_origin" != "$REPO_URL_SSH" ] && [ "$current_origin" != "$REPO_URL_HTTPS" ]; then
+                log_info "Retargeting managed checkout origin to $REPOSITORY..."
+                if [ -n "$current_origin" ]; then
+                    git remote set-url origin "$REPO_URL_HTTPS"
+                else
+                    git remote add origin "$REPO_URL_HTTPS"
+                fi
             fi
 
             # Fetch only the target branch. A bare `git fetch origin` pulls

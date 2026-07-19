@@ -43,6 +43,9 @@ import { hiddenWindowsChildOptions } from './windows-child-options'
 const IS_WINDOWS = process.platform === 'win32'
 
 const STAMP_COMMIT_RE = /^[0-9a-f]{7,40}$/i
+const REPOSITORY_RE = /^[A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+$/
+const DEFAULT_INSTALL_REPOSITORY = 'NousResearch/hermes-agent'
+const INSTALL_STAMP_SCHEMA_VERSION = 1
 
 // Stages flagged needs_user_input=true in the manifest are skipped by the
 // runner (passed -NonInteractive to install.ps1, which the install script
@@ -115,16 +118,54 @@ function hasExistingGitCheckout(activeRoot) {
   }
 }
 
-function cachedScriptPath(hermesHome, commit) {
-  return path.join(bootstrapCacheDir(hermesHome), `install-${commit}.${process.platform === 'win32' ? 'ps1' : 'sh'}`)
+function normalizeInstallStamp(parsed, stampPath) {
+  if (
+    !parsed ||
+    typeof parsed !== 'object' ||
+    parsed.schemaVersion !== INSTALL_STAMP_SCHEMA_VERSION ||
+    typeof parsed.commit !== 'string' ||
+    parsed.commit.length < 7
+  ) {
+    return null
+  }
+
+  return Object.freeze({
+    schemaVersion: parsed.schemaVersion,
+    commit: parsed.commit,
+    branch: parsed.branch || null,
+    repository: parsed.repository || null,
+    builtAt: parsed.builtAt || null,
+    dirty: Boolean(parsed.dirty),
+    source: parsed.source || null,
+    path: stampPath
+  })
 }
 
-function downloadInstallScript(commit, destPath) {
+function cachedScriptPath(hermesHome, commit, repository = DEFAULT_INSTALL_REPOSITORY) {
+  const validatedRepository = REPOSITORY_RE.test(String(repository || ''))
+    ? String(repository)
+    : DEFAULT_INSTALL_REPOSITORY
+
+  const repositoryKey = Buffer.from(validatedRepository, 'utf8').toString('base64url')
+
+  return path.join(
+    bootstrapCacheDir(hermesHome),
+    `install-${repositoryKey}-${commit}.${process.platform === 'win32' ? 'ps1' : 'sh'}`
+  )
+}
+
+function installRepository(installStamp) {
+  const repository = String(installStamp?.repository || '').trim()
+
+  return REPOSITORY_RE.test(repository) ? repository : DEFAULT_INSTALL_REPOSITORY
+}
+
+function downloadInstallScript(commit, destPath, repository = DEFAULT_INSTALL_REPOSITORY) {
   // Fetch from GitHub raw at the pinned commit. The raw URL with a SHA
   // is immutable (unlike a branch ref), so we don't need integrity
   // verification beyond "did the file we wrote pass a syntax probe."
   const scriptName = installScriptName()
-  const url = `https://raw.githubusercontent.com/NousResearch/hermes-agent/${commit}/scripts/${scriptName}`
+  const url = `https://raw.githubusercontent.com/${repository}/${commit}/scripts/${scriptName}`
 
   return new Promise((resolve, reject) => {
     fs.mkdirSync(path.dirname(destPath), { recursive: true })
@@ -231,7 +272,8 @@ async function resolveInstallScript({
     )
   }
 
-  const cached = cachedScriptPath(hermesHome, installStamp.commit)
+  const repository = installRepository(installStamp)
+  const cached = cachedScriptPath(hermesHome, installStamp.commit, repository)
 
   try {
     await fsp.access(cached, fs.constants.R_OK)
@@ -247,11 +289,13 @@ async function resolveInstallScript({
 
   emit({
     type: 'log',
-    line: `[bootstrap] fetching ${installScriptName()} for ${installStamp.commit.slice(0, 12)} from GitHub`
+    line:
+      `[bootstrap] fetching ${installScriptName()} for ${installStamp.commit.slice(0, 12)} ` +
+      `from ${repository}`
   })
 
   try {
-    await _download(installStamp.commit, cached)
+    await _download(installStamp.commit, cached, repository)
     emit({ type: 'log', line: `[bootstrap] saved to ${cached}` })
 
     return { path: cached, source: 'download', commit: installStamp.commit, kind: installScriptKind() }
@@ -556,6 +600,10 @@ function buildPinArgs(installStamp, { pinCommit = true } = {}) {
     args.push('-Branch', installStamp.branch)
   }
 
+  if (installStamp && REPOSITORY_RE.test(String(installStamp.repository || ''))) {
+    args.push('-Repository', installStamp.repository)
+  }
+
   return args
 }
 
@@ -568,6 +616,10 @@ function buildPosixPinArgs({ installStamp, activeRoot, hermesHome, pinCommit = t
 
   if (pinCommit && installStamp && installStamp.commit) {
     args.push('--commit', installStamp.commit)
+  }
+
+  if (installStamp && REPOSITORY_RE.test(String(installStamp.repository || ''))) {
+    args.push('--repository', installStamp.repository)
   }
 
   return args
@@ -888,7 +940,9 @@ export {
   buildPosixPinArgs,
   cachedScriptPath,
   hasExistingGitCheckout,
+  INSTALL_STAMP_SCHEMA_VERSION,
   installedAgentInstallScript,
+  normalizeInstallStamp,
   // Exposed for testability
   parseStageResult,
   resolveInstallScript,

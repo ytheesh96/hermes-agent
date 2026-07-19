@@ -16,6 +16,7 @@ param(
     [switch]$NoVenv,
     [switch]$SkipSetup,
     [string]$Branch = "main",
+    [string]$Repository = "NousResearch/hermes-agent",
     # -Commit and -Tag are higher-precedence variants of -Branch for users
     # who need reproducible installs (desktop installer pinning, CI, release
     # bundles).  When set, the repository stage clones $Branch (faster than
@@ -136,8 +137,11 @@ foreach ($tmpVar in @('TEMP', 'TMP')) {
 # Configuration
 # ============================================================================
 
-$RepoUrlSsh = "git@github.com:NousResearch/hermes-agent.git"
-$RepoUrlHttps = "https://github.com/NousResearch/hermes-agent.git"
+if ($Repository -notmatch '^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$') {
+    throw "Invalid repository '$Repository' (expected OWNER/REPO)"
+}
+$RepoUrlSsh = "git@github.com:$Repository.git"
+$RepoUrlHttps = "https://github.com/$Repository.git"
 $PythonVersion = "3.11"
 # Minor versions the installer accepts when the requested $PythonVersion isn't
 # available, in preference order.  uv discovers both uv-managed and system
@@ -1496,6 +1500,23 @@ function Install-Repository {
                     git -c windows.appendAtomically=false stash push --include-untracked -m "$stashName"
                     if ($LASTEXITCODE -eq 0) { $autostashRef = "stash@{0}" }
                 }
+
+                $currentOriginOut = @(git -c windows.appendAtomically=false remote get-url origin 2>$null)
+                $originExists = ($LASTEXITCODE -eq 0)
+                $currentOrigin = if ($originExists -and $currentOriginOut.Count -gt 0) {
+                    $currentOriginOut[0].ToString().Trim()
+                } else {
+                    ""
+                }
+                if (($currentOrigin -ne $RepoUrlSsh) -and ($currentOrigin -ne $RepoUrlHttps)) {
+                    Write-Info "Retargeting managed checkout origin to $Repository..."
+                    if ($originExists) {
+                        git -c windows.appendAtomically=false remote set-url origin $RepoUrlHttps
+                    } else {
+                        git -c windows.appendAtomically=false remote add origin $RepoUrlHttps
+                    }
+                    if ($LASTEXITCODE -ne 0) { throw "git remote origin update failed (exit $LASTEXITCODE)" }
+                }
                 git -c windows.appendAtomically=false fetch origin $Branch
                 if ($LASTEXITCODE -ne 0) { throw "git fetch failed (exit $LASTEXITCODE)" }
                 # Precedence: Commit > Tag > Branch.  Commit and Tag check
@@ -1663,13 +1684,13 @@ function Install-Repository {
                 # for.  GitHub supports archive URLs for commits, tags, and
                 # branches; we honour Commit > Tag > Branch.
                 if ($Commit) {
-                    $zipUrl = "https://github.com/NousResearch/hermes-agent/archive/$Commit.zip"
+                    $zipUrl = "https://github.com/$Repository/archive/$Commit.zip"
                     $zipLabel = $Commit
                 } elseif ($Tag) {
-                    $zipUrl = "https://github.com/NousResearch/hermes-agent/archive/refs/tags/$Tag.zip"
+                    $zipUrl = "https://github.com/$Repository/archive/refs/tags/$Tag.zip"
                     $zipLabel = $Tag
                 } else {
-                    $zipUrl = "https://github.com/NousResearch/hermes-agent/archive/refs/heads/$Branch.zip"
+                    $zipUrl = "https://github.com/$Repository/archive/refs/heads/$Branch.zip"
                     $zipLabel = $Branch
                 }
                 $zipPath = "$env:TEMP\hermes-agent-$zipLabel.zip"
