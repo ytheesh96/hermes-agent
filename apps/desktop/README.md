@@ -28,8 +28,9 @@
 2. Download the file ending in `mac-arm64.dmg`.
 3. Open the DMG, drag **Hermes** to **Applications**, and launch it.
 
-The current build is not Apple-notarized. If macOS blocks the first launch,
-Control-click **Hermes** in Applications, choose **Open**, then confirm **Open**.
+The current build does not carry an Apple Developer ID signature and is not
+Apple-notarized. If macOS blocks the first launch, Control-click **Hermes** in
+Applications, choose **Open**, then confirm **Open**.
 
 > The upstream `hermes desktop` command launches the upstream Hermes Desktop
 > checkout; it does not install this Hermes Loop fork. Windows, Linux, and Intel
@@ -82,7 +83,10 @@ npm run dist:linux   # AppImage + deb + rpm
 npm run pack         # unpacked app under release/ (no installer)
 ```
 
-Installers are built and uploaded to GitHub Releases manually. macOS/Windows signing & notarization happen automatically when the relevant credentials are present in the environment (`CSC_LINK` / `CSC_KEY_PASSWORD` / `APPLE_*` for macOS, `WIN_CSC_*` for Windows).
+Installers are built and uploaded to GitHub Releases manually. The current
+Hermes Loop macOS release is built without an Apple Developer ID identity or
+notarization credentials; do not describe it as signed, notarized, or accepted
+by Gatekeeper.
 
 ### How it works
 
