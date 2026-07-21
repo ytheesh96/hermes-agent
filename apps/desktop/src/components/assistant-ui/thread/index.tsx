@@ -85,16 +85,7 @@ export const Thread: FC<{
         />
       )
     }),
-    [
-      cwd,
-      gateway,
-      onBranchInNewChat,
-      onCancel,
-      onDismissError,
-      onRestoreToMessage,
-      requestRestoreConfirm,
-      sessionId
-    ]
+    [cwd, gateway, onBranchInNewChat, onCancel, onDismissError, onRestoreToMessage, requestRestoreConfirm, sessionId]
   )
 
   const emptyPlaceholder = intro ? (

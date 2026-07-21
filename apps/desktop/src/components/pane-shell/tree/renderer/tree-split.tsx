@@ -400,10 +400,7 @@ export function TreeSplit({ node, root, rootRow }: { node: SplitNode; root?: boo
     const gone = subtreeGone(child, trackCtx)
     const minimized = isMinimized(child)
 
-    const railOnly =
-      !editMode &&
-      child.type === 'split' &&
-      subtreeOnlyCrossAxisMinimized(child, axis, trackCtx)
+    const railOnly = !editMode && child.type === 'split' && subtreeOnlyCrossAxisMinimized(child, axis, trackCtx)
 
     const collapsed = gone || railOnly || (isEmptyZone(child) && !editMode) || sideGone(i)
     const track = minimized || collapsed ? null : fixedTrackSize(child, axis, trackCtx)

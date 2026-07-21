@@ -49,9 +49,7 @@ function loopRowStatusIndicator(row: LoopRow): StatusIndicatorKind {
   }
 
   const failed =
-    LOOP_FAILED_STATUSES.has(status) ||
-    LOOP_FAILED_STATUSES.has(runStatus) ||
-    LOOP_FAILED_STATUSES.has(runOutcome)
+    LOOP_FAILED_STATUSES.has(status) || LOOP_FAILED_STATUSES.has(runStatus) || LOOP_FAILED_STATUSES.has(runOutcome)
 
   if (failed) {
     return 'failed'

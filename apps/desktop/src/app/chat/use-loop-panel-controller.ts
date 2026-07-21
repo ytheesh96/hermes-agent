@@ -18,10 +18,7 @@ import {
   unlinkLoopTasks,
   updateLoopTaskStatus
 } from '@/hermes'
-import {
-  reconcileKanbanSessionSourceForComposer,
-  selectLoopWorkflowForSession
-} from '@/store/composer-status'
+import { reconcileKanbanSessionSourceForComposer, selectLoopWorkflowForSession } from '@/store/composer-status'
 import { notify, notifyError } from '@/store/notifications'
 import { $activeGatewayProfile } from '@/store/profile'
 import { openSessionInNewWindow } from '@/store/windows'

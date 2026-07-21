@@ -316,8 +316,7 @@ const toActivity = (
       ? strings(task.parent_task_ids)
       : (prev?.parentTaskIds ?? [])
 
-  const workflowId =
-    str(payload.workflow_id) || str(task.workflow_id) || str(worker.workflow_id) || prev?.workflowId
+  const workflowId = str(payload.workflow_id) || str(task.workflow_id) || str(worker.workflow_id) || prev?.workflowId
 
   const filesWritten = strings(payload.changed_files_preview).length
     ? strings(payload.changed_files_preview)
@@ -353,8 +352,7 @@ const toActivity = (
     runId: runIdOf(payload) ?? prev?.runId,
     sequence: sequenceOf(payload) ?? prev?.sequence,
     sourceEvent,
-    startedAt:
-      prev?.startedAt ?? timestampMs(payload.started_at, worker.started_at, payload.created_at) ?? at,
+    startedAt: prev?.startedAt ?? timestampMs(payload.started_at, worker.started_at, payload.created_at) ?? at,
     status,
     stream,
     summaryPreview,

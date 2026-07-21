@@ -109,9 +109,7 @@ function loopRowStatusIndicator(row: LoopRow): StatusIndicatorKind {
   }
 
   const failed =
-    LOOP_FAILED_STATUSES.has(status) ||
-    LOOP_FAILED_STATUSES.has(runStatus) ||
-    LOOP_FAILED_STATUSES.has(runOutcome)
+    LOOP_FAILED_STATUSES.has(status) || LOOP_FAILED_STATUSES.has(runStatus) || LOOP_FAILED_STATUSES.has(runOutcome)
 
   const attention = attentionScore(row) > 0 && !failed
 
@@ -178,11 +176,7 @@ function attentionReason(row: LoopRow): string {
     return row.childCount > 0 ? `Blocked · ${row.childCount} downstream` : 'Blocked'
   }
 
-  if (
-    LOOP_FAILED_STATUSES.has(status) ||
-    LOOP_FAILED_STATUSES.has(runStatus) ||
-    LOOP_FAILED_STATUSES.has(runOutcome)
-  ) {
+  if (LOOP_FAILED_STATUSES.has(status) || LOOP_FAILED_STATUSES.has(runStatus) || LOOP_FAILED_STATUSES.has(runOutcome)) {
     return 'Worker failed'
   }
 
@@ -213,12 +207,7 @@ function attentionScore(row: LoopRow): number {
   const runOutcome = normalizedLoopValue(row.latestRun?.outcome)
   const text = loopAttentionText(row)
 
-  if (
-    LOOP_TERMINAL_STATUSES.has(status) ||
-    status === 'running' ||
-    status === 'claimed' ||
-    status === 'in_progress'
-  ) {
+  if (LOOP_TERMINAL_STATUSES.has(status) || status === 'running' || status === 'claimed' || status === 'in_progress') {
     return 0
   }
 
@@ -274,8 +263,7 @@ function workflowGroupAnchor(rows: LoopRow[], preferredTaskId?: null | string): 
     (preferredTaskId ? rows.find(row => row.taskId === preferredTaskId) : null) ||
     [...rows].sort(
       (left, right) =>
-        (left.rawTask?.created_at ?? Number.MAX_SAFE_INTEGER) -
-        (right.rawTask?.created_at ?? Number.MAX_SAFE_INTEGER)
+        (left.rawTask?.created_at ?? Number.MAX_SAFE_INTEGER) - (right.rawTask?.created_at ?? Number.MAX_SAFE_INTEGER)
     )[0]!
   )
 }

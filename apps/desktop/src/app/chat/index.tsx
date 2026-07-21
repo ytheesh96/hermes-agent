@@ -109,7 +109,8 @@ function ChatHeader({
   const profiles = useStore($profiles)
 
   const activeStoredSession =
-    sessions.find(session => sessionMatchesAnyId(session, [selectedSessionId, routedSessionId, activeSessionId])) || null
+    sessions.find(session => sessionMatchesAnyId(session, [selectedSessionId, routedSessionId, activeSessionId])) ||
+    null
 
   const title = activeStoredSession ? sessionTitle(activeStoredSession) : 'New session'
 

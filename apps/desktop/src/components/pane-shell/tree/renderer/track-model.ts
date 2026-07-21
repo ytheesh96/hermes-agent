@@ -223,11 +223,7 @@ export function subtreeGone(node: LayoutNode, ctx: TrackContext): boolean {
  * so a composite subtree made only from those leaves must not reserve an empty
  * outer track. Same-axis minimized leaves remain real restore rails.
  */
-export function subtreeOnlyCrossAxisMinimized(
-  node: LayoutNode,
-  axis: 'row' | 'column',
-  ctx: TrackContext
-): boolean {
+export function subtreeOnlyCrossAxisMinimized(node: LayoutNode, axis: 'row' | 'column', ctx: TrackContext): boolean {
   const walk = (current: LayoutNode, parentAxis?: 'row' | 'column'): boolean => {
     if (current.type === 'group') {
       return (

@@ -786,9 +786,8 @@ function adoptMissingPanes(target: LayoutNode, source: LayoutNode): LayoutNode {
 
     const sibling = findGroupOfPane(source, paneId)?.panes.find(p => have.has(p))
 
-    const dock = (
-      registry.getArea('panes').find(c => c.id === paneId)?.data as { dock?: PaneDockHint } | undefined
-    )?.dock
+    const dock = (registry.getArea('panes').find(c => c.id === paneId)?.data as { dock?: PaneDockHint } | undefined)
+      ?.dock
 
     const dockAnchor = dock && have.has(dock.pane) ? dock.pane : undefined
 

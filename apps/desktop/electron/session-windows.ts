@@ -61,6 +61,7 @@ function buildSessionWindowUrl(
   if (profileKey) {
     query.set('profile', profileKey)
   }
+
   const route = newSession ? '#/' : `#/${encodeURIComponent(sessionId)}`
 
   if (devServer) {

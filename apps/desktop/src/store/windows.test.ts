@@ -1,6 +1,11 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 
-import { canOpenSessionWindow, openNewSessionInNewWindow, openSessionInNewWindow, sessionWindowProfile } from './windows'
+import {
+  canOpenSessionWindow,
+  openNewSessionInNewWindow,
+  openSessionInNewWindow,
+  sessionWindowProfile
+} from './windows'
 
 const desktopWindow = window as unknown as { hermesDesktop?: Window['hermesDesktop'] }
 const initialHermesDesktop = desktopWindow.hermesDesktop

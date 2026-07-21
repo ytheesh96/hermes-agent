@@ -527,11 +527,9 @@ export function workflowIdsFromTenantSource(
 ): string[] {
   const canonical = Array.from(
     new Set(
-      [
-        ...(source.workflow_ids || []),
-        source.workflow_id,
-        ...tasks.map(task => task.workflow_id)
-      ].filter((value): value is string => Boolean(value?.trim()))
+      [...(source.workflow_ids || []), source.workflow_id, ...tasks.map(task => task.workflow_id)].filter(
+        (value): value is string => Boolean(value?.trim())
+      )
     )
   )
 

@@ -1,10 +1,6 @@
 import { atom, computed } from 'nanostores'
 
-import {
-  type LoopWorkerActivity,
-  type TenantLoopSource,
-  type TenantLoopTask
-} from '@/app/chat/loop-state'
+import { type LoopWorkerActivity, type TenantLoopSource, type TenantLoopTask } from '@/app/chat/loop-state'
 import type { StatusIndicatorKind } from '@/components/chat/status-indicator'
 import { translateNow } from '@/i18n'
 import { stableArray } from '@/lib/stable-array'
@@ -225,7 +221,15 @@ const humanToolLabel = (name: string): string =>
     .join(' ') || name
 
 const taskAttentionText = (task: TenantLoopTask): string =>
-  [task.status, task.title, task.body, task.result, task.latest_summary, task.latest_run?.summary, task.latest_run?.outcome]
+  [
+    task.status,
+    task.title,
+    task.body,
+    task.result,
+    task.latest_summary,
+    task.latest_run?.summary,
+    task.latest_run?.outcome
+  ]
     .filter((value): value is string => Boolean(value))
     .join(' ')
     .toLowerCase()
@@ -249,16 +253,18 @@ const taskIsActive = (task: TenantLoopTask): boolean => {
   const status = normalized(task.status)
   const runStatus = normalized(task.latest_run?.status)
 
-  return ACTIVE_KANBAN_TASK_STATUSES.has(status) || ACTIVE_KANBAN_TASK_STATUSES.has(runStatus) || Boolean(task.current_run_id)
+  return (
+    ACTIVE_KANBAN_TASK_STATUSES.has(status) ||
+    ACTIVE_KANBAN_TASK_STATUSES.has(runStatus) ||
+    Boolean(task.current_run_id)
+  )
 }
 
 const taskIsDone = (task: TenantLoopTask): boolean => DONE_KANBAN_TASK_STATUSES.has(normalized(task.status))
 
 const taskIsTriage = (task: TenantLoopTask): boolean => normalized(task.status) === 'triage'
 
-const kanbanTaskProgress = (
-  tasks: readonly TenantLoopTask[]
-): NonNullable<ComposerStatusItem['taskProgress']> =>
+const kanbanTaskProgress = (tasks: readonly TenantLoopTask[]): NonNullable<ComposerStatusItem['taskProgress']> =>
   tasks.reduce<NonNullable<ComposerStatusItem['taskProgress']>>(
     (progress, task) => {
       if (taskNeedsAttention(task)) {
@@ -449,8 +455,7 @@ const kanbanWorkerToItem = (worker: LoopWorkerActivity): ComposerStatusItem => (
   profile: textValue(worker.profile),
   id: `kanban-agent:${worker.task_id}:${worker.run_id}`,
   kanbanTaskId: worker.task_id,
-  output:
-    worker.error_preview || worker.error || worker.summary_preview || worker.summary || undefined,
+  output: worker.error_preview || worker.error || worker.summary_preview || worker.summary || undefined,
   runId: worker.run_id,
   sessionId: worker.worker_session_id || undefined,
   startedAt: epochMs(worker.started_at),
@@ -497,8 +502,7 @@ const kanbanTaskToItem = (
   const task =
     tasks.find(candidate => candidate.id === workflowId) ||
     [...tasks].sort(
-      (left, right) =>
-        (left.created_at ?? Number.MAX_SAFE_INTEGER) - (right.created_at ?? Number.MAX_SAFE_INTEGER)
+      (left, right) => (left.created_at ?? Number.MAX_SAFE_INTEGER) - (right.created_at ?? Number.MAX_SAFE_INTEGER)
     )[0]!
 
   return {
@@ -676,10 +680,7 @@ const LOOP_STATUS_INDICATOR_RANK: Readonly<Record<StatusIndicatorKind, number>> 
   unknown: 1
 }
 
-const loopagentWorkflowTaskToItem = (
-  workflowId: string,
-  agents: readonly LoopagentActivity[]
-): ComposerStatusItem => {
+const loopagentWorkflowTaskToItem = (workflowId: string, agents: readonly LoopagentActivity[]): ComposerStatusItem => {
   const representative =
     agents.find(agent => agent.taskId === workflowId) ||
     [...agents].sort((left, right) => left.updatedAt - right.updatedAt || left.taskId.localeCompare(right.taskId))[0]!
@@ -727,12 +728,7 @@ const loopagentWorkflowTaskToItem = (
     id: `kanban-workflow:${workflowId}`,
     kanbanTaskId: representative.taskId,
     kanbanWorkflowId: workflowId,
-    state:
-      statusIndicator === 'done'
-        ? 'done'
-        : statusIndicator === 'attention'
-          ? 'failed'
-          : 'running',
+    state: statusIndicator === 'done' ? 'done' : statusIndicator === 'attention' ? 'failed' : 'running',
     statusIndicator,
     taskProgress,
     title: representative.title || representative.taskId,
@@ -741,10 +737,7 @@ const loopagentWorkflowTaskToItem = (
   }
 }
 
-const mergeLoopWorkflowTaskItem = (
-  snapshot: ComposerStatusItem,
-  live: ComposerStatusItem
-): ComposerStatusItem => {
+const mergeLoopWorkflowTaskItem = (snapshot: ComposerStatusItem, live: ComposerStatusItem): ComposerStatusItem => {
   const snapshotIndicator = snapshot.statusIndicator || 'unknown'
   const liveIndicator = live.statusIndicator || 'unknown'
 
@@ -761,8 +754,7 @@ const mergeLoopWorkflowTaskItem = (
         : 'in_progress'
 
   const taskProgress =
-    live.taskProgress &&
-    (!snapshot.taskProgress || live.taskProgress.total >= snapshot.taskProgress.total)
+    live.taskProgress && (!snapshot.taskProgress || live.taskProgress.total >= snapshot.taskProgress.total)
       ? live.taskProgress
       : snapshot.taskProgress
 

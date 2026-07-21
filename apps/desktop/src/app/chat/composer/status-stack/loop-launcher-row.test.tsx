@@ -161,11 +161,7 @@ describe('LoopLauncherRow', () => {
 
     render(
       <I18nProvider configClient={null}>
-        <LoopLauncherRow
-          onOpen={onOpen}
-          onSelectWorkflow={onSelectWorkflow}
-          sessionId="runtime-session"
-        />
+        <LoopLauncherRow onOpen={onOpen} onSelectWorkflow={onSelectWorkflow} sessionId="runtime-session" />
       </I18nProvider>
     )
 
