@@ -100,7 +100,13 @@ import { useBackgroundSync } from './hooks/use-background-sync'
 import { useDesktopIntegrations } from './hooks/use-desktop-integrations'
 import { usePetBridge } from './hooks/use-pet-bridge'
 import { useSessionTileDelegate } from './hooks/use-session-tile-delegate'
-import { $loopPanelController, $restartPreviewServer, useTitlebarToolContributions } from './panes'
+import {
+  $loopPanelController,
+  $restartPreviewServer,
+  loopNewWorkflowPaneId,
+  loopWorkflowPaneId,
+  useTitlebarToolContributions
+} from './panes'
 import { ChatRoutesSurface, SidebarSurface, StatusbarSurface, TerminalSurface } from './surfaces'
 import type { WiringActions, WiringApi } from './types'
 
@@ -518,10 +524,31 @@ export function ContribWiring({ children }: { children: ReactNode }) {
     loopSourceSessionId
   })
 
+  const loopControllerRef = useRef(loopController)
+  loopControllerRef.current = loopController
+
+  // Publish the latest controller before the reveal effect below. The pane
+  // mirror synchronously registers/adopts any newly opened workflow, so the
+  // exact native tab exists by the time revealTreePane fronts it.
+  useEffect(() => {
+    $loopPanelController.set(loopController)
+  }, [loopController])
+
+  useEffect(
+    () => () => {
+      const controller = loopControllerRef.current
+
+      if ($loopPanelController.get() === controller) {
+        $loopPanelController.set(null)
+      }
+    },
+    []
+  )
+
   const lastLoopFocusRequestRef = useRef('')
 
   const loopFocusRequestId =
-    loopController.focusRequestKey > 0 ? `${loopController.canvasScopeKey}:${loopController.focusRequestKey}` : ''
+    loopController.focusRequestKey > 0 ? `${loopController.workflowPaneScopeKey}:${loopController.focusRequestKey}` : ''
 
   useEffect(() => {
     if (
@@ -534,28 +561,34 @@ export function ContribWiring({ children }: { children: ReactNode }) {
     }
 
     lastLoopFocusRequestRef.current = loopFocusRequestId
-    revealTreePane('loop')
-  }, [loopController.hidden, loopController.open, loopFocusRequestId])
+    const workflowId = loopController.activeWorkflowId
 
-  const openLoop = loopController.onOpen
+    revealTreePane(
+      workflowId
+        ? loopWorkflowPaneId(loopController.workflowPaneScopeKey, workflowId)
+        : loopNewWorkflowPaneId(loopController.workflowPaneScopeKey)
+    )
+  }, [
+    loopController.activeWorkflowId,
+    loopController.hidden,
+    loopController.open,
+    loopController.workflowPaneScopeKey,
+    loopFocusRequestId
+  ])
 
   const openLoopPanel = useCallback(
     (taskId?: string) => {
-      openLoop(taskId)
-      revealTreePane('loop')
+      loopControllerRef.current.onOpen(taskId)
     },
-    [openLoop]
+    []
   )
 
-  useEffect(() => {
-    $loopPanelController.set(loopController)
-
-    return () => {
-      if ($loopPanelController.get() === loopController) {
-        $loopPanelController.set(null)
-      }
-    }
-  }, [loopController])
+  const openLoopWorkflowPanel = useCallback(
+    (workflowId: string) => {
+      loopControllerRef.current.onSelectWorkflowId(workflowId)
+    },
+    []
+  )
 
   const branchInNewChat = useCallback(
     async (messageId?: string) => {
@@ -813,6 +846,7 @@ export function ContribWiring({ children }: { children: ReactNode }) {
     onPickFolders: () => void composer.pickContextPaths('folder'),
     onPickImages: () => void composer.pickImages(),
     onOpenLoop: openLoopPanel,
+    onOpenLoopWorkflow: openLoopWorkflowPanel,
     onOpenKanbanTask: openLoopPanel,
     onReload: reloadFromMessage,
     onRemoveAttachment: id => void composer.removeAttachment(id),

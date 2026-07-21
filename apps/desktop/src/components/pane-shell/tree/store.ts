@@ -30,6 +30,7 @@ import {
   normalize,
   removePane,
   reorderPaneInGroup as reorderPaneInGroupOp,
+  replacePaneId as replacePaneIdOp,
   type RootEdge,
   setActivePane as setActivePaneOp,
   setGroupHeaderHidden as setGroupHeaderHiddenOp,
@@ -200,8 +201,11 @@ function frontPaneInGroup(paneId: string) {
 
   const next = setActivePaneOp(tree, group.id, paneId)
 
-  if (next !== tree) {
-    commit(next)
+  const normalized = normalizeShownGroupActives(next)
+
+  if (normalized !== tree) {
+    commit(normalized)
+    activatedPanes(next, normalized).forEach(notifyPaneActivated)
   }
 }
 
@@ -235,6 +239,12 @@ function setDismissed(paneId: string, dismissed: boolean) {
 
 const paneClosers: Record<string, () => void> = {}
 const paneOpeners: Record<string, () => void> = {}
+
+function notifyPaneActivated(paneId: string) {
+  const data = registry.getArea('panes').find(c => c.id === paneId)?.data as { onActivate?: () => void } | undefined
+
+  data?.onActivate?.()
+}
 
 /** Route a pane's Close through the app store that owns its visibility. */
 export function registerPaneCloser(paneId: string, close: () => void) {
@@ -285,11 +295,108 @@ export function registerLayoutResetHandler(fn: () => void): () => void {
  *  click lands on a non-focusable surface). Tracked by trackActiveTreeGroup. */
 export const $activeTreeGroup = atom<null | string>(null)
 
+let treeTabFocusRequestKey = 0
+let pendingPaneRemovalFocus: null | { nextPaneId: string; paneId: string } = null
+
+export const $treeTabFocusRequest = atom<null | { key: number; paneId: string }>(null)
+
+/** Carry domain close-neighbor intent across the later contribution/tree
+ *  removal. This matters when the closing pane owns a singleton split. */
+export function prepareTreePaneRemovalFocus(paneId: string, nextPaneId: string) {
+  pendingPaneRemovalFocus = { nextPaneId, paneId }
+}
+
+export function clearTreeTabFocusRequest(key: number) {
+  if ($treeTabFocusRequest.get()?.key === key) {
+    $treeTabFocusRequest.set(null)
+  }
+}
+
 /** Record the interacted zone (pointerdown / focusin). Idempotent. */
 export function noteActiveTreeGroup(groupId: null | string) {
   if (groupId !== $activeTreeGroup.get()) {
     $activeTreeGroup.set(groupId)
   }
+}
+
+/** Active pane in the zone the user most recently interacted with. */
+export function activeTreePaneId(): null | string {
+  const tree = $layoutTree.get()
+  const groupId = $activeTreeGroup.get()
+  const group = tree && groupId ? findGroup(tree, groupId) : null
+
+  return group ? effectiveShownActivePaneId(group) : null
+}
+
+function shownTreePaneIds(paneIds: string[]): string[] {
+  const registered = new Map(registry.getArea('panes').map(pane => [pane.id, pane]))
+  const hidden = $hiddenTreePanes.get()
+
+  return paneIds.filter(paneId => {
+    const pane = registered.get(paneId)
+    const data = pane?.data as { layoutAnchorOnly?: boolean } | undefined
+
+    return Boolean(pane) && !hidden.has(paneId) && !data?.layoutAnchorOnly
+  })
+}
+
+function effectiveShownActivePaneId(group: { active: string; panes: string[] }): null | string {
+  const shown = shownTreePaneIds(group.panes)
+
+  if (shown.includes(group.active)) {
+    return group.active
+  }
+
+  const contributions = registry.getArea('panes')
+
+  const preferred = shown.find(paneId => {
+    const data = contributions.find(pane => pane.id === paneId)?.data as { preferredActive?: () => boolean } | undefined
+
+    return data?.preferredActive?.()
+  })
+
+  return preferred || shown[0] || null
+}
+
+function normalizeShownGroupActives(node: LayoutNode): LayoutNode {
+  if (node.type === 'group') {
+    const active = effectiveShownActivePaneId(node)
+
+    return active && active !== node.active ? { ...node, active } : node
+  }
+
+  const children = node.children.map(normalizeShownGroupActives)
+
+  return children.some((child, index) => child !== node.children[index]) ? { ...node, children } : node
+}
+
+function activatedPanes(before: LayoutNode, after: LayoutNode): string[] {
+  const previous = new Map<string, string>()
+
+  const collect = (node: LayoutNode) => {
+    if (node.type === 'group') {
+      previous.set(node.id, node.active)
+    } else {
+      node.children.forEach(collect)
+    }
+  }
+
+  collect(before)
+  const activated: string[] = []
+
+  const compare = (node: LayoutNode) => {
+    if (node.type === 'group') {
+      if (previous.get(node.id) !== node.active) {
+        activated.push(node.active)
+      }
+    } else {
+      node.children.forEach(compare)
+    }
+  }
+
+  compare(after)
+
+  return activated
 }
 
 /** Install the active-zone tracker (call once from the tree root). Records the
@@ -388,7 +495,7 @@ export function treePanesWithPrefix(prefix: string): string[] {
 export function activateTreeTabSlot(slot: number): boolean {
   const groupId = $activeTreeGroup.get()
   const tree = $layoutTree.get()
-  const panes = (groupId && tree ? findGroup(tree, groupId)?.panes : null) ?? []
+  const panes = shownTreePaneIds((groupId && tree ? findGroup(tree, groupId)?.panes : null) ?? [])
 
   if (panes.length < 2 || slot < 1 || slot > panes.length) {
     return false
@@ -406,9 +513,12 @@ export function cycleTreeTabInFocusedZone(direction: 1 | -1): boolean {
   const groupId = $activeTreeGroup.get()
   const tree = $layoutTree.get()
   const group = groupId && tree ? findGroup(tree, groupId) : null
-  const panes = group?.panes ?? []
+  const panes = shownTreePaneIds(group?.panes ?? [])
 
-  if (panes.length < 2 || !panes.some(id => id === 'workspace' || id.startsWith('session-tile:'))) {
+  if (
+    panes.length < 2 ||
+    !panes.some(id => id === 'workspace' || id.startsWith('session-tile:') || id.startsWith('loop-workflow:'))
+  ) {
     return false
   }
 
@@ -433,7 +543,65 @@ export function removeTreePane(paneId: string) {
   const tree = $layoutTree.get()
 
   if (tree) {
-    commit(removePane(tree, paneId))
+    const preparedFocus = pendingPaneRemovalFocus?.paneId === paneId ? pendingPaneRemovalFocus : null
+
+    if (preparedFocus) {
+      pendingPaneRemovalFocus = null
+    }
+
+    const group = findGroupOfPane(tree, paneId)
+    const activeBefore = group ? effectiveShownActivePaneId(group) : null
+
+    const focused =
+      typeof document !== 'undefined' && document.activeElement instanceof HTMLElement ? document.activeElement : null
+
+    const focusedPaneId =
+      focused?.closest<HTMLElement>('[data-tree-pane-body]')?.dataset.treePaneBody ||
+      focused?.closest<HTMLElement>('[data-tree-tab]')?.dataset.treeTab
+
+    const next = removePane(tree, paneId)
+
+    commit(next)
+
+    if (activeBefore === paneId && next && group) {
+      const nextGroup = findGroup(next, group.id)
+      const activeAfter = nextGroup ? effectiveShownActivePaneId(nextGroup) : null
+
+      const preparedNextPaneId =
+        preparedFocus && allPaneIds(next).includes(preparedFocus.nextPaneId) ? preparedFocus.nextPaneId : null
+
+      const focusPaneId = activeAfter || preparedNextPaneId
+
+      if (focusPaneId) {
+        const focusGroup = findGroupOfPane(next, focusPaneId)
+
+        if (focusedPaneId === paneId || preparedFocus) {
+          if (focusGroup) {
+            noteActiveTreeGroup(focusGroup.id)
+          }
+
+          $treeTabFocusRequest.set({ key: ++treeTabFocusRequestKey, paneId: focusPaneId })
+        }
+
+        notifyPaneActivated(focusPaneId)
+      }
+    }
+  }
+}
+
+/** Promote a temporary native pane to its durable id without losing a user
+ *  drag/split placement or the group's active tab. */
+export function replaceTreePaneId(fromPaneId: string, toPaneId: string) {
+  const tree = $layoutTree.get()
+
+  if (!tree) {
+    return
+  }
+
+  const next = replacePaneIdOp(tree, fromPaneId, toPaneId)
+
+  if (next !== tree) {
+    commit(next)
   }
 }
 
@@ -708,6 +876,8 @@ export function revealTreePane(paneId: string) {
     if (next !== tree) {
       commit(next)
     }
+
+    notifyPaneActivated(paneId)
   }
 }
 
@@ -786,9 +956,8 @@ function adoptMissingPanes(target: LayoutNode, source: LayoutNode): LayoutNode {
 
     const sibling = findGroupOfPane(source, paneId)?.panes.find(p => have.has(p))
 
-    const dock = (
-      registry.getArea('panes').find(c => c.id === paneId)?.data as { dock?: PaneDockHint } | undefined
-    )?.dock
+    const dock = (registry.getArea('panes').find(c => c.id === paneId)?.data as { dock?: PaneDockHint } | undefined)
+      ?.dock
 
     const dockAnchor = dock && have.has(dock.pane) ? dock.pane : undefined
 
@@ -921,8 +1090,11 @@ function adoptContributedPanes(): void {
     }
   }
 
-  if (next !== tree) {
-    commit(next)
+  const normalized = normalizeShownGroupActives(next)
+
+  if (normalized !== tree) {
+    commit(normalized)
+    activatedPanes(next, normalized).forEach(notifyPaneActivated)
   }
 }
 
@@ -1032,6 +1204,7 @@ export function moveTreePane(paneId: string, target: { groupId: string; pos: Dro
   // real move customizes the preset or pins the pane as user-placed.
   if (next !== tree) {
     commit(next)
+    notifyPaneActivated(paneId)
     markActivePreset('custom')
     markPaneUserPlaced(paneId)
   }
@@ -1051,7 +1224,10 @@ export function applyTree(tree: LayoutNode, presetId: string) {
   // a layout hands pane placement back to the app (auto-docking resumes).
   clearAllPaneSizeOverrides()
   saveUserPlaced(new Set())
-  commit(previous ? adoptMissingPanes(tree, previous) : tree)
+  const adopted = previous ? adoptMissingPanes(tree, previous) : tree
+  const next = normalizeShownGroupActives(adopted)
+  commit(next)
+  activatedPanes(adopted, next).forEach(notifyPaneActivated)
   markActivePreset(presetId)
 
   // Picking a named layout is an intent to SEE its panes. Toggle-gated panes
@@ -1088,6 +1264,7 @@ export function mergeTreeZones(groupIds: string[], paneId: string, fallbackGroup
 
   if (merged) {
     commit(merged)
+    notifyPaneActivated(paneId)
     markActivePreset('custom')
     markPaneUserPlaced(paneId)
   } else if (fallbackGroupId) {
@@ -1098,8 +1275,9 @@ export function mergeTreeZones(groupIds: string[], paneId: string, fallbackGroup
 export function activateTreePane(groupId: string, paneId: string) {
   const tree = $layoutTree.get()
 
-  if (tree) {
+  if (tree && findGroup(tree, groupId)?.panes.includes(paneId)) {
     commit(setActivePaneOp(tree, groupId, paneId))
+    notifyPaneActivated(paneId)
   }
 }
 
@@ -1118,9 +1296,14 @@ export function splitTreeZone(groupId: string, side: RootEdge, movePaneId: strin
   const tree = $layoutTree.get()
 
   if (tree) {
-    commit(splitGroupZoneOp(tree, groupId, side, movePaneId))
-    markActivePreset('custom')
-    markPaneUserPlaced(movePaneId)
+    const next = splitGroupZoneOp(tree, groupId, side, movePaneId)
+
+    if (next !== tree) {
+      commit(next)
+      notifyPaneActivated(movePaneId)
+      markActivePreset('custom')
+      markPaneUserPlaced(movePaneId)
+    }
   }
 }
 

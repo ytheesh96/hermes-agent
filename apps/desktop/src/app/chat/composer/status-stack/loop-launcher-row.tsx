@@ -20,13 +20,13 @@ import {
 
 interface LoopLauncherRowProps {
   onOpen?: () => void
-  onSelectWorkflow?: (taskId: string) => void
+  onOpenWorkflow?: (workflowId: string) => void
   sessionId: null | string
 }
 
 export const LoopLauncherRow = memo(function LoopLauncherRow({
   onOpen,
-  onSelectWorkflow,
+  onOpenWorkflow,
   sessionId
 }: LoopLauncherRowProps) {
   const { t } = useI18n()
@@ -78,8 +78,10 @@ export const LoopLauncherRow = memo(function LoopLauncherRow({
       className="loop-launcher-row min-h-7 rounded-t-[inherit] rounded-b-none border-b border-(--ui-stroke-tertiary) px-3.5 py-1.5 hover:bg-transparent"
       leading={<Codicon className="text-(--ui-blue)" name="type-hierarchy-sub" size="0.8rem" />}
       onActivate={() => {
-        if (onSelectWorkflow && selectedWorkflow.kanbanTaskId) {
-          onSelectWorkflow(selectedWorkflow.kanbanTaskId)
+        const workflowId = selectedWorkflow.kanbanWorkflowId || selectedWorkflow.kanbanTaskId
+
+        if (onOpenWorkflow && workflowId) {
+          onOpenWorkflow(workflowId)
 
           return
         }
@@ -130,7 +132,7 @@ export const LoopLauncherRow = memo(function LoopLauncherRow({
         <span className="min-w-0 truncate text-xs font-normal text-muted-foreground/92 transition-colors group-hover/status-row:text-foreground/90">
           {selectedWorkflow.title}
         </span>
-        {workflows.length > 0 && onSelectWorkflow && (
+        {workflows.length > 0 && onOpenWorkflow && (
           <span
             className="flex shrink-0 items-center"
             onClick={event => event.stopPropagation()}
@@ -139,7 +141,7 @@ export const LoopLauncherRow = memo(function LoopLauncherRow({
             <DropdownMenu>
               <DropdownMenuTrigger asChild>
                 <Button
-                  aria-label={t.statusStack.switchWorkflow}
+                  aria-label={t.statusStack.openWorkflow}
                   className="size-5 shrink-0 text-muted-foreground/65 hover:text-foreground"
                   size="icon-xs"
                   type="button"
@@ -156,15 +158,17 @@ export const LoopLauncherRow = memo(function LoopLauncherRow({
                 sideOffset={6}
               >
                 <DropdownMenuLabel className="text-[0.625rem] font-semibold uppercase tracking-wider text-(--ui-text-tertiary)">
-                  {t.statusStack.switchWorkflow}
+                  {t.statusStack.openWorkflow}
                 </DropdownMenuLabel>
                 {workflows.map(item => (
                   <DropdownMenuItem
                     className="items-start gap-2"
                     key={item.kanbanWorkflowId || item.kanbanTaskId}
                     onSelect={() => {
-                      selectLoopWorkflowForSession(sessionId || '', item.kanbanWorkflowId || item.kanbanTaskId!)
-                      onSelectWorkflow(item.kanbanTaskId!)
+                      const workflowId = item.kanbanWorkflowId || item.kanbanTaskId!
+
+                      selectLoopWorkflowForSession(sessionId || '', workflowId)
+                      onOpenWorkflow(workflowId)
                     }}
                   >
                     <Codicon

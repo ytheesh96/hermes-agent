@@ -120,9 +120,9 @@ describe('LoopLauncherRow', () => {
     ).toBeTruthy()
   })
 
-  it('switches between workflows from the ellipsis menu next to Loop', () => {
+  it('opens workflows from the ellipsis menu next to Loop', () => {
     const onOpen = vi.fn()
-    const onSelectWorkflow = vi.fn()
+    const onOpenWorkflow = vi.fn()
 
     $kanbanStatusBySession.set({
       'runtime-session': [
@@ -161,15 +161,11 @@ describe('LoopLauncherRow', () => {
 
     render(
       <I18nProvider configClient={null}>
-        <LoopLauncherRow
-          onOpen={onOpen}
-          onSelectWorkflow={onSelectWorkflow}
-          sessionId="runtime-session"
-        />
+        <LoopLauncherRow onOpen={onOpen} onOpenWorkflow={onOpenWorkflow} sessionId="runtime-session" />
       </I18nProvider>
     )
 
-    const trigger = screen.getByRole('button', { name: 'Switch workflow' })
+    const trigger = screen.getByRole('button', { name: 'Open workflow' })
 
     expect(trigger.querySelector('.codicon-kebab-vertical')).toBeTruthy()
 
@@ -180,7 +176,7 @@ describe('LoopLauncherRow', () => {
     expect(screen.queryByRole('menuitem', { name: /One-off verification delegation/ })).toBeNull()
     fireEvent.click(screen.getByRole('menuitem', { name: /Finish private handoff/ }))
 
-    expect(onSelectWorkflow).toHaveBeenCalledWith('t_second')
+    expect(onOpenWorkflow).toHaveBeenCalledWith('wf_second')
     expect(onOpen).not.toHaveBeenCalled()
     expect(
       screen.getByRole('button', {
@@ -194,8 +190,8 @@ describe('LoopLauncherRow', () => {
       })
     )
 
-    expect(onSelectWorkflow).toHaveBeenLastCalledWith('t_second')
-    expect(onSelectWorkflow).toHaveBeenCalledTimes(2)
+    expect(onOpenWorkflow).toHaveBeenLastCalledWith('wf_second')
+    expect(onOpenWorkflow).toHaveBeenCalledTimes(2)
   })
 
   it('hides empty counters', () => {

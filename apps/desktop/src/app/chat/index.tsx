@@ -74,6 +74,7 @@ interface ChatViewProps extends Omit<React.ComponentProps<'div'>, 'onSubmit'> {
   onPickFolders: () => void
   onPickImages: () => void
   onOpenLoop?: () => void
+  onOpenLoopWorkflow?: (workflowId: string) => void
   onOpenKanbanTask?: (taskId: string) => void
   onRemoveAttachment: (id: string) => void
   onSteer: (text: string) => Promise<boolean> | boolean
@@ -231,6 +232,7 @@ export function ChatView({
   onPickFolders,
   onPickImages,
   onOpenLoop,
+  onOpenLoopWorkflow,
   onOpenKanbanTask,
   onRemoveAttachment,
   onSteer,
@@ -525,6 +527,7 @@ export function ChatView({
               onCancel={onCancel}
               onOpenKanbanTask={onOpenKanbanTask}
               onOpenLoop={onOpenLoop}
+              onOpenLoopWorkflow={onOpenLoopWorkflow}
               onPasteClipboardImage={onPasteClipboardImage}
               onPickFiles={onPickFiles}
               onPickFolders={onPickFolders}
