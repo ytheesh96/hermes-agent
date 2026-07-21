@@ -1,6 +1,6 @@
 import { QueryClient, QueryClientProvider } from '@tanstack/react-query'
 import { cleanup, fireEvent, render, screen, waitFor } from '@testing-library/react'
-import { useRef } from 'react'
+import { useRef, useState } from 'react'
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 
 import { openSessionInNewWindow } from '@/store/windows'
@@ -85,17 +85,74 @@ function demoLoopSource() {
   }
 }
 
-function renderControllerHarness({ gatewayOpen = false }: { gatewayOpen?: boolean } = {}) {
+function multiWorkflowSource() {
+  return {
+    board: 'default',
+    latest_event_id: 12,
+    session_id: 'session-1',
+    workflow_ids: ['wf-a', 'wf-b'],
+    tasks: [
+      {
+        created_at: 1,
+        id: 'a-root',
+        status: 'scheduled',
+        title: 'Workflow A',
+        workflow_id: 'wf-a'
+      },
+      {
+        created_at: 2,
+        id: 'b-root',
+        status: 'scheduled',
+        title: 'Workflow B',
+        workflow_id: 'wf-b'
+      }
+    ]
+  }
+}
+
+function threeWorkflowSource() {
+  const source = multiWorkflowSource()
+
+  return {
+    ...source,
+    latest_event_id: 13,
+    workflow_ids: [...source.workflow_ids, 'wf-c'],
+    tasks: [
+      ...source.tasks,
+      {
+        created_at: 3,
+        id: 'c-root',
+        status: 'scheduled',
+        title: 'Workflow C',
+        workflow_id: 'wf-c'
+      }
+    ]
+  }
+}
+
+function renderControllerHarness({
+  gatewayOpen = false,
+  onControllerRender
+}: {
+  gatewayOpen?: boolean
+  onControllerRender?: (snapshot: { open: boolean; scopeKey: string }) => void
+} = {}) {
   const queryClient = new QueryClient({
     defaultOptions: { queries: { retry: false }, mutations: { retry: false } }
   })
 
   function Harness() {
+    const [controllerSessionId, setControllerSessionId] = useState('session-1')
+
     const controller = useLoopPanelController({
-      activeSessionId: 'session-1',
+      activeSessionId: controllerSessionId,
       gatewayOpen,
-      loopSourceSessionId: 'session-1'
+      loopSourceSessionId: controllerSessionId
     })
+
+    const [closeResult, setCloseResult] = useState<ReturnType<typeof controller.onCloseWorkflowId>>(null)
+
+    onControllerRender?.({ open: controller.open, scopeKey: controller.workflowPaneScopeKey })
 
     const activeSessionIdRef = useRef<string | null>('session-1')
     const busyRef = useRef(false)
@@ -130,8 +187,35 @@ function renderControllerHarness({ gatewayOpen = false }: { gatewayOpen?: boolea
         <button onClick={() => controller.onSelectTaskId('t_root')} type="button">
           Open Loop row
         </button>
+        <button onClick={() => controller.onSelectTaskId('a-root')} type="button">
+          Open workflow A row
+        </button>
+        <button onClick={() => controller.onSelectTaskId('b-root')} type="button">
+          Open workflow B row
+        </button>
+        <button onClick={() => controller.onSelectTaskId('c-root')} type="button">
+          Open workflow C row
+        </button>
+        <button onClick={() => controller.onActivateWorkflowId('wf-a')} type="button">
+          Activate workflow A tab
+        </button>
+        <button onClick={() => controller.onActivateWorkflowId('wf-b')} type="button">
+          Activate workflow B tab
+        </button>
+        <button onClick={() => setCloseResult(controller.onCloseWorkflowId('wf-a'))} type="button">
+          Close workflow A tab
+        </button>
+        <button onClick={() => setCloseResult(controller.onCloseWorkflowId('wf-b'))} type="button">
+          Close workflow B tab
+        </button>
+        <button onClick={() => controller.workflowIds.forEach(controller.onCloseWorkflowId)} type="button">
+          Close all workflow tabs synchronously
+        </button>
         <button onClick={() => controller.onOpen()} type="button">
           Open Loop canvas
+        </button>
+        <button onClick={() => setControllerSessionId('session-2')} type="button">
+          Switch Loop session scope
         </button>
         <button onClick={() => void executeSlashCommand('/loop')} type="button">
           Run slash Loop
@@ -258,11 +342,21 @@ function renderControllerHarness({ gatewayOpen = false }: { gatewayOpen?: boolea
           Open worker session
         </button>
         <output data-testid="loop-open">{String(controller.open)}</output>
+        <output data-testid="loop-hidden">{String(controller.hidden)}</output>
+        <output data-testid="loop-active-workflow">{controller.activeWorkflowId || ''}</output>
+        <output data-testid="loop-open-workflows">{JSON.stringify(controller.workflowIds)}</output>
+        <output data-testid="loop-close-result">{JSON.stringify(closeResult)}</output>
         <output data-testid="loop-focus-request">{controller.focusRequestKey}</output>
+        <output data-testid="loop-focus-requests-by-workflow">
+          {JSON.stringify(controller.focusRequestKeysByWorkflow)}
+        </output>
         <output data-testid="loop-selected">{controller.selectedTaskId || ''}</output>
         <output data-testid="loop-root">{controller.state?.workflowId || ''}</output>
+        <output data-testid="loop-row-count">{controller.state?.rows.length || 0}</output>
         <output data-testid="loop-scope">{controller.canvasScopeKey}</output>
+        <output data-testid="loop-pane-scope">{controller.workflowPaneScopeKey}</output>
         <output data-testid="loop-positions">{JSON.stringify(controller.positions)}</output>
+        <output data-testid="loop-positions-by-workflow">{JSON.stringify(controller.positionsByWorkflow)}</output>
       </>
     )
   }
@@ -310,6 +404,91 @@ describe('useLoopPanelController', () => {
     expect(screen.getByTestId('loop-selected').textContent).toBe('t_root')
   })
 
+  it('opens, reuses, switches, and closes workflow canvas tabs independently', async () => {
+    hermesMocks.getLoopSessionSource.mockResolvedValue(multiWorkflowSource())
+    hermesMocks.getLoopCanvasPositions.mockImplementation(async (workflowId: string) => ({
+      positions: [{ taskId: `${workflowId}-position`, x: workflowId === 'wf-a' ? 10 : 20, y: 30 }],
+      workflowId
+    }))
+
+    renderControllerHarness({ gatewayOpen: true })
+    await waitFor(() => expect(screen.getByTestId('loop-row-count').textContent).toBe('2'))
+
+    fireEvent.click(screen.getByRole('button', { name: /open workflow a row/i }))
+    await waitFor(() => expect(screen.getByTestId('loop-active-workflow').textContent).toBe('wf-a'))
+    expect(screen.getByTestId('loop-open-workflows').textContent).toBe('["wf-a"]')
+
+    fireEvent.click(screen.getByRole('button', { name: /open workflow b row/i }))
+    await waitFor(() => expect(screen.getByTestId('loop-active-workflow').textContent).toBe('wf-b'))
+    expect(screen.getByTestId('loop-open-workflows').textContent).toBe('["wf-a","wf-b"]')
+
+    fireEvent.click(screen.getByRole('button', { name: /open workflow a row/i }))
+    expect(screen.getByTestId('loop-active-workflow').textContent).toBe('wf-a')
+    expect(screen.getByTestId('loop-open-workflows').textContent).toBe('["wf-a","wf-b"]')
+    const focusRequestBeforeNativeSwitch = screen.getByTestId('loop-focus-request').textContent
+    const scopedFocusRequestsBeforeNativeSwitch = screen.getByTestId('loop-focus-requests-by-workflow').textContent
+
+    fireEvent.click(screen.getByRole('button', { name: /activate workflow b tab/i }))
+    expect(screen.getByTestId('loop-active-workflow').textContent).toBe('wf-b')
+    expect(screen.getByTestId('loop-selected').textContent).toBe('a-root')
+    expect(screen.getByTestId('loop-focus-request').textContent).toBe(focusRequestBeforeNativeSwitch)
+    expect(screen.getByTestId('loop-focus-requests-by-workflow').textContent).toBe(
+      scopedFocusRequestsBeforeNativeSwitch
+    )
+
+    await waitFor(() => expect(screen.getByTestId('loop-positions-by-workflow').textContent).toContain('wf-a-position'))
+    await waitFor(() => expect(screen.getByTestId('loop-positions-by-workflow').textContent).toContain('wf-b-position'))
+
+    fireEvent.click(screen.getByRole('button', { name: /close workflow b tab/i }))
+    expect(screen.getByTestId('loop-active-workflow').textContent).toBe('wf-a')
+    expect(screen.getByTestId('loop-open-workflows').textContent).toBe('["wf-a"]')
+
+    fireEvent.click(screen.getByRole('button', { name: /close workflow a tab/i }))
+    expect(screen.getByTestId('loop-open-workflows').textContent).toBe('[]')
+    expect(screen.getByTestId('loop-open').textContent).toBe('false')
+    expect(screen.getByTestId('loop-hidden').textContent).toBe('true')
+  })
+
+  it('matches native previous-neighbor close semantics and handles a synchronous bulk close', async () => {
+    hermesMocks.getLoopSessionSource.mockResolvedValue(threeWorkflowSource())
+
+    renderControllerHarness({ gatewayOpen: true })
+    await waitFor(() => expect(screen.getByTestId('loop-row-count').textContent).toBe('3'))
+
+    fireEvent.click(screen.getByRole('button', { name: /open workflow a row/i }))
+    fireEvent.click(screen.getByRole('button', { name: /open workflow b row/i }))
+    fireEvent.click(screen.getByRole('button', { name: /open workflow c row/i }))
+    await waitFor(() => expect(screen.getByTestId('loop-open-workflows').textContent).toBe('["wf-a","wf-b","wf-c"]'))
+
+    fireEvent.click(screen.getByRole('button', { name: /activate workflow b tab/i }))
+    fireEvent.click(screen.getByRole('button', { name: /close workflow b tab/i }))
+    expect(screen.getByTestId('loop-active-workflow').textContent).toBe('wf-a')
+    expect(screen.getByTestId('loop-open-workflows').textContent).toBe('["wf-a","wf-c"]')
+
+    fireEvent.click(screen.getByRole('button', { name: /close all workflow tabs synchronously/i }))
+    expect(screen.getByTestId('loop-open-workflows').textContent).toBe('[]')
+    expect(screen.getByTestId('loop-open').textContent).toBe('false')
+  })
+
+  it('returns the surviving active workflow when a separate inactive workflow closes', async () => {
+    hermesMocks.getLoopSessionSource.mockResolvedValue(multiWorkflowSource())
+
+    renderControllerHarness({ gatewayOpen: true })
+    await waitFor(() => expect(screen.getByTestId('loop-row-count').textContent).toBe('2'))
+
+    fireEvent.click(screen.getByRole('button', { name: /open workflow a row/i }))
+    fireEvent.click(screen.getByRole('button', { name: /open workflow b row/i }))
+    fireEvent.click(screen.getByRole('button', { name: /activate workflow a tab/i }))
+    expect(screen.getByTestId('loop-active-workflow').textContent).toBe('wf-a')
+
+    fireEvent.click(screen.getByRole('button', { name: /close workflow b tab/i }))
+
+    expect(screen.getByTestId('loop-open-workflows').textContent).toBe('["wf-a"]')
+    expect(screen.getByTestId('loop-close-result').textContent).toBe(
+      JSON.stringify({ closedLast: false, nextWorkflowId: 'wf-a' })
+    )
+  })
+
   it('attaches a Loop task without inserting a canned chat prompt', async () => {
     const onInsertRefs = vi.fn()
     const unsubscribe = onComposerInsertRefsRequest(onInsertRefs)
@@ -336,7 +515,22 @@ describe('useLoopPanelController', () => {
     expect(screen.getByTestId('loop-open').textContent).toBe('true')
     expect(screen.getByTestId('loop-selected').textContent).toBe('')
     expect(screen.getByTestId('loop-scope').textContent).toBe('session-1')
+    expect(screen.getByTestId('loop-pane-scope').textContent).toBe('default:session-1')
     expect(hermesMocks.getLoopSessionSource).not.toHaveBeenCalled()
+  })
+
+  it('never exposes the previous scope as a transient New workflow pane', () => {
+    const snapshots: Array<{ open: boolean; scopeKey: string }> = []
+
+    renderControllerHarness({ onControllerRender: snapshot => snapshots.push(snapshot) })
+    fireEvent.click(screen.getByRole('button', { name: /open loop canvas/i }))
+    expect(snapshots.at(-1)).toEqual({ open: true, scopeKey: 'default:session-1' })
+
+    snapshots.length = 0
+    fireEvent.click(screen.getByRole('button', { name: /switch loop session scope/i }))
+
+    expect(snapshots.some(snapshot => snapshot.scopeKey === 'default:session-2' && snapshot.open)).toBe(false)
+    expect(snapshots.at(-1)).toEqual({ open: false, scopeKey: 'default:session-2' })
   })
 
   it('routes bare /loop through Desktop slash dispatch and focuses the canvas', async () => {
@@ -367,10 +561,13 @@ describe('useLoopPanelController', () => {
     fireEvent.click(screen.getByRole('button', { name: /open loop canvas/i }))
 
     expect(screen.getByTestId('loop-open').textContent).toBe('true')
+    expect(screen.getByTestId('loop-open-workflows').textContent).toBe('[]')
     resolveSource(demoLoopSource())
 
     await waitFor(() => expect(screen.getByTestId('loop-root').textContent).toBe('LIVE DISPOSABLE DEMO'))
     expect(screen.getByTestId('loop-open').textContent).toBe('true')
+    await waitFor(() => expect(screen.getByTestId('loop-open-workflows').textContent).toBe('["LIVE DISPOSABLE DEMO"]'))
+    expect(screen.getByTestId('loop-active-workflow').textContent).toBe('LIVE DISPOSABLE DEMO')
   })
 
   it('opens a hydrated canvas without selecting its persistence anchor', async () => {
@@ -387,6 +584,23 @@ describe('useLoopPanelController', () => {
       'default',
       'session-1'
     )
+  })
+
+  it('opens a canonical workflow even when its hydrated source has no tasks', async () => {
+    hermesMocks.getLoopSessionSource.mockResolvedValue({
+      board: 'default',
+      latest_event_id: 1,
+      session_id: 'session-1',
+      tasks: [],
+      workflow_ids: ['wf-empty']
+    })
+
+    renderControllerHarness({ gatewayOpen: true })
+    await waitFor(() => expect(screen.getByTestId('loop-root').textContent).toBe('wf-empty'))
+    fireEvent.click(screen.getByRole('button', { name: /open loop canvas/i }))
+
+    expect(screen.getByTestId('loop-active-workflow').textContent).toBe('wf-empty')
+    expect(screen.getByTestId('loop-open-workflows').textContent).toBe('["wf-empty"]')
   })
 
   it('keeps a requested task open when the new Loop workflow hydrates', async () => {

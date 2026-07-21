@@ -94,6 +94,10 @@ function loopDependencySourceIsEditable(state: LoopPanelState | null, parentId: 
   return Boolean(parent && loopTaskAllowsDependencySource(parent))
 }
 
+function loopWorkflowIdForTask(state: LoopPanelState | null, taskId: string): string {
+  return state?.rows.find(row => row.taskId === taskId)?.workflowId?.trim() || state?.workflowId || ''
+}
+
 function loopPanelAutoOpenParams(): { enabled: boolean; taskId: null | string } {
   if (typeof window === 'undefined') {
     return { enabled: false, taskId: null }
@@ -149,17 +153,57 @@ export function useLoopPanelController({
   }, [activeSessionId, loopSourceQuery.data, loopSourceSessionId])
 
   const loopPanelState = tenantLoopPanelState
+  const loopCanvasScopeKey = loopSourceSessionId || activeSessionId || 'new'
+  const workflowPaneScopeKey = `${activeGatewayProfile}:${loopCanvasScopeKey}`
+  const loopSourceBoard = loopSourceQuery.data?.board || undefined
   const [selectedLoopTaskId, setSelectedLoopTaskId] = useState<string | null>(null)
   const [focusedLoopTaskId, setFocusedLoopTaskId] = useState<string | null>(null)
+
+  const [openLoopWorkflows, setOpenLoopWorkflows] = useState<{
+    activeId: null | string
+    ids: string[]
+    scopeKey: string
+  }>(() => ({ activeId: null, ids: [], scopeKey: workflowPaneScopeKey }))
+
+  const openLoopWorkflowsRef = useRef(openLoopWorkflows)
+
+  const updateOpenLoopWorkflows = useCallback(
+    (
+      update: (current: { activeId: null | string; ids: string[]; scopeKey: string }) => {
+        activeId: null | string
+        ids: string[]
+        scopeKey: string
+      }
+    ) => {
+      const next = update(openLoopWorkflowsRef.current)
+      openLoopWorkflowsRef.current = next
+      setOpenLoopWorkflows(next)
+
+      return next
+    },
+    []
+  )
+
+  const openLoopWorkflowIds = useMemo(
+    () => (openLoopWorkflows.scopeKey === workflowPaneScopeKey ? openLoopWorkflows.ids : []),
+    [openLoopWorkflows, workflowPaneScopeKey]
+  )
+
+  const workflowPaneScopeReady = openLoopWorkflows.scopeKey === workflowPaneScopeKey
+  const activeLoopWorkflowId = workflowPaneScopeReady ? openLoopWorkflows.activeId : null
+
+  const [loopCanvasPositionsByWorkflow, setLoopCanvasPositionsByWorkflow] = useState<
+    Record<string, LoopCanvasPosition[]>
+  >({})
+
   const [loopFocusRequestKey, setLoopFocusRequestKey] = useState(0)
+  const [loopFocusRequestKeysByWorkflow, setLoopFocusRequestKeysByWorkflow] = useState<Record<string, number>>({})
   const [loopPanelOpen, setLoopPanelOpen] = useState(false)
   const [loopPanelHidden, setLoopPanelHidden] = useState(false)
   const autoOpenedLoopPanelRef = useRef<string | null>(null)
   const pendingSelectedLoopTaskIdRef = useRef<string | null>(null)
 
-  const loopPanelWorkflowKey = loopPanelState?.workflowId || ''
-  const loopCanvasScopeKey = loopSourceSessionId || activeSessionId || 'new'
-  const loopSourceBoard = loopSourceQuery.data?.board || undefined
+  const loopPanelWorkflowKey = activeLoopWorkflowId || loopPanelState?.workflowId || ''
 
   const loopCanvasPositionsQuery = useQuery({
     queryKey: [
@@ -174,6 +218,19 @@ export function useLoopPanelController({
     enabled: gatewayOpen && Boolean(loopPanelWorkflowKey),
     staleTime: 2_000
   })
+
+  useEffect(() => {
+    const loadedPositions = loopCanvasPositionsQuery.data?.positions
+
+    if (!loopPanelWorkflowKey || !loadedPositions) {
+      return
+    }
+
+    setLoopCanvasPositionsByWorkflow(current => ({
+      ...current,
+      [loopPanelWorkflowKey]: loadedPositions
+    }))
+  }, [loopCanvasPositionsQuery.data?.positions, loopPanelWorkflowKey])
 
   const selectedLoopTaskDetailQuery = useQuery({
     queryKey: [
@@ -236,12 +293,130 @@ export function useLoopPanelController({
     }
   })
 
+  const requestLoopFocus = useCallback((workflowId?: null | string) => {
+    setLoopFocusRequestKey(key => key + 1)
+
+    if (workflowId) {
+      setLoopFocusRequestKeysByWorkflow(keys => ({
+        ...keys,
+        [workflowId]: (keys[workflowId] || 0) + 1
+      }))
+    }
+  }, [])
+
+  const rememberLoopWorkflow = useCallback(
+    (workflowId: string) => {
+      const normalizedWorkflowId = workflowId.trim()
+
+      if (!normalizedWorkflowId) {
+        return
+      }
+
+      updateOpenLoopWorkflows(current => {
+        const workflowIds = current.scopeKey === workflowPaneScopeKey ? current.ids : []
+
+        return {
+          activeId: normalizedWorkflowId,
+          ids: workflowIds.includes(normalizedWorkflowId) ? workflowIds : [...workflowIds, normalizedWorkflowId],
+          scopeKey: workflowPaneScopeKey
+        }
+      })
+
+      if (activeSessionId) {
+        selectLoopWorkflowForSession(activeSessionId, normalizedWorkflowId)
+      }
+    },
+    [activeSessionId, updateOpenLoopWorkflows, workflowPaneScopeKey]
+  )
+
+  const handleSelectLoopWorkflowId = useCallback(
+    (workflowId: string) => {
+      const normalizedWorkflowId = workflowId.trim()
+
+      if (!normalizedWorkflowId) {
+        return
+      }
+
+      pendingSelectedLoopTaskIdRef.current = null
+      rememberLoopWorkflow(normalizedWorkflowId)
+      setSelectedLoopTaskId(null)
+      setFocusedLoopTaskId(null)
+      requestLoopFocus(normalizedWorkflowId)
+      setLoopPanelOpen(true)
+      setLoopPanelHidden(false)
+    },
+    [rememberLoopWorkflow, requestLoopFocus]
+  )
+
+  const handleActivateLoopWorkflowId = useCallback(
+    (workflowId: string) => {
+      const normalizedWorkflowId = workflowId.trim()
+
+      if (normalizedWorkflowId && openLoopWorkflowIds.includes(normalizedWorkflowId)) {
+        rememberLoopWorkflow(normalizedWorkflowId)
+      }
+    },
+    [openLoopWorkflowIds, rememberLoopWorkflow]
+  )
+
+  const handleFocusLoopTaskId = useCallback(
+    (taskId: null | string) => {
+      if (taskId) {
+        const workflowId = loopWorkflowIdForTask(loopPanelState, taskId)
+
+        if (workflowId) {
+          rememberLoopWorkflow(workflowId)
+        }
+      }
+
+      setFocusedLoopTaskId(taskId)
+    },
+    [loopPanelState, rememberLoopWorkflow]
+  )
+
+  // A bare /loop can open before its source query resolves. Keep the
+  // closeable "New workflow" native pane during that gap, then promote it to
+  // the source's first real workflow once hydration makes one available.
+  useEffect(() => {
+    if (
+      !loopPanelOpen ||
+      loopPanelHidden ||
+      openLoopWorkflowIds.length > 0 ||
+      selectedLoopTaskId ||
+      focusedLoopTaskId ||
+      pendingSelectedLoopTaskIdRef.current
+    ) {
+      return
+    }
+
+    const workflowId =
+      loopPanelState?.workflowId ||
+      loopPanelState?.workflowIds[0] ||
+      (loopPanelState?.rows[0] ? loopWorkflowIdForTask(loopPanelState, loopPanelState.rows[0].taskId) : '')
+
+    if (workflowId) {
+      handleSelectLoopWorkflowId(workflowId)
+    }
+  }, [
+    focusedLoopTaskId,
+    handleSelectLoopWorkflowId,
+    loopPanelHidden,
+    loopPanelOpen,
+    loopPanelState,
+    openLoopWorkflowIds.length,
+    selectedLoopTaskId
+  ])
+
   useEffect(() => {
     setSelectedLoopTaskId(null)
     setFocusedLoopTaskId(null)
+    updateOpenLoopWorkflows(() => ({ activeId: null, ids: [], scopeKey: workflowPaneScopeKey }))
+    setLoopCanvasPositionsByWorkflow({})
+    setLoopFocusRequestKeysByWorkflow({})
     setLoopPanelOpen(false)
     setLoopPanelHidden(false)
-  }, [loopSourceSessionId])
+    pendingSelectedLoopTaskIdRef.current = null
+  }, [updateOpenLoopWorkflows, workflowPaneScopeKey])
 
   useEffect(() => {
     const taskId = pendingSelectedLoopTaskIdRef.current
@@ -251,12 +426,18 @@ export function useLoopPanelController({
     }
 
     pendingSelectedLoopTaskIdRef.current = null
+    const workflowId = loopWorkflowIdForTask(loopPanelState, taskId)
+
+    if (workflowId) {
+      rememberLoopWorkflow(workflowId)
+    }
+
     setSelectedLoopTaskId(taskId)
     setFocusedLoopTaskId(taskId)
-    setLoopFocusRequestKey(key => key + 1)
+    requestLoopFocus(workflowId)
     setLoopPanelOpen(true)
     setLoopPanelHidden(false)
-  }, [loopPanelState])
+  }, [loopPanelState, rememberLoopWorkflow, requestLoopFocus])
 
   useEffect(() => {
     const autoOpen = loopPanelAutoOpenParams()
@@ -269,8 +450,14 @@ export function useLoopPanelController({
       return
     }
 
+    const targetWorkflowId =
+      (autoOpen.taskId ? loopWorkflowIdForTask(loopPanelState, autoOpen.taskId) : '') ||
+      loopPanelState.workflowId ||
+      loopPanelState.workflowIds[0] ||
+      loopWorkflowIdForTask(loopPanelState, loopPanelState.rows[0]!.taskId)
+
     const targetTaskId = autoOpen.taskId
-    const autoOpenKey = `${loopCanvasScopeKey}:${targetTaskId || 'canvas'}`
+    const autoOpenKey = `${activeGatewayProfile}:${loopCanvasScopeKey}:${targetWorkflowId || targetTaskId || 'canvas'}`
 
     if (autoOpenedLoopPanelRef.current === autoOpenKey) {
       return
@@ -278,29 +465,33 @@ export function useLoopPanelController({
 
     autoOpenedLoopPanelRef.current = autoOpenKey
 
+    if (targetWorkflowId) {
+      rememberLoopWorkflow(targetWorkflowId)
+    }
+
     setSelectedLoopTaskId(targetTaskId)
     setFocusedLoopTaskId(targetTaskId)
-    setLoopFocusRequestKey(key => key + 1)
+    requestLoopFocus(targetWorkflowId)
     setLoopPanelOpen(true)
     setLoopPanelHidden(false)
-  }, [loopCanvasScopeKey, loopPanelState])
+  }, [activeGatewayProfile, loopCanvasScopeKey, loopPanelState, rememberLoopWorkflow, requestLoopFocus])
 
   const handleSelectLoopTaskId = useCallback(
     (taskId: string) => {
-      const workflowId = loopPanelState?.rows.find(row => row.taskId === taskId)?.workflowId
+      const workflowId = loopWorkflowIdForTask(loopPanelState, taskId)
 
-      if (activeSessionId && workflowId) {
-        selectLoopWorkflowForSession(activeSessionId, workflowId)
+      if (workflowId) {
+        rememberLoopWorkflow(workflowId)
       }
 
       pendingSelectedLoopTaskIdRef.current = loopPanelState?.rows.some(row => row.taskId === taskId) ? null : taskId
       setSelectedLoopTaskId(taskId)
       setFocusedLoopTaskId(taskId)
-      setLoopFocusRequestKey(key => key + 1)
+      requestLoopFocus(workflowId)
       setLoopPanelOpen(true)
       setLoopPanelHidden(false)
     },
-    [activeSessionId, loopPanelState]
+    [loopPanelState, rememberLoopWorkflow, requestLoopFocus]
   )
 
   const handleOpenLoopPanel = useCallback(
@@ -311,14 +502,74 @@ export function useLoopPanelController({
         return
       }
 
+      const workflowId =
+        activeLoopWorkflowId ||
+        loopPanelState?.workflowId ||
+        loopPanelState?.workflowIds[0] ||
+        (loopPanelState?.rows[0] ? loopWorkflowIdForTask(loopPanelState, loopPanelState.rows[0].taskId) : '')
+
+      if (workflowId) {
+        handleSelectLoopWorkflowId(workflowId)
+
+        return
+      }
+
       pendingSelectedLoopTaskIdRef.current = null
       setSelectedLoopTaskId(null)
       setFocusedLoopTaskId(null)
-      setLoopFocusRequestKey(key => key + 1)
+      requestLoopFocus()
       setLoopPanelOpen(true)
       setLoopPanelHidden(false)
     },
-    [handleSelectLoopTaskId]
+    [activeLoopWorkflowId, handleSelectLoopTaskId, handleSelectLoopWorkflowId, loopPanelState, requestLoopFocus]
+  )
+
+  const handleCloseLoopWorkflowId = useCallback(
+    (workflowId: string) => {
+      const current = openLoopWorkflowsRef.current
+      const currentWorkflowIds = current.scopeKey === workflowPaneScopeKey ? current.ids : []
+      const currentActiveWorkflowId = current.scopeKey === workflowPaneScopeKey ? current.activeId : null
+      const closingIndex = currentWorkflowIds.indexOf(workflowId)
+
+      if (closingIndex < 0) {
+        return null
+      }
+
+      const remainingWorkflowIds = currentWorkflowIds.filter(openWorkflowId => openWorkflowId !== workflowId)
+      const nextWorkflowId = remainingWorkflowIds[closingIndex - 1] || remainingWorkflowIds[closingIndex]
+
+      const nextActiveWorkflowId =
+        currentActiveWorkflowId === workflowId
+          ? nextWorkflowId || null
+          : currentActiveWorkflowId && remainingWorkflowIds.includes(currentActiveWorkflowId)
+            ? currentActiveWorkflowId
+            : nextWorkflowId || remainingWorkflowIds[0] || null
+
+      updateOpenLoopWorkflows(() => ({
+        activeId: nextActiveWorkflowId,
+        ids: remainingWorkflowIds,
+        scopeKey: workflowPaneScopeKey
+      }))
+
+      if (remainingWorkflowIds.length === 0) {
+        setSelectedLoopTaskId(null)
+        setFocusedLoopTaskId(null)
+        requestLoopFocus()
+        setLoopPanelOpen(false)
+        setLoopPanelHidden(true)
+
+        return { closedLast: true, nextWorkflowId: null }
+      }
+
+      if (currentActiveWorkflowId === workflowId && nextActiveWorkflowId) {
+        if (activeSessionId) {
+          selectLoopWorkflowForSession(activeSessionId, nextActiveWorkflowId)
+        }
+      }
+
+      return { closedLast: false, nextWorkflowId: nextActiveWorkflowId }
+    },
+    [activeSessionId, requestLoopFocus, updateOpenLoopWorkflows, workflowPaneScopeKey]
   )
 
   const handleHideLoopPanel = useCallback(() => {
@@ -449,6 +700,10 @@ export function useLoopPanelController({
           ['loop-canvas-positions', activeGatewayProfile, loopSourceBoard, targetWorkflowId, loopSourceSessionId],
           saved
         )
+        setLoopCanvasPositionsByWorkflow(current => ({
+          ...current,
+          [targetWorkflowId]: saved.positions
+        }))
 
         return true
       } catch (error) {
@@ -614,26 +869,34 @@ export function useLoopPanelController({
   )
 
   return {
+    activeWorkflowId: activeLoopWorkflowId,
     canvasScopeKey: loopCanvasScopeKey,
-    focusedTaskId: focusedLoopTaskId,
-    focusRequestKey: loopFocusRequestKey,
-    hidden: loopPanelHidden,
+    focusedTaskId: workflowPaneScopeReady ? focusedLoopTaskId : null,
+    focusRequestKey: workflowPaneScopeReady ? loopFocusRequestKey : 0,
+    focusRequestKeysByWorkflow: workflowPaneScopeReady ? loopFocusRequestKeysByWorkflow : {},
+    hidden: workflowPaneScopeReady ? loopPanelHidden : true,
     onAddTaskComment: handleAddLoopTaskComment,
+    onActivateWorkflowId: handleActivateLoopWorkflowId,
     onCreateTask: handleCreateLoopTask,
-    onFocusTaskId: setFocusedLoopTaskId,
+    onCloseWorkflowId: handleCloseLoopWorkflowId,
+    onFocusTaskId: handleFocusLoopTaskId,
     onHide: handleHideLoopPanel,
     onLinkTasks: handleLinkLoopTasks,
     onOpen: handleOpenLoopPanel,
     onSavePositions: handleSaveLoopCanvasPositions,
     onSelectTaskId: handleSelectLoopTaskId,
+    onSelectWorkflowId: handleSelectLoopWorkflowId,
     onTaskAction: handleLoopTaskAction,
     onUnlinkTasks: handleUnlinkLoopTasks,
-    open: loopPanelOpen,
+    open: workflowPaneScopeReady && loopPanelOpen,
     positions: loopCanvasPositionsQuery.data?.positions,
+    positionsByWorkflow: loopCanvasPositionsByWorkflow,
     workflowId: loopPanelWorkflowKey || undefined,
-    selectedTaskDetail: selectedLoopTaskDetailQuery.data,
-    selectedTaskDetailError: selectedLoopTaskDetailError,
-    selectedTaskId: selectedLoopTaskId,
+    workflowIds: openLoopWorkflowIds,
+    workflowPaneScopeKey,
+    selectedTaskDetail: workflowPaneScopeReady ? selectedLoopTaskDetailQuery.data : undefined,
+    selectedTaskDetailError: workflowPaneScopeReady ? selectedLoopTaskDetailError : null,
+    selectedTaskId: workflowPaneScopeReady ? selectedLoopTaskId : null,
     state: loopPanelState,
     tabKey: selectedLoopTaskId || focusedLoopTaskId || ''
   }
